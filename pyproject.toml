@@ -3,8 +3,8 @@ requires = [ "setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "workspace-mcp"
-version = "1.13.0"
+name = "workspace-mcp-fixed"
+version = "1.13.1"
 description = "Comprehensive, highly performant Google Workspace Streamable HTTP & SSE MCP Server for Calendar, Gmail, Docs, Sheets, Slides & Drive"
 readme = "README.md"
 keywords = [ "mcp", "google", "workspace", "llm", "ai", "claude", "model", "context", "protocol", "server"]
@@ -48,13 +48,13 @@ email = "taylor@taylorwilsdon.com"
 
 [project.urls]
 Homepage = "https://workspacemcp.com"
-Repository = "https://github.com/taylorwilsdon/google_workspace_mcp"
-Documentation = "https://github.com/taylorwilsdon/google_workspace_mcp#readme"
-Issues = "https://github.com/taylorwilsdon/google_workspace_mcp/issues"
-Changelog = "https://github.com/taylorwilsdon/google_workspace_mcp/releases"
+Repository = "https://github.com/akilja24/workspace-mcp-fixed"
+Documentation = "https://github.com/akilja24/workspace-mcp-fixed#readme"
+Issues = "https://github.com/akilja24/workspace-mcp-fixed/issues"
+Changelog = "https://github.com/akilja24/workspace-mcp-fixed/releases"
 
 [project.scripts]
-workspace-mcp = "main:main"
+workspace-mcp-fixed = "main:main"
 
 [project.optional-dependencies]
 valkey = [
