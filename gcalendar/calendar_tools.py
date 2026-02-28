@@ -1239,3 +1239,102 @@ async def query_freebusy(
         f"[query_freebusy] Successfully retrieved free/busy information for {len(calendars)} calendar(s)"
     )
     return result_text
+
+
+@server.tool()
+@handle_http_errors("create_calendar", is_read_only=False, service_type="calendar")
+@require_google_service("calendar", "calendar_full")
+async def create_calendar(
+    service,
+    user_google_email: str,
+    summary: str,
+    description: Optional[str] = None,
+    timezone: Optional[str] = None,
+) -> str:
+    """Creates a new secondary Google Calendar.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        summary (str): The name/title of the new calendar.
+        description (Optional[str]): A description for the calendar.
+        timezone (Optional[str]): IANA timezone for the calendar (e.g., "America/New_York"). Defaults to the user's primary calendar timezone.
+
+    Returns:
+        str: Confirmation message with the new calendar's ID and name.
+    """
+    logger.info(
+        f"[create_calendar] Creating calendar '{summary}' for {user_google_email}"
+    )
+
+    body: Dict[str, Any] = {"summary": summary}
+    if description:
+        body["description"] = description
+    if timezone:
+        body["timeZone"] = timezone
+
+    result = await asyncio.to_thread(
+        lambda: service.calendars().insert(body=body).execute()
+    )
+
+    cal_id = result.get("id", "unknown")
+    cal_name = result.get("summary", summary)
+
+    logger.info(f"[create_calendar] Created calendar '{cal_name}' with ID: {cal_id}")
+    return (
+        f"Successfully created calendar '{cal_name}' for {user_google_email}.\n"
+        f"Calendar ID: {cal_id}"
+    )
+
+
+@server.tool()
+@handle_http_errors("share_calendar", is_read_only=False, service_type="calendar")
+@require_google_service("calendar", "calendar_full")
+async def share_calendar(
+    service,
+    user_google_email: str,
+    calendar_id: str,
+    share_with_email: str,
+    role: str = "reader",
+) -> str:
+    """Shares a Google Calendar with another user by adding an ACL rule.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        calendar_id (str): The ID of the calendar to share.
+        share_with_email (str): The email address of the person to share with.
+        role (str): The access role to grant. One of "freeBusyReader", "reader", "writer", or "owner". Defaults to "reader".
+
+    Returns:
+        str: Confirmation message with sharing details.
+    """
+    valid_roles = {"freeBusyReader", "reader", "writer", "owner"}
+    if role not in valid_roles:
+        return f"Invalid role '{role}'. Must be one of: {', '.join(sorted(valid_roles))}"
+
+    logger.info(
+        f"[share_calendar] Sharing calendar '{calendar_id}' with {share_with_email} as {role}"
+    )
+
+    acl_rule = {
+        "scope": {
+            "type": "user",
+            "value": share_with_email,
+        },
+        "role": role,
+    }
+
+    result = await asyncio.to_thread(
+        lambda: service.acl().insert(calendarId=calendar_id, body=acl_rule).execute()
+    )
+
+    granted_role = result.get("role", role)
+    rule_id = result.get("id", "unknown")
+
+    logger.info(
+        f"[share_calendar] Shared calendar '{calendar_id}' with {share_with_email} (role: {granted_role}, rule: {rule_id})"
+    )
+    return (
+        f"Successfully shared calendar '{calendar_id}' with {share_with_email}.\n"
+        f"Role: {granted_role}\n"
+        f"ACL Rule ID: {rule_id}"
+    )
