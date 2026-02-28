@@ -50,6 +50,8 @@ calendar:
     - get_events
     - create_event
     - modify_event
+    - create_calendar
+    - share_calendar
   extended:
     - delete_event
     - query_freebusy
