@@ -28,6 +28,7 @@ from core.config import (
     set_transport_mode as _set_transport_mode,
     get_oauth_redirect_uri as get_oauth_redirect_uri_for_current_mode,
 )
+from core.audit import audit_log, logger as audit_logger
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,6 +52,12 @@ class SecureFastMCP(FastMCP):
         # Rebuild middleware stack
         app.middleware_stack = app.build_middleware_stack()
         logger.info("Added middleware stack: Session Management")
+
+        async def _audit_startup() -> None:
+            await audit_logger().start()
+
+        app.add_event_handler("startup", _audit_startup)
+
         return app
 
 
@@ -58,6 +65,24 @@ server = SecureFastMCP(
     name="google_workspace",
     auth=None,
 )
+
+# Audit logging: wrap every registered tool with audit_log() before any
+# @server.tool() decorator fires (including start_google_auth below) and
+# before wrap_server_tool_method() runs in either entrypoint.
+_original_server_tool = server.tool
+
+
+def _audited_tool(*args, **kwargs):
+    register = _original_server_tool(*args, **kwargs)
+
+    def apply(fn):
+        return register(audit_log()(fn))
+
+    return apply
+
+
+server.tool = _audited_tool
+logger.info("Audit logging: server.tool patched")
 
 # Add the AuthInfo middleware to inject authentication into FastMCP context
 auth_info_middleware = AuthInfoMiddleware()
