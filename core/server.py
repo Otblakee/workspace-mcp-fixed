@@ -1,3 +1,4 @@
+import functools
 import logging
 import os
 from typing import List, Optional
@@ -53,12 +54,32 @@ class SecureFastMCP(FastMCP):
         app.middleware_stack = app.build_middleware_stack()
         logger.info("Added middleware stack: Session Management")
 
-        async def _audit_startup() -> None:
-            await audit_logger().start()
-
-        app.add_event_handler("startup", _audit_startup)
+        app.add_event_handler("startup", _ensure_audit_started)
 
         return app
+
+
+_audit_started = False
+
+
+async def _ensure_audit_started() -> None:
+    """Idempotent, fail-soft start of the audit background flusher.
+
+    Called from the HTTP startup event AND lazily from each audited tool
+    invocation, so the flusher runs under both streamable-http and stdio
+    transports. Catches all errors (e.g. malformed AUDIT_SA_JSON_B64) so
+    audit init never aborts server startup or tool calls.
+    """
+    global _audit_started
+    if _audit_started:
+        return
+    _audit_started = True
+    try:
+        await audit_logger().start()
+    except Exception as e:
+        logger.error(
+            "Audit logger failed to start; continuing without audit: %s", e
+        )
 
 
 server = SecureFastMCP(
@@ -76,7 +97,14 @@ def _audited_tool(*args, **kwargs):
     register = _original_server_tool(*args, **kwargs)
 
     def apply(fn):
-        return register(audit_log()(fn))
+        audited = audit_log()(fn)
+
+        @functools.wraps(audited)
+        async def with_lazy_audit_start(*a, **kw):
+            await _ensure_audit_started()
+            return await audited(*a, **kw)
+
+        return register(with_lazy_audit_start)
 
     return apply
 
