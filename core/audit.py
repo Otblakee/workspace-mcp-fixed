@@ -119,7 +119,7 @@ class AuditLogger:
     def _ensure_tab(self, tab):
         meta = self._sheets.spreadsheets().get(spreadsheetId=AUDIT_SHEET_ID).execute()
         if tab not in {s["properties"]["title"] for s in meta.get("sheets", [])}:
-            self._sheets.spreadsheets().batchUpdate(
+            add_resp = self._sheets.spreadsheets().batchUpdate(
                 spreadsheetId=AUDIT_SHEET_ID,
                 body={"requests": [{"addSheet": {"properties": {"title": tab}}}]}).execute()
             self._sheets.spreadsheets().values().update(
@@ -127,6 +127,46 @@ class AuditLogger:
                 range=f"'{tab}'!A1:I1",
                 valueInputOption="RAW",
                 body={"values": [HEADERS]}).execute()
+            try:
+                new_sheet_id = add_resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+                self._apply_tab_formatting(new_sheet_id)
+            except Exception as e:
+                log.warning("Audit tab '%s' created without conditional formatting: %s", tab, e)
+
+    def _apply_tab_formatting(self, sheet_id):
+        grid_range = {
+            "sheetId": sheet_id,
+            "startRowIndex": 1, "endRowIndex": 1000,
+            "startColumnIndex": 0, "endColumnIndex": 9,
+        }
+        write_ops_re = ('=REGEXMATCH($D2,"^(create|modify|send|delete|update|share|'
+                       'set|add|remove|transfer|batch|draft|import|copy|format|'
+                       'insert|manage|reply|resolve)_")')
+        rules = [
+            ('=$G2="error"',
+             {"red": 0.988, "green": 0.894, "blue": 0.894},
+             {"red": 0.612, "green": 0.0, "blue": 0.024}),
+            (write_ops_re,
+             {"red": 1.0, "green": 0.949, "blue": 0.8},
+             {"red": 0.498, "green": 0.376, "blue": 0.0}),
+        ]
+        requests = [{
+            "addConditionalFormatRule": {
+                "index": i,
+                "rule": {
+                    "ranges": [grid_range],
+                    "booleanRule": {
+                        "condition": {"type": "CUSTOM_FORMULA",
+                                      "values": [{"userEnteredValue": formula}]},
+                        "format": {"backgroundColor": bg,
+                                   "textFormat": {"foregroundColor": fg}},
+                    },
+                },
+            },
+        } for i, (formula, bg, fg) in enumerate(rules)]
+        self._sheets.spreadsheets().batchUpdate(
+            spreadsheetId=AUDIT_SHEET_ID,
+            body={"requests": requests}).execute()
 
 
 _inst: AuditLogger | None = None
