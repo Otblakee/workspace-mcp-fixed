@@ -548,28 +548,41 @@ async def create_drive_file(
     folder_id: str = "root",
     mime_type: str = "text/plain",
     fileUrl: Optional[str] = None,  # Now explicitly Optional
+    base64_content: Optional[str] = None,
 ) -> str:
     """
     Creates a new file in Google Drive, supporting creation within shared drives.
-    Accepts either direct content or a fileUrl to fetch the content from.
+    Accepts text content, a fileUrl to fetch from, or standard base64-encoded
+    binary content. Exactly one of these sources must be provided (unless
+    creating a folder).
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         file_name (str): The name for the new file.
-        content (Optional[str]): If provided, the content to write to the file.
+        content (Optional[str]): If provided, text content to write to the file (encoded as UTF-8).
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
-        mime_type (str): The MIME type of the file. Defaults to 'text/plain'.
+        mime_type (str): The MIME type of the file. Defaults to 'text/plain'. For binary uploads via base64_content, set this to the actual MIME type (e.g. 'image/png', 'application/pdf').
         fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
+        base64_content (Optional[str]): If provided, standard base64-encoded (NOT urlsafe) bytes to upload as the file. Use for binary file types such as PNG, PDF, etc. Set mime_type to the actual file MIME type when using this.
 
     Returns:
         str: Confirmation message of the successful file creation with file link.
     """
     logger.info(
-        f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}"
+        f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}, base64_content: {'<provided>' if base64_content else None}"
     )
 
-    if content is None and fileUrl is None and mime_type != FOLDER_MIME_TYPE:
-        raise Exception("You must provide either 'content' or 'fileUrl'.")
+    sources_provided = sum(
+        1 for x in (content, fileUrl, base64_content) if x is not None
+    )
+    if sources_provided > 1:
+        raise Exception(
+            "Provide only one of 'content', 'fileUrl', or 'base64_content'."
+        )
+    if sources_provided == 0 and mime_type != FOLDER_MIME_TYPE:
+        raise Exception(
+            "You must provide one of 'content', 'fileUrl', or 'base64_content'."
+        )
 
     # Create folder (no content or media_body). Prefer create_drive_folder for new code.
     if mime_type == FOLDER_MIME_TYPE:
@@ -758,6 +771,34 @@ async def create_drive_file(
             raise Exception(
                 f"Unsupported URL scheme '{parsed_url.scheme}'. Only file://, http://, and https:// are supported."
             )
+    elif base64_content is not None:
+        try:
+            file_data = base64.b64decode(base64_content, validate=True)
+        except (ValueError, TypeError) as e:
+            raise Exception(
+                f"base64_content is not valid standard base64 (use standard, not urlsafe, encoding): {e}"
+            )
+        logger.info(
+            f"[create_drive_file] Decoded {len(file_data)} bytes from base64_content"
+        )
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(file_data),
+            mimetype=mime_type,
+            resumable=True,
+            chunksize=UPLOAD_CHUNK_SIZE_BYTES,
+        )
+
+        created_file = await asyncio.to_thread(
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute
+        )
     elif content is not None:
         file_data = content.encode("utf-8")
         media = io.BytesIO(file_data)
