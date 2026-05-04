@@ -323,29 +323,91 @@ async def list_docs_in_folder(
 
 @server.tool()
 @handle_http_errors("create_doc", service_type="docs")
-@require_google_service("docs", "docs_write")
+@require_multiple_services(
+    [
+        {"service_type": "docs", "scopes": "docs_write", "param_name": "docs_service"},
+        {"service_type": "drive", "scopes": "drive_file", "param_name": "drive_service"},
+    ]
+)
 async def create_doc(
-    service: Any,
+    docs_service: Any,
+    drive_service: Any,
     user_google_email: str,
     title: str,
     content: str = "",
+    content_format: str = "plain",
 ) -> str:
     """
     Creates a new Google Doc and optionally inserts initial content.
 
+    Args:
+        user_google_email: The user's Google email address. Required.
+        title: Document title.
+        content: Document content. May be empty. Interpreted per content_format.
+        content_format: 'plain' (default, unchanged behaviour: content is inserted
+            as literal text) or 'markdown' (the content is uploaded as text/markdown
+            via the Drive API, and Google's server-side converter renders it with
+            native heading styles, lists, bold/italic, etc.).
+
     Returns:
         str: Confirmation message with document ID and link.
     """
-    logger.info(f"[create_doc] Invoked. Email: '{user_google_email}', Title='{title}'")
+    valid_formats = ("plain", "markdown")
+    if content_format not in valid_formats:
+        return (
+            f"Error: content_format must be one of {valid_formats}, "
+            f"got '{content_format}'"
+        )
 
+    logger.info(
+        f"[create_doc] Invoked. Email: '{user_google_email}', Title='{title}', Format='{content_format}'"
+    )
+
+    if content_format == "markdown" and content:
+        # Drive-API conversion path: upload text/markdown, target a Google Doc
+        # mimeType so Drive's server-side converter does the work. No client-side
+        # markdown parser, no extra dependencies. Same pattern as
+        # gdrive.drive_tools.import_to_google_doc.
+        media = MediaIoBaseUpload(
+            io.BytesIO(content.encode("utf-8")),
+            mimetype="text/markdown",
+            resumable=True,
+        )
+        file_metadata = {
+            "name": title,
+            "mimeType": "application/vnd.google-apps.document",
+        }
+        created = await asyncio.to_thread(
+            drive_service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute
+        )
+        doc_id = created.get("id")
+        link = (
+            created.get("webViewLink")
+            or f"https://docs.google.com/document/d/{doc_id}/edit"
+        )
+        msg = (
+            f"Created Google Doc '{title}' (ID: {doc_id}, format=markdown) "
+            f"for {user_google_email}. Link: {link}"
+        )
+        logger.info(msg)
+        return msg
+
+    # Plain path (default; unchanged behaviour for existing callers).
     doc = await asyncio.to_thread(
-        service.documents().create(body={"title": title}).execute
+        docs_service.documents().create(body={"title": title}).execute
     )
     doc_id = doc.get("documentId")
     if content:
         requests = [{"insertText": {"location": {"index": 1}, "text": content}}]
         await asyncio.to_thread(
-            service.documents()
+            docs_service.documents()
             .batchUpdate(documentId=doc_id, body={"requests": requests})
             .execute
         )
