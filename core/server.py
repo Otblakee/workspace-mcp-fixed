@@ -1,3 +1,4 @@
+import functools
 import logging
 import os
 from typing import List, Optional
@@ -28,6 +29,7 @@ from core.config import (
     set_transport_mode as _set_transport_mode,
     get_oauth_redirect_uri as get_oauth_redirect_uri_for_current_mode,
 )
+from core.audit import audit_log, logger as audit_logger
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,13 +53,64 @@ class SecureFastMCP(FastMCP):
         # Rebuild middleware stack
         app.middleware_stack = app.build_middleware_stack()
         logger.info("Added middleware stack: Session Management")
+
+        app.add_event_handler("startup", _ensure_audit_started)
+
         return app
+
+
+_audit_started = False
+
+
+async def _ensure_audit_started() -> None:
+    """Idempotent, fail-soft start of the audit background flusher.
+
+    Called from the HTTP startup event AND lazily from each audited tool
+    invocation, so the flusher runs under both streamable-http and stdio
+    transports. Catches all errors (e.g. malformed AUDIT_SA_JSON_B64) so
+    audit init never aborts server startup or tool calls.
+    """
+    global _audit_started
+    if _audit_started:
+        return
+    _audit_started = True
+    try:
+        await audit_logger().start()
+    except Exception as e:
+        logger.error(
+            "Audit logger failed to start; continuing without audit: %s", e
+        )
 
 
 server = SecureFastMCP(
     name="google_workspace",
     auth=None,
 )
+
+# Audit logging: wrap every registered tool with audit_log() before any
+# @server.tool() decorator fires (including start_google_auth below) and
+# before wrap_server_tool_method() runs in either entrypoint.
+_original_server_tool = server.tool
+
+
+def _audited_tool(*args, **kwargs):
+    register = _original_server_tool(*args, **kwargs)
+
+    def apply(fn):
+        audited = audit_log()(fn)
+
+        @functools.wraps(audited)
+        async def with_lazy_audit_start(*a, **kw):
+            await _ensure_audit_started()
+            return await audited(*a, **kw)
+
+        return register(with_lazy_audit_start)
+
+    return apply
+
+
+server.tool = _audited_tool
+logger.info("Audit logging: server.tool patched")
 
 # Add the AuthInfo middleware to inject authentication into FastMCP context
 auth_info_middleware = AuthInfoMiddleware()
