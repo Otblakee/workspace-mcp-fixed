@@ -39,7 +39,8 @@ SERVICE_MAP = {"drive": "drive", "gmail": "gmail", "calendar": "calendar",
     "permission": "drive"}
 
 SENSITIVE = {"body", "text_content", "message_body", "html_body", "values",
-             "data", "content", "notes", "description", "subject", "query"}
+             "data", "content", "notes", "description", "subject", "query",
+             "base64_content", "fileUrl", "attachments"}
 
 
 def _service(tool: str) -> str:
