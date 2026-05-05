@@ -38,6 +38,8 @@ async def _list_script_projects_impl(
         "pageSize": page_size,
         "fields": "nextPageToken, files(id, name, createdTime, modifiedTime)",
         "orderBy": "modifiedTime desc",
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
     }
     if page_token:
         request_params["pageToken"] = page_token
@@ -740,7 +742,9 @@ async def _delete_script_project_impl(
     )
 
     # Apps Script projects are stored as Drive files
-    await asyncio.to_thread(service.files().delete(fileId=script_id).execute)
+    await asyncio.to_thread(
+        service.files().delete(fileId=script_id, supportsAllDrives=True).execute
+    )
 
     logger.info(f"[delete_script_project] Deleted script {script_id}")
     return f"Deleted Apps Script project: {script_id}"

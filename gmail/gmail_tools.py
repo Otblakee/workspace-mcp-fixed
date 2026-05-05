@@ -1394,6 +1394,35 @@ async def draft_gmail_message(
     return f"Draft created{attachment_info}! Draft ID: {draft_id}"
 
 
+@server.tool()
+@handle_http_errors("delete_gmail_draft", service_type="gmail")
+@require_google_service("gmail", GMAIL_COMPOSE_SCOPE)
+async def delete_gmail_draft(
+    service,
+    user_google_email: str,
+    draft_id: str = Field(..., description="ID of the draft to delete (e.g. 'r-4409920494913194848')."),
+) -> str:
+    """
+    Permanently deletes a Gmail draft by ID.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        draft_id (str): The ID of the draft to delete (returned by draft_gmail_message).
+
+    Returns:
+        str: Confirmation message for the deletion.
+    """
+    logger.info(
+        f"[delete_gmail_draft] Invoked. Email: '{user_google_email}', Draft ID: '{draft_id}'"
+    )
+
+    await asyncio.to_thread(
+        service.users().drafts().delete(userId="me", id=draft_id).execute
+    )
+
+    return f"Draft deleted successfully. Draft ID: {draft_id}"
+
+
 def _format_thread_content(thread_data: dict, thread_id: str) -> str:
     """
     Helper function to format thread content from Gmail API response.

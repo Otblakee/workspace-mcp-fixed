@@ -1138,6 +1138,7 @@ async def create_spreadsheet(
     user_google_email: str,
     title: str,
     sheet_names: Optional[List[str]] = None,
+    locale: str = "en_GB",
 ) -> str:
     """
     Creates a new Google Spreadsheet.
@@ -1146,15 +1147,16 @@ async def create_spreadsheet(
         user_google_email (str): The user's Google email address. Required.
         title (str): The title of the new spreadsheet. Required.
         sheet_names (Optional[List[str]]): List of sheet names to create. If not provided, creates one sheet with default name.
+        locale (str): IETF BCP 47 locale tag (e.g. 'en_GB', 'en_US', 'fr_FR'). Defaults to 'en_GB'. Controls default currency, date and number formats.
 
     Returns:
         str: Information about the newly created spreadsheet including ID, URL, and locale.
     """
     logger.info(
-        f"[create_spreadsheet] Invoked. Email: '{user_google_email}', Title: {title}"
+        f"[create_spreadsheet] Invoked. Email: '{user_google_email}', Title: {title}, Locale: {locale}"
     )
 
-    spreadsheet_body = {"properties": {"title": title}}
+    spreadsheet_body = {"properties": {"title": title, "locale": locale}}
 
     if sheet_names:
         spreadsheet_body["sheets"] = [
