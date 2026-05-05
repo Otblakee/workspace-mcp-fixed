@@ -321,17 +321,22 @@ async def list_docs_in_folder(
     return "\n".join(out)
 
 
+@require_google_service("drive", "drive_file")
+async def _create_doc_drive_service(service: Any, user_google_email: str) -> Any:
+    """Lazily fetch a Drive service for the markdown branch of create_doc.
+
+    Kept separate from create_doc so the default plain path requires only
+    docs_write scope; clients with Docs-only credentials still work for
+    plain creation.
+    """
+    return service
+
+
 @server.tool()
 @handle_http_errors("create_doc", service_type="docs")
-@require_multiple_services(
-    [
-        {"service_type": "docs", "scopes": "docs_write", "param_name": "docs_service"},
-        {"service_type": "drive", "scopes": "drive_file", "param_name": "drive_service"},
-    ]
-)
+@require_google_service("docs", "docs_write")
 async def create_doc(
-    docs_service: Any,
-    drive_service: Any,
+    service: Any,
     user_google_email: str,
     title: str,
     content: str = "",
@@ -347,7 +352,9 @@ async def create_doc(
         content_format: 'plain' (default, unchanged behaviour: content is inserted
             as literal text) or 'markdown' (the content is uploaded as text/markdown
             via the Drive API, and Google's server-side converter renders it with
-            native heading styles, lists, bold/italic, etc.).
+            native heading styles, lists, bold/italic, etc.). The markdown path
+            additionally requires drive_file scope; the plain path needs only
+            docs_write.
 
     Returns:
         str: Confirmation message with document ID and link.
@@ -367,7 +374,11 @@ async def create_doc(
         # Drive-API conversion path: upload text/markdown, target a Google Doc
         # mimeType so Drive's server-side converter does the work. No client-side
         # markdown parser, no extra dependencies. Same pattern as
-        # gdrive.drive_tools.import_to_google_doc.
+        # gdrive.drive_tools.import_to_google_doc. Drive scope is acquired
+        # lazily here so the plain path remains docs_write-only.
+        drive_service = await _create_doc_drive_service(
+            user_google_email=user_google_email
+        )
         media = MediaIoBaseUpload(
             io.BytesIO(content.encode("utf-8")),
             mimetype="text/markdown",
@@ -401,13 +412,13 @@ async def create_doc(
 
     # Plain path (default; unchanged behaviour for existing callers).
     doc = await asyncio.to_thread(
-        docs_service.documents().create(body={"title": title}).execute
+        service.documents().create(body={"title": title}).execute
     )
     doc_id = doc.get("documentId")
     if content:
         requests = [{"insertText": {"location": {"index": 1}, "text": content}}]
         await asyncio.to_thread(
-            docs_service.documents()
+            service.documents()
             .batchUpdate(documentId=doc_id, body={"requests": requests})
             .execute
         )

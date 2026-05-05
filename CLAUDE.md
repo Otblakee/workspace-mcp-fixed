@@ -81,10 +81,13 @@ server-side converter render headings, lists, bold/italic, etc. as native Doc
 styles. Same upload pattern as `gdrive.drive_tools.import_to_google_doc`. No
 client-side markdown parser, no new dependency.
 
-The `create_doc` decorator switched from `@require_google_service('docs',
-'docs_write')` to `@require_multiple_services(docs+drive)` so the function
-holds both clients. The injected parameters are `docs_service` and
-`drive_service`; the public MCP signature seen by clients is unchanged.
+`create_doc` keeps its original `@require_google_service('docs', 'docs_write')`
+decorator so the default plain path requires only Docs scope — clients with
+Docs-only credentials still work for plain creation. The Drive service is
+acquired lazily via a small `_create_doc_drive_service` helper (decorated
+with `@require_google_service('drive', 'drive_file')`) that's only called
+inside the markdown branch when content is non-empty. The public MCP
+signature seen by clients is unchanged.
 
 Markdown subset that should work end-to-end via Google's converter:
 `#`/`##`/`###` headings, `-`/`*` bulleted lists, `1.` numbered lists,

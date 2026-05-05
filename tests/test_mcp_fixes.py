@@ -202,14 +202,30 @@ class TestCreateDocMarkdown:
         assert "content_format" in sig.parameters
         assert sig.parameters["content_format"].default == "plain"
 
+    def test_decorator_requires_only_docs_scope(self):
+        """The plain default path must only require docs_write — Codex P2 from
+        PR #2 review. If the @require_google_service decorator were swapped
+        to @require_multiple_services (docs+drive), every plain create_doc
+        call would suddenly need drive_file scope too, breaking docs-only
+        tokens."""
+        src = (REPO_ROOT / "gdocs" / "docs_tools.py").read_text()
+        assert (
+            '@require_google_service("docs", "docs_write")\n'
+            "async def create_doc("
+        ) in src
+        # The Drive service is fetched lazily by a separate helper.
+        assert (
+            '@require_google_service("drive", "drive_file")\n'
+            "async def _create_doc_drive_service("
+        ) in src
+
     @pytest.mark.asyncio
     async def test_invalid_format_returns_error_string(self):
         from gdocs.docs_tools import create_doc
 
         impl = _unwrap(create_doc)
         result = await impl(
-            docs_service=MagicMock(),
-            drive_service=MagicMock(),
+            service=MagicMock(),
             user_google_email=LIVE_USER,
             title="t",
             content="x",
@@ -218,13 +234,14 @@ class TestCreateDocMarkdown:
         assert "Error" in result and "content_format" in result
 
     @pytest.mark.asyncio
-    async def test_markdown_routes_through_drive_api(self):
+    async def test_markdown_routes_through_drive_api(self, monkeypatch):
         """When content_format='markdown' and content is non-empty, the impl
-        must call drive_service.files().create() with text/markdown and a
-        Google Doc target mimeType — and must NOT call docs_service."""
-        from gdocs.docs_tools import create_doc
+        must lazily acquire a Drive service via _create_doc_drive_service,
+        then call drive.files().create() with text/markdown source and a
+        Google Doc target mimeType — and must NOT touch the Docs service."""
+        from gdocs import docs_tools
 
-        impl = _unwrap(create_doc)
+        impl = _unwrap(docs_tools.create_doc)
         docs_service = MagicMock()
         drive_service = MagicMock()
         drive_service.files.return_value.create.return_value.execute.return_value = {
@@ -233,9 +250,15 @@ class TestCreateDocMarkdown:
             "webViewLink": "https://docs.google.com/document/d/doc-1/edit",
         }
 
+        async def fake_drive_helper(user_google_email):
+            return drive_service
+
+        monkeypatch.setattr(
+            docs_tools, "_create_doc_drive_service", fake_drive_helper
+        )
+
         await impl(
-            docs_service=docs_service,
-            drive_service=drive_service,
+            service=docs_service,
             user_google_email=LIVE_USER,
             title="t",
             content="# Hello\n- a\n- b",
@@ -252,62 +275,73 @@ class TestCreateDocMarkdown:
         docs_service.documents.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_plain_default_still_uses_docs_api(self):
+    async def test_plain_default_still_uses_docs_api(self, monkeypatch):
         """No regression: default content_format='plain' (or unset) must still
-        call docs_service.documents().create() and never the Drive API."""
-        from gdocs.docs_tools import create_doc
+        call docs.documents().create() and must NEVER reach for Drive — even
+        as a lazy helper invocation. This is what makes docs-only credentials
+        keep working."""
+        from gdocs import docs_tools
 
-        impl = _unwrap(create_doc)
+        impl = _unwrap(docs_tools.create_doc)
         docs_service = MagicMock()
-        drive_service = MagicMock()
         docs_service.documents.return_value.create.return_value.execute.return_value = {
             "documentId": "doc-2"
         }
 
+        async def boom(user_google_email):  # pragma: no cover
+            raise AssertionError(
+                "_create_doc_drive_service must not be called on the plain path"
+            )
+
+        monkeypatch.setattr(docs_tools, "_create_doc_drive_service", boom)
+
         # Default — no content_format passed.
         await impl(
-            docs_service=docs_service,
-            drive_service=drive_service,
+            service=docs_service,
             user_google_email=LIVE_USER,
             title="t",
             content="hello",
         )
 
         docs_service.documents.return_value.create.assert_called_once()
-        drive_service.files.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_empty_content_does_not_invoke_drive(self):
+    async def test_empty_content_does_not_invoke_drive(self, monkeypatch):
         """Empty content + markdown should fall through to the plain path
-        (creates the empty Doc) — the Drive converter would 400 on empty."""
-        from gdocs.docs_tools import create_doc
+        (creates the empty Doc) — the Drive converter would 400 on empty,
+        and we shouldn't even acquire a Drive service for the empty case."""
+        from gdocs import docs_tools
 
-        impl = _unwrap(create_doc)
+        impl = _unwrap(docs_tools.create_doc)
         docs_service = MagicMock()
-        drive_service = MagicMock()
         docs_service.documents.return_value.create.return_value.execute.return_value = {
             "documentId": "doc-3"
         }
 
+        async def boom(user_google_email):  # pragma: no cover
+            raise AssertionError(
+                "Empty markdown must not acquire Drive scope"
+            )
+
+        monkeypatch.setattr(docs_tools, "_create_doc_drive_service", boom)
+
         await impl(
-            docs_service=docs_service,
-            drive_service=drive_service,
+            service=docs_service,
             user_google_email=LIVE_USER,
             title="empty",
             content="",
             content_format="markdown",
         )
 
-        drive_service.files.assert_not_called()
         docs_service.documents.return_value.create.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_large_markdown_does_not_crash(self):
+    async def test_large_markdown_does_not_crash(self, monkeypatch):
         """50KB markdown blob round-trips through the impl without truncation
         or memory issues — important for Render's 512MB starter plan."""
-        from gdocs.docs_tools import create_doc
+        from gdocs import docs_tools
 
-        impl = _unwrap(create_doc)
+        impl = _unwrap(docs_tools.create_doc)
         big = "# Heading\n" + ("- item\n" * 8000)  # ~50KB
         assert len(big) > 50_000
 
@@ -317,9 +351,15 @@ class TestCreateDocMarkdown:
             "webViewLink": "x",
         }
 
+        async def fake_drive_helper(user_google_email):
+            return drive_service
+
+        monkeypatch.setattr(
+            docs_tools, "_create_doc_drive_service", fake_drive_helper
+        )
+
         await impl(
-            docs_service=MagicMock(),
-            drive_service=drive_service,
+            service=MagicMock(),
             user_google_email=LIVE_USER,
             title="big",
             content=big,
