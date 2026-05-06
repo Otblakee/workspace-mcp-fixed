@@ -1,0 +1,75 @@
+# Render service definition for OTB workspace-mcp-fixed.
+#
+# Single-worker async server (the FastMCP streamable-HTTP transport is
+# session-stateful; multi-worker requires shared session storage and
+# sticky routing — see the Task 3 audit for details).
+#
+# A persistent Render Disk is mounted at /data so OAuth tokens, FastMCP
+# OAuth-proxy state, and Gmail/Chat attachments survive redeploys. The
+# in-container default credentials path (~/.google_workspace_mcp/credentials)
+# is overridden via WORKSPACE_MCP_CREDENTIALS_DIR.
+#
+# After applying this file, the following env vars MUST still be set in
+# the Render dashboard (they're secrets, not stored in the repo):
+#   - GOOGLE_OAUTH_CLIENT_ID
+#   - GOOGLE_OAUTH_CLIENT_SECRET
+#   - GOOGLE_OAUTH_REDIRECT_URI
+#   - AUDIT_SHEET_ID
+#   - FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY (recommended; otherwise
+#     derived from the client secret on every restart)
+#
+# Do NOT set WORKSPACE_MCP_STATELESS_MODE=true here — it disables the
+# disk-backed credential store at auth/google_auth.py:623,692,745 and
+# defeats the whole point of the disk.
+
+services:
+  - type: web
+    name: workspace-mcp
+    runtime: docker
+    plan: standard
+    region: frankfurt  # set to whichever Render region you're using
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /health
+    disk:
+      name: workspace-mcp-data
+      mountPath: /data
+      sizeGB: 1  # tokens are tiny; bump if attachment storage grows
+    envVars:
+      # ---- credential / OAuth state persistence on the mounted disk ----
+      - key: WORKSPACE_MCP_CREDENTIALS_DIR
+        value: /data/credentials
+      - key: WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND
+        value: disk
+      - key: WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY
+        value: /data/oauth-proxy
+      - key: WORKSPACE_ATTACHMENT_DIR
+        value: /data/attachments
+
+      # ---- explicitly NOT stateless: tokens must be persisted ----
+      - key: WORKSPACE_MCP_STATELESS_MODE
+        value: "false"
+
+      # ---- OAuth 2.1 mode (per CLAUDE.md, single-user oliver@otbgroup.co.uk) ----
+      - key: MCP_ENABLE_OAUTH21
+        value: "true"
+
+      # ---- audit logger tunables (see CLAUDE.md) ----
+      - key: AUDIT_FLUSH_INTERVAL_S
+        value: "30"
+      - key: AUDIT_BATCH_SIZE
+        value: "50"
+      - key: DEFAULT_USER
+        value: oli
+
+      # ---- secrets: set in dashboard, not in repo ----
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_OAUTH_REDIRECT_URI
+        sync: false
+      - key: AUDIT_SHEET_ID
+        sync: false
+      - key: FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY
+        sync: false

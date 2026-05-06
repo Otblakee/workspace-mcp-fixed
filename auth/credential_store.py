@@ -11,9 +11,16 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Optional, List
 from datetime import datetime
+
+from filelock import FileLock, Timeout
 from google.oauth2.credentials import Credentials
 
 logger = logging.getLogger(__name__)
+
+# How long to wait for the per-file lock before giving up. A token refresh
+# write should complete in milliseconds; 10s is generous and still surfaces
+# stuck-lock pathologies fast.
+_CREDENTIAL_LOCK_TIMEOUT_S = 10
 
 
 class CredentialStore(ABC):
@@ -165,8 +172,17 @@ class LocalDirectoryCredentialStore(CredentialStore):
             return None
 
     def store_credential(self, user_email: str, credentials: Credentials) -> bool:
-        """Store credentials to local JSON file."""
+        """Store credentials to local JSON file.
+
+        Crash- and concurrent-write safe: takes a per-file FileLock to
+        serialise writers, writes to ``<path>.tmp``, fsyncs the temp file,
+        then ``os.replace``s it onto the real path (atomic on POSIX). A
+        reader without the lock either sees the old file or the new file —
+        never a partial mid-write file.
+        """
         creds_path = self._get_credential_path(user_email)
+        tmp_path = creds_path + ".tmp"
+        lock_path = creds_path + ".lock"
 
         creds_data = {
             "token": credentials.token,
@@ -179,11 +195,34 @@ class LocalDirectoryCredentialStore(CredentialStore):
         }
 
         try:
-            with open(creds_path, "w") as f:
-                json.dump(creds_data, f, indent=2)
+            with FileLock(lock_path, timeout=_CREDENTIAL_LOCK_TIMEOUT_S):
+                fd = os.open(
+                    tmp_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                    0o600,
+                )
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        json.dump(creds_data, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_path, creds_path)
+                except Exception:
+                    # Best-effort cleanup; the lock release in the outer
+                    # `with` runs regardless.
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
             logger.info(f"Stored credentials for {user_email} to {creds_path}")
             return True
-        except IOError as e:
+        except Timeout:
+            logger.error(
+                f"Timed out acquiring credential lock for {user_email} at {lock_path}"
+            )
+            return False
+        except (IOError, OSError) as e:
             logger.error(
                 f"Error storing credentials for {user_email} to {creds_path}: {e}"
             )
