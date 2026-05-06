@@ -167,33 +167,6 @@ class AuditLogger:
                 for entry in batch:
                     log.error("AUDIT_FALLBACK %s", json.dumps(entry))
 
-
-def _run_periodic_memory_sweeps() -> None:
-    """Periodic memory hygiene driven from the audit flush loop.
-
-    Collected here because the audit logger is the only always-on async task
-    in the server. Each sweep is fail-soft so a broken one can't take down
-    the loop.
-    """
-    try:
-        from core.attachment_storage import get_attachment_storage
-        removed = get_attachment_storage().cleanup_expired()
-        if removed:
-            log.info("Attachment cleanup removed %d expired files", removed)
-    except Exception as e:
-        log.debug("Attachment cleanup sweep failed: %s", e)
-    try:
-        from auth.oauth21_session_store import get_oauth21_session_store
-        store = get_oauth21_session_store()
-        # Cleanup expired OAuth states (already locked-and-locked-down by store).
-        with store._lock:  # safe: same RLock used internally everywhere
-            store._cleanup_expired_oauth_states_locked()
-        # Sweep orphaned MCP→user mappings whose backing session was deleted
-        # elsewhere; bounded work.
-        store.cleanup_orphaned_mappings()
-    except Exception as e:
-        log.debug("OAuth session sweep failed: %s", e)
-
     async def _flush(self, batch):
         sheets = await asyncio.to_thread(self._build_sheets_for_batch, batch)
         if sheets is None:
@@ -291,6 +264,33 @@ def _run_periodic_memory_sweeps() -> None:
         sheets.spreadsheets().batchUpdate(
             spreadsheetId=AUDIT_SHEET_ID,
             body={"requests": requests}).execute()
+
+
+def _run_periodic_memory_sweeps() -> None:
+    """Periodic memory hygiene driven from the audit flush loop.
+
+    Collected here because the audit logger is the only always-on async task
+    in the server. Each sweep is fail-soft so a broken one can't take down
+    the loop.
+    """
+    try:
+        from core.attachment_storage import get_attachment_storage
+        removed = get_attachment_storage().cleanup_expired()
+        if removed:
+            log.info("Attachment cleanup removed %d expired files", removed)
+    except Exception as e:
+        log.debug("Attachment cleanup sweep failed: %s", e)
+    try:
+        from auth.oauth21_session_store import get_oauth21_session_store
+        store = get_oauth21_session_store()
+        # Cleanup expired OAuth states (already locked-and-locked-down by store).
+        with store._lock:  # safe: same RLock used internally everywhere
+            store._cleanup_expired_oauth_states_locked()
+        # Sweep orphaned MCP→user mappings whose backing session was deleted
+        # elsewhere; bounded work.
+        store.cleanup_orphaned_mappings()
+    except Exception as e:
+        log.debug("OAuth session sweep failed: %s", e)
 
 
 _inst: Optional[AuditLogger] = None
