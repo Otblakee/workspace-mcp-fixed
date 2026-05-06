@@ -10,6 +10,7 @@ in CLAUDE.md."""
 
 import asyncio
 import functools
+import gc
 import json
 import logging
 import os
@@ -123,10 +124,15 @@ def _resolve_credentials(user_email: str):
 
 
 class AuditLogger:
+    # Run periodic memory-hygiene sweeps every Nth flush iteration.
+    # At FLUSH_S=30, N=10 ≈ once every 5 minutes.
+    _SWEEP_EVERY_N_TICKS = 10
+
     def __init__(self):
         self.q: asyncio.Queue = asyncio.Queue(maxsize=5000)
         self._task = None
         self._current_tab = None
+        self._tick = 0
 
     async def start(self):
         if not ENABLED:
@@ -146,6 +152,9 @@ class AuditLogger:
     async def _loop(self):
         while True:
             await asyncio.sleep(FLUSH_S)
+            self._tick += 1
+            if self._tick % self._SWEEP_EVERY_N_TICKS == 0:
+                _run_periodic_memory_sweeps()
             batch = []
             while not self.q.empty() and len(batch) < BATCH:
                 batch.append(self.q.get_nowait())
@@ -158,22 +167,55 @@ class AuditLogger:
                 for entry in batch:
                     log.error("AUDIT_FALLBACK %s", json.dumps(entry))
 
+
+def _run_periodic_memory_sweeps() -> None:
+    """Periodic memory hygiene driven from the audit flush loop.
+
+    Collected here because the audit logger is the only always-on async task
+    in the server. Each sweep is fail-soft so a broken one can't take down
+    the loop.
+    """
+    try:
+        from core.attachment_storage import get_attachment_storage
+        removed = get_attachment_storage().cleanup_expired()
+        if removed:
+            log.info("Attachment cleanup removed %d expired files", removed)
+    except Exception as e:
+        log.debug("Attachment cleanup sweep failed: %s", e)
+    try:
+        from auth.oauth21_session_store import get_oauth21_session_store
+        store = get_oauth21_session_store()
+        # Cleanup expired OAuth states (already locked-and-locked-down by store).
+        with store._lock:  # safe: same RLock used internally everywhere
+            store._cleanup_expired_oauth_states_locked()
+        # Sweep orphaned MCP→user mappings whose backing session was deleted
+        # elsewhere; bounded work.
+        store.cleanup_orphaned_mappings()
+    except Exception as e:
+        log.debug("OAuth session sweep failed: %s", e)
+
     async def _flush(self, batch):
         sheets = await asyncio.to_thread(self._build_sheets_for_batch, batch)
         if sheets is None:
             raise RuntimeError("no usable user OAuth credentials in batch")
-        tab = datetime.now(timezone.utc).strftime("%Y-%m")
-        if tab != self._current_tab:
-            await asyncio.to_thread(self._ensure_tab, sheets, tab)
-            self._current_tab = tab
-        rows = [[e.get(h, "") for h in HEADERS] for e in batch]
-        await asyncio.to_thread(
-            sheets.spreadsheets().values().append(
-                spreadsheetId=AUDIT_SHEET_ID,
-                range=f"'{tab}'!A:I",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body={"values": rows}).execute)
+        try:
+            tab = datetime.now(timezone.utc).strftime("%Y-%m")
+            if tab != self._current_tab:
+                await asyncio.to_thread(self._ensure_tab, sheets, tab)
+                self._current_tab = tab
+            rows = [[e.get(h, "") for h in HEADERS] for e in batch]
+            await asyncio.to_thread(
+                sheets.spreadsheets().values().append(
+                    spreadsheetId=AUDIT_SHEET_ID,
+                    range=f"'{tab}'!A:I",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": rows}).execute)
+        finally:
+            # Drop the per-flush sheets client; googleapiclient Resource trees
+            # retain circular refs that defy refcount cleanup.
+            await asyncio.to_thread(sheets.close)
+            gc.collect()
 
     def _build_sheets_for_batch(self, batch):
         """Fresh Sheets client per flush, built from the first user in the
@@ -284,6 +326,13 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                 raise
             finally:
                 try:
+                    # Extract resource_id eagerly so we can drop the full
+                    # response body before yielding to the queue submit.
+                    # Sheets calls with includeValuesInResponse=True can echo
+                    # back many KB of data that we'd otherwise pin in the
+                    # `wrap` frame across the queue put.
+                    resource_id = _resource_id(result, kwargs)
+                    result = None
                     user = await _resolve_user_email()
                     if user == DEFAULT_USER and user_resolver is not None:
                         try:
@@ -296,7 +345,7 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                         "service": _service(fn.__name__),
                         "tool": fn.__name__,
                         "params_summary": _redact(kwargs),
-                        "resource_id": _resource_id(result, kwargs),
+                        "resource_id": resource_id,
                         "status": status,
                         "error": err,
                         "latency_ms": int((time.perf_counter() - t0) * 1000),

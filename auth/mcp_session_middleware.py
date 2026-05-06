@@ -74,12 +74,18 @@ class MCPSessionMiddleware(BaseHTTPMiddleware):
                 elif not effective_session_id and mcp_session_id:
                     effective_session_id = mcp_session_id
 
+                # Don't pin the raw Starlette Request on the contextvar — under
+                # streamable-http it transitively keeps the receive/send
+                # callbacks and any in-flight body buffers alive for the full
+                # duration of the downstream coroutine. Copy the small bits we
+                # actually consume into metadata; nothing in the codebase reads
+                # `session_context.request` directly.
                 session_context = SessionContext(
                     session_id=effective_session_id,
                     user_id=user_email
                     or (auth_context.user_id if auth_context else None),
                     auth_context=auth_context,
-                    request=request,
+                    request=None,
                     metadata={
                         "path": request.url.path,
                         "method": request.method,

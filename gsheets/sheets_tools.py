@@ -355,20 +355,23 @@ async def modify_sheet_values(
     else:
         body = {"values": values}
 
+        # Only USER_ENTERED can produce evaluated error tokens (#VALUE!, #REF!,
+        # #N/A, …). RAW writes literal strings, so requesting the evaluated
+        # values back is pure waste of memory and bandwidth — and a 30-write
+        # burst with this echo enabled is large enough to OOM a 512 MB worker.
+        wants_evaluated = (value_input_option or "").upper() == "USER_ENTERED"
+        update_kwargs = {
+            "spreadsheetId": spreadsheet_id,
+            "range": range_name,
+            "valueInputOption": value_input_option,
+            "body": body,
+        }
+        if wants_evaluated:
+            update_kwargs["includeValuesInResponse"] = True
+            update_kwargs["responseValueRenderOption"] = "FORMATTED_VALUE"
+
         result = await asyncio.to_thread(
-            service.spreadsheets()
-            .values()
-            .update(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
-                valueInputOption=value_input_option,
-                # NOTE: This increases response payload/shape by including `updatedData`, but lets
-                # us detect Sheets error tokens (e.g. "#VALUE!", "#REF!") without an extra read.
-                includeValuesInResponse=True,
-                responseValueRenderOption="FORMATTED_VALUE",
-                body=body,
-            )
-            .execute
+            service.spreadsheets().values().update(**update_kwargs).execute
         )
 
         updated_cells = result.get("updatedCells", 0)

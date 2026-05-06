@@ -14,7 +14,7 @@ import socket
 from contextlib import asynccontextmanager
 
 from typing import AsyncIterator, Optional, List, Dict, Any
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, SpooledTemporaryFile
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import url2pathname
 from pathlib import Path
@@ -47,6 +47,12 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_CHUNK_SIZE_BYTES = 256 * 1024  # 256 KB
 UPLOAD_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (Google recommended minimum)
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB safety limit for URL downloads
+# Hard cap for base64-encoded uploads (~67 MB ASCII -> ~50 MB binary). Set
+# below the 512 MB Render limit with headroom for the in-flight ASCII string
+# the caller already has live in kwargs.
+MAX_BASE64_INPUT_BYTES = 64 * 1024 * 1024
+# Decode base64 in 4 MB ASCII windows (each yields ~3 MB binary).
+_BASE64_DECODE_CHUNK = 4 * 1024 * 1024
 
 
 @server.tool()
@@ -647,55 +653,24 @@ async def create_drive_file(
 
             logger.info(f"[create_drive_file] Reading local file: {file_path}")
 
-            # Read file and upload
-            file_data = await asyncio.to_thread(path_obj.read_bytes)
-            total_bytes = len(file_data)
-            logger.info(f"[create_drive_file] Read {total_bytes} bytes from local file")
-
-            media = MediaIoBaseUpload(
-                io.BytesIO(file_data),
-                mimetype=mime_type,
-                resumable=True,
-                chunksize=UPLOAD_CHUNK_SIZE_BYTES,
-            )
-
-            logger.info("[create_drive_file] Starting upload to Google Drive...")
-            created_file = await asyncio.to_thread(
-                service.files()
-                .create(
-                    body=file_metadata,
-                    media_body=media,
-                    fields="id, name, webViewLink",
-                    supportsAllDrives=True,
+            # Stream the file straight from disk to MediaIoBaseUpload — no
+            # intermediate full-file BytesIO. googleapiclient handles seeks
+            # for resumable chunking.
+            file_handle = await asyncio.to_thread(open, path_obj, "rb")
+            try:
+                total_bytes = path_obj.stat().st_size
+                logger.info(
+                    f"[create_drive_file] Streaming {total_bytes} bytes from local file"
                 )
-                .execute
-            )
-        # Handle HTTP/HTTPS URLs
-        elif parsed_url.scheme in ("http", "https"):
-            # when running in stateless mode, deployment may not have access to local file system
-            if is_stateless_mode():
-                resp = await _ssrf_safe_fetch(fileUrl)
-                if resp.status_code != 200:
-                    raise Exception(
-                        f"Failed to fetch file from URL: {fileUrl} (status {resp.status_code})"
-                    )
-                file_data = resp.content
-                # Try to get MIME type from Content-Type header
-                content_type = resp.headers.get("Content-Type")
-                if content_type and content_type != "application/octet-stream":
-                    mime_type = content_type
-                    file_metadata["mimeType"] = content_type
-                    logger.info(
-                        f"[create_drive_file] Using MIME type from Content-Type header: {content_type}"
-                    )
 
                 media = MediaIoBaseUpload(
-                    io.BytesIO(file_data),
+                    file_handle,
                     mimetype=mime_type,
                     resumable=True,
                     chunksize=UPLOAD_CHUNK_SIZE_BYTES,
                 )
 
+                logger.info("[create_drive_file] Starting upload to Google Drive...")
                 created_file = await asyncio.to_thread(
                     service.files()
                     .create(
@@ -706,6 +681,63 @@ async def create_drive_file(
                     )
                     .execute
                 )
+            finally:
+                file_handle.close()
+        # Handle HTTP/HTTPS URLs
+        elif parsed_url.scheme in ("http", "https"):
+            # Stateless mode: stream into SpooledTemporaryFile (RAM up to 5MB,
+            # disk-spilled beyond) instead of buffering the whole body in RAM.
+            if is_stateless_mode():
+                spool = SpooledTemporaryFile(max_size=UPLOAD_CHUNK_SIZE_BYTES)
+                try:
+                    total_bytes = 0
+                    content_type = None
+
+                    async with _ssrf_safe_stream(fileUrl) as resp:
+                        if resp.status_code != 200:
+                            raise Exception(
+                                f"Failed to fetch file from URL: {fileUrl} (status {resp.status_code})"
+                            )
+
+                        content_type = resp.headers.get("Content-Type")
+
+                        async for chunk in resp.aiter_bytes(
+                            chunk_size=DOWNLOAD_CHUNK_SIZE_BYTES
+                        ):
+                            total_bytes += len(chunk)
+                            if total_bytes > MAX_DOWNLOAD_BYTES:
+                                raise Exception(
+                                    f"Download exceeded {MAX_DOWNLOAD_BYTES} byte limit"
+                                )
+                            await asyncio.to_thread(spool.write, chunk)
+
+                    if content_type and content_type != "application/octet-stream":
+                        mime_type = content_type
+                        file_metadata["mimeType"] = content_type
+                        logger.info(
+                            f"[create_drive_file] Using MIME type from Content-Type header: {content_type}"
+                        )
+
+                    spool.seek(0)
+                    media = MediaIoBaseUpload(
+                        spool,
+                        mimetype=mime_type,
+                        resumable=True,
+                        chunksize=UPLOAD_CHUNK_SIZE_BYTES,
+                    )
+
+                    created_file = await asyncio.to_thread(
+                        service.files()
+                        .create(
+                            body=file_metadata,
+                            media_body=media,
+                            fields="id, name, webViewLink",
+                            supportsAllDrives=True,
+                        )
+                        .execute
+                    )
+                finally:
+                    spool.close()
             else:
                 # Stream download to temp file with SSRF protection, then upload
                 with NamedTemporaryFile() as temp_file:
@@ -776,33 +808,54 @@ async def create_drive_file(
                 f"Unsupported URL scheme '{parsed_url.scheme}'. Only file://, http://, and https:// are supported."
             )
     elif base64_content is not None:
-        try:
-            file_data = base64.b64decode(base64_content, validate=True)
-        except (ValueError, TypeError) as e:
+        # Reject early if the ASCII payload exceeds the hard cap.
+        if len(base64_content) > MAX_BASE64_INPUT_BYTES:
             raise Exception(
-                f"base64_content is not valid standard base64 (use standard, not urlsafe, encoding): {e}"
+                f"base64_content is {len(base64_content)} bytes; "
+                f"exceeds {MAX_BASE64_INPUT_BYTES} byte limit. Use fileUrl for larger files."
             )
-        logger.info(
-            f"[create_drive_file] Decoded {len(file_data)} bytes from base64_content"
-        )
 
-        media = MediaIoBaseUpload(
-            io.BytesIO(file_data),
-            mimetype=mime_type,
-            resumable=True,
-            chunksize=UPLOAD_CHUNK_SIZE_BYTES,
-        )
-
-        created_file = await asyncio.to_thread(
-            service.files()
-            .create(
-                body=file_metadata,
-                media_body=media,
-                fields="id, name, webViewLink",
-                supportsAllDrives=True,
+        # Stream the decode into a SpooledTemporaryFile so peak memory stays
+        # bounded — small payloads stay in RAM, large ones spill to disk.
+        # base64 length must be a multiple of 4; chunk on a 4-byte boundary.
+        spool = SpooledTemporaryFile(max_size=UPLOAD_CHUNK_SIZE_BYTES)
+        total_bytes = 0
+        try:
+            try:
+                for i in range(0, len(base64_content), _BASE64_DECODE_CHUNK):
+                    chunk = base64_content[i : i + _BASE64_DECODE_CHUNK]
+                    decoded = base64.b64decode(chunk, validate=True)
+                    spool.write(decoded)
+                    total_bytes += len(decoded)
+            except (ValueError, TypeError) as e:
+                spool.close()
+                raise Exception(
+                    f"base64_content is not valid standard base64 (use standard, not urlsafe, encoding): {e}"
+                )
+            spool.seek(0)
+            logger.info(
+                f"[create_drive_file] Decoded {total_bytes} bytes from base64_content"
             )
-            .execute
-        )
+
+            media = MediaIoBaseUpload(
+                spool,
+                mimetype=mime_type,
+                resumable=True,
+                chunksize=UPLOAD_CHUNK_SIZE_BYTES,
+            )
+
+            created_file = await asyncio.to_thread(
+                service.files()
+                .create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields="id, name, webViewLink",
+                    supportsAllDrives=True,
+                )
+                .execute
+            )
+        finally:
+            spool.close()
     elif content is not None:
         file_data = content.encode("utf-8")
         media = io.BytesIO(file_data)

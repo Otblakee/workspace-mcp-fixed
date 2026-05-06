@@ -1,6 +1,7 @@
 # auth/google_auth.py
 
 import asyncio
+import gc
 import json
 import jwt
 import logging
@@ -827,6 +828,9 @@ def get_user_info(
     finally:
         if service:
             service.close()
+        # googleapiclient's Resource tree retains circular references; an
+        # explicit collect after close() prevents per-call memory creep.
+        gc.collect()
 
 
 # --- Centralized Google Service Authentication ---

@@ -756,27 +756,23 @@ def _resolve_client_credentials() -> Tuple[Optional[str], Optional[str]]:
 def _build_credentials_from_provider(
     access_token: AccessToken,
 ) -> Optional[Credentials]:
-    """Construct Google credentials from the provider cache."""
+    """Construct Google credentials from the access token claims.
+
+    Earlier versions of this code probed FastMCP's `OAuthProxy` for
+    `_access_tokens` / `_access_to_refresh` / `_refresh_tokens` dicts to
+    recover the upstream refresh token. Those attributes never existed on
+    `OAuthProxy` (token state is stored in pluggable `_upstream_token_store`
+    and `_client_storage` adapters, accessed via async APIs), so the lookup
+    always returned None. The fallback path is the only path that ever ran;
+    the probes are removed.
+    """
     if not _auth_provider:
         return None
 
-    access_entry = getattr(_auth_provider, "_access_tokens", {}).get(access_token.token)
-    if not access_entry:
-        access_entry = access_token
-
     client_id, client_secret = _resolve_client_credentials()
 
-    refresh_token_value = getattr(_auth_provider, "_access_to_refresh", {}).get(
-        access_token.token
-    )
-    refresh_token_obj = None
-    if refresh_token_value:
-        refresh_token_obj = getattr(_auth_provider, "_refresh_tokens", {}).get(
-            refresh_token_value
-        )
-
     expiry = None
-    expires_at = getattr(access_entry, "expires_at", None)
+    expires_at = getattr(access_token, "expires_at", None)
     if expires_at:
         try:
             expiry_candidate = datetime.fromtimestamp(expires_at, tz=timezone.utc)
@@ -784,11 +780,11 @@ def _build_credentials_from_provider(
         except Exception:  # pragma: no cover - defensive
             expiry = None
 
-    scopes = getattr(access_entry, "scopes", None)
+    scopes = getattr(access_token, "scopes", None)
 
     return Credentials(
         token=access_token.token,
-        refresh_token=refresh_token_obj.token if refresh_token_obj else None,
+        refresh_token=None,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=client_id,
         client_secret=client_secret,
@@ -842,19 +838,33 @@ def ensure_session_from_access_token(
     if email and not is_external_oauth21_provider():
         try:
             store = get_oauth21_session_store()
-            store.store_session(
-                user_email=email,
-                access_token=credentials.token,
-                refresh_token=credentials.refresh_token,
-                token_uri=credentials.token_uri,
-                client_id=credentials.client_id,
-                client_secret=credentials.client_secret,
-                scopes=credentials.scopes,
-                expiry=store_expiry,
-                session_id=f"google_{email}",
-                mcp_session_id=mcp_session_id,
-                issuer="https://accounts.google.com",
-            )
+            # Skip the write if we'd just be overwriting identical state.
+            # Middleware calls this on every request; rewriting unchanged
+            # session info per-request churns dict allocations and (until the
+            # MCP session id changes) tells store_session() to also touch the
+            # binding/mapping dicts.
+            existing = store.get_session_info(email)
+            if (
+                existing is None
+                or existing.get("access_token") != credentials.token
+                or (
+                    mcp_session_id
+                    and existing.get("mcp_session_id") != mcp_session_id
+                )
+            ):
+                store.store_session(
+                    user_email=email,
+                    access_token=credentials.token,
+                    refresh_token=credentials.refresh_token,
+                    token_uri=credentials.token_uri,
+                    client_id=credentials.client_id,
+                    client_secret=credentials.client_secret,
+                    scopes=credentials.scopes,
+                    expiry=store_expiry,
+                    session_id=f"google_{email}",
+                    mcp_session_id=mcp_session_id,
+                    issuer="https://accounts.google.com",
+                )
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(f"Failed to cache credentials for {email}: {exc}")
 
@@ -884,14 +894,11 @@ def get_credentials_from_token(
                 logger.debug(f"Found matching credentials from store for {user_email}")
                 return credentials
 
-        # If the FastMCP provider is managing tokens, sync from provider storage
-        if _auth_provider:
-            access_record = getattr(_auth_provider, "_access_tokens", {}).get(
-                access_token
-            )
-            if access_record:
-                logger.debug("Building credentials from FastMCP provider cache")
-                return ensure_session_from_access_token(access_record, user_email)
+        # NOTE: a previous version of this function probed the FastMCP
+        # provider's private `_access_tokens` dict, but no FastMCP version
+        # exposes such an attribute (tokens live in async `_upstream_token_store`
+        # / `_client_storage` adapters). The probe always missed; we now go
+        # straight to the fallback minimal-credentials construction below.
 
         # Otherwise, create minimal credentials with just the access token
         # Assume token is valid for 1 hour (typical for Google tokens)
