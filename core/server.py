@@ -7,7 +7,6 @@ from importlib import metadata
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.middleware import Middleware
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
@@ -15,7 +14,6 @@ from fastmcp.server.auth.providers.google import GoogleProvider
 from auth.oauth21_session_store import get_oauth21_session_store, set_auth_provider
 from auth.google_auth import handle_auth_callback, start_auth_flow, check_client_secrets
 from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
-from auth.mcp_session_middleware import MCPSessionMiddleware
 from auth.oauth_responses import (
     create_error_response,
     create_success_response,
@@ -37,25 +35,26 @@ logger = logging.getLogger(__name__)
 _auth_provider: Optional[GoogleProvider] = None
 _legacy_callback_registered = False
 
-session_middleware = Middleware(MCPSessionMiddleware)
-
 
 # Custom FastMCP that adds secure middleware stack for OAuth 2.1
 class SecureFastMCP(FastMCP):
     def http_app(self, **kwargs) -> "Starlette":
-        """Override to add secure middleware stack for OAuth 2.1."""
+        """Override to register HTTP-level startup hooks.
+
+        We previously inserted a Starlette ``BaseHTTPMiddleware`` here to
+        populate a session-scoped ContextVar. That middleware is removed:
+        ``BaseHTTPMiddleware`` wraps responses through an anyio task-group
+        queue that interleaves badly with the streamable-HTTP / SSE
+        long-poll the MCP transport relies on, and under concurrent
+        sessions can route a response intended for one session into
+        another session's stream. The ContextVar it populated had no
+        readers in the codebase, so dropping it is purely upside.
+        Per-tool authentication state is populated by ``AuthInfoMiddleware``
+        (a FastMCP-protocol middleware, not a Starlette HTTP one) keyed by
+        the FastMCP session_id; that path stays intact.
+        """
         app = super().http_app(**kwargs)
-
-        # Add middleware in order (first added = outermost layer)
-        # Session Management - extracts session info for MCP context
-        app.user_middleware.insert(0, session_middleware)
-
-        # Rebuild middleware stack
-        app.middleware_stack = app.build_middleware_stack()
-        logger.info("Added middleware stack: Session Management")
-
         app.add_event_handler("startup", _ensure_audit_started)
-
         return app
 
 
