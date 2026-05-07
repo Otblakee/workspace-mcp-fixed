@@ -2,16 +2,14 @@
 OAuth 2.1 Session Store for Google Services
 
 This module provides a global store for OAuth 2.1 authenticated sessions
-that can be accessed by Google service decorators. It also includes
-session context management and credential conversion functionality.
+that can be accessed by Google service decorators, plus helpers for
+converting access tokens to google-auth Credentials.
 """
 
-import contextvars
 import logging
 from typing import Dict, Optional, Any, Tuple
 from threading import RLock
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass
 
 from fastmcp.server.auth import AccessToken
 from google.oauth2.credentials import Credentials
@@ -50,126 +48,6 @@ def _normalize_expiry_to_naive_utc(expiry: Optional[Any]) -> Optional[datetime]:
         return _normalize_expiry_to_naive_utc(parsed)
 
     logger.debug("Unsupported expiry type '%s' (%s)", expiry, type(expiry))
-    return None
-
-
-# Context variable to store the current session information
-_current_session_context: contextvars.ContextVar[Optional["SessionContext"]] = (
-    contextvars.ContextVar("current_session_context", default=None)
-)
-
-
-@dataclass
-class SessionContext:
-    """Container for session-related information."""
-
-    session_id: Optional[str] = None
-    user_id: Optional[str] = None
-    auth_context: Optional[Any] = None
-    request: Optional[Any] = None
-    metadata: Dict[str, Any] = None
-    issuer: Optional[str] = None
-
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
-
-
-def set_session_context(context: Optional[SessionContext]):
-    """
-    Set the current session context.
-
-    Args:
-        context: The session context to set
-    """
-    _current_session_context.set(context)
-    if context:
-        logger.debug(
-            f"Set session context: session_id={context.session_id}, user_id={context.user_id}"
-        )
-    else:
-        logger.debug("Cleared session context")
-
-
-def get_session_context() -> Optional[SessionContext]:
-    """
-    Get the current session context.
-
-    Returns:
-        The current session context or None
-    """
-    return _current_session_context.get()
-
-
-def clear_session_context():
-    """Clear the current session context."""
-    set_session_context(None)
-
-
-class SessionContextManager:
-    """
-    Context manager for temporarily setting session context.
-
-    Usage:
-        with SessionContextManager(session_context):
-            # Code that needs access to session context
-            pass
-    """
-
-    def __init__(self, context: Optional[SessionContext]):
-        self.context = context
-        self.token = None
-
-    def __enter__(self):
-        """Set the session context."""
-        self.token = _current_session_context.set(self.context)
-        return self.context
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Reset the session context."""
-        if self.token:
-            _current_session_context.reset(self.token)
-
-
-def extract_session_from_headers(headers: Dict[str, str]) -> Optional[str]:
-    """
-    Extract session ID from request headers.
-
-    Args:
-        headers: Request headers
-
-    Returns:
-        Session ID if found
-    """
-    # Try different header names
-    session_id = headers.get("mcp-session-id") or headers.get("Mcp-Session-Id")
-    if session_id:
-        return session_id
-
-    session_id = headers.get("x-session-id") or headers.get("X-Session-ID")
-    if session_id:
-        return session_id
-
-    # Try Authorization header for Bearer token
-    auth_header = headers.get("authorization") or headers.get("Authorization")
-    if auth_header and auth_header.lower().startswith("bearer "):
-        token = auth_header[7:]  # Remove "Bearer " prefix
-        # Intentionally ignore empty tokens - "Bearer " with no token should not
-        # create a session context (avoids hash collisions on empty string)
-        if token:
-            # Use thread-safe lookup to find session by access token
-            store = get_oauth21_session_store()
-            session_id = store.find_session_id_for_access_token(token)
-            if session_id:
-                return session_id
-
-            # If no session found, create a temporary session ID from token hash
-            # This allows header-based authentication to work with session context
-            import hashlib
-
-            token_hash = hashlib.sha256(token.encode()).hexdigest()[:8]
-            return f"bearer_token_{token_hash}"
-
     return None
 
 
