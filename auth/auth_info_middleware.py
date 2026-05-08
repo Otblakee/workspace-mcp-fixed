@@ -3,7 +3,9 @@ Authentication middleware to populate context state with user information
 """
 
 import logging
+import os
 import time
+from typing import Any, Optional, Tuple
 
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.dependencies import get_access_token
@@ -15,6 +17,68 @@ from auth.oauth_types import WorkspaceAccessToken
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+def _allowed_email_domains() -> list[str]:
+    """Comma-separated allowlist from OAUTH_ALLOWED_EMAIL_DOMAINS. Empty
+    list = no domain restriction (single-user / dev default)."""
+    raw = os.getenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "")
+    return [d.strip().lower() for d in raw.split(",") if d.strip()]
+
+
+def _claims_pass_domain_policy(
+    claims: Optional[dict], email: Optional[str]
+) -> Tuple[bool, str]:
+    """Defence-in-depth domain check on a verified token's claims.
+
+    Two layers, both opt-in but always evaluated when the inputs are present:
+
+    1. ``email_verified=False`` is always rejected. Google access tokens
+       commonly omit this claim; absence is allowed. Explicit ``False`` is
+       not, since it means the IdP itself flagged the address.
+    2. If ``OAUTH_ALLOWED_EMAIL_DOMAINS`` is set, the request must come from
+       one of those domains. Prefers Google's ``hd`` (hosted domain) claim
+       because it's IdP-attested; falls back to the email's domain literal
+       when ``hd`` isn't present in the claims (true for many access tokens).
+       Without the env var set, no domain restriction is enforced — keeps
+       the single-user dev path working as-is.
+
+    Returns:
+        ``(ok, reason)`` where ``reason`` is empty on success and a short
+        diagnostic string on failure (logged, never returned to the client).
+    """
+    if claims and claims.get("email_verified") is False:
+        return False, "email_verified=False"
+
+    allowed = _allowed_email_domains()
+    if not allowed:
+        return True, ""
+
+    hd = ""
+    if claims:
+        hd_val = claims.get("hd")
+        if isinstance(hd_val, str):
+            hd = hd_val.strip().lower()
+
+    if hd:
+        if hd not in allowed:
+            return False, f"hd={hd!r} not in OAUTH_ALLOWED_EMAIL_DOMAINS"
+        return True, ""
+
+    if not email or "@" not in email:
+        return False, "no hd claim and no usable email to check"
+    domain = email.rsplit("@", 1)[1].strip().lower()
+    if domain not in allowed:
+        return False, f"email domain {domain!r} not in OAUTH_ALLOWED_EMAIL_DOMAINS"
+    return True, ""
+
+
+def _claims_of(token: Any) -> dict:
+    """Best-effort claim extraction tolerant of FastMCP/Google token shapes."""
+    claims = getattr(token, "claims", None)
+    if isinstance(claims, dict):
+        return claims
+    return {}
 
 
 class AuthInfoMiddleware(Middleware):
@@ -46,20 +110,29 @@ class AuthInfoMiddleware(Middleware):
                     user_email = access_token.claims.get("email")
 
                 if user_email:
-                    logger.info(
-                        f"✓ Using FastMCP validated token for user: {user_email}"
+                    ok, reason = _claims_pass_domain_policy(
+                        _claims_of(access_token), user_email
                     )
-                    await context.fastmcp_context.set_state(
-                        "authenticated_user_email", user_email
-                    )
-                    await context.fastmcp_context.set_state(
-                        "authenticated_via", "fastmcp_oauth"
-                    )
-                    await context.fastmcp_context.set_state(
-                        "access_token", access_token, serializable=False
-                    )
-                    authenticated_user = user_email
-                    auth_via = "fastmcp_oauth"
+                    if not ok:
+                        logger.warning(
+                            f"Rejecting FastMCP-validated token for {user_email}: {reason}"
+                        )
+                        access_token = None
+                    else:
+                        logger.info(
+                            f"✓ Using FastMCP validated token for user: {user_email}"
+                        )
+                        await context.fastmcp_context.set_state(
+                            "authenticated_user_email", user_email
+                        )
+                        await context.fastmcp_context.set_state(
+                            "authenticated_via", "fastmcp_oauth"
+                        )
+                        await context.fastmcp_context.set_state(
+                            "access_token", access_token, serializable=False
+                        )
+                        authenticated_user = user_email
+                        auth_via = "fastmcp_oauth"
                 else:
                     logger.warning(
                         f"FastMCP access_token found but no email. Type: {type(access_token).__name__}"
@@ -111,6 +184,17 @@ class AuthInfoMiddleware(Middleware):
                                                 "email"
                                             )
 
+                                        ok, reason = _claims_pass_domain_policy(
+                                            _claims_of(verified_auth), user_email
+                                        )
+                                        if not ok:
+                                            logger.warning(
+                                                f"Rejecting bearer token for "
+                                                f"{user_email or '<no-email>'}: {reason}"
+                                            )
+                                            verified_auth = None
+
+                                    if verified_auth:
                                         if isinstance(
                                             verified_auth, WorkspaceAccessToken
                                         ):

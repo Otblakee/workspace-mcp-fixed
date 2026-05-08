@@ -52,23 +52,48 @@ def _service(tool: str) -> str:
     return "unknown"
 
 
+# Deep redaction: SENSITIVE keys are matched at every nesting level so
+# nested payloads like attachments=[{"content": ...}] or
+# message={"raw": ...} don't slip through the way the old shallow walk
+# allowed. Bounded depth keeps adversarial inputs from blowing the stack.
+_REDACT_MAX_DEPTH = 6
+
+
+def _safe_len(v) -> Any:
+    try:
+        return len(v) if hasattr(v, "__len__") else "?"
+    except Exception:
+        return "?"
+
+
+def _redact_value(v: Any, depth: int = 0) -> Any:
+    if depth >= _REDACT_MAX_DEPTH:
+        return "<truncated:depth>"
+    if isinstance(v, dict):
+        out = {}
+        for k, val in v.items():
+            if k in SENSITIVE:
+                out[k] = f"<redacted:{type(val).__name__}:{_safe_len(val)}>"
+            else:
+                out[k] = _redact_value(val, depth + 1)
+        return out
+    if isinstance(v, (list, tuple)):
+        return [_redact_value(item, depth + 1) for item in v]
+    if isinstance(v, str) and len(v) > 200:
+        return v[:200] + "…"
+    return v
+
+
 def _redact(kwargs: dict) -> str:
-    out = {}
-    for k, v in (kwargs or {}).items():
-        if k in SENSITIVE:
-            try:
-                length = len(v) if hasattr(v, "__len__") else "?"
-            except Exception:
-                length = "?"
-            out[k] = f"<redacted:{type(v).__name__}:{length}>"
-        elif isinstance(v, str) and len(v) > 200:
-            out[k] = v[:200] + "…"
-        else:
-            try:
-                json.dumps(v); out[k] = v
-            except Exception:
-                out[k] = f"<{type(v).__name__}>"
-    return json.dumps(out, ensure_ascii=False)[:1000]
+    redacted = _redact_value(kwargs or {})
+    try:
+        return json.dumps(
+            redacted,
+            ensure_ascii=False,
+            default=lambda o: f"<{type(o).__name__}>",
+        )[:1000]
+    except Exception:
+        return str(redacted)[:1000]
 
 
 def _resource_id(result: Any, kwargs: dict) -> str:
@@ -88,15 +113,29 @@ async def _resolve_user_email() -> str:
 
     The auth middleware sets `authenticated_user_email` on the request context
     for each tool call. Falls back to DEFAULT_USER when no context is live
-    (local stdio dev, background task before any request, etc.)."""
+    (local stdio dev, background task before any request, etc.).
+
+    Empty-but-present context state and resolver exceptions are warn-logged
+    rather than swallowed silently — by the time this runs (in a tool call's
+    finally block) the auth middleware should have populated state, so an
+    empty value usually indicates a middleware bug worth seeing."""
     try:
         from fastmcp.server.dependencies import get_context
         ctx = get_context()
         if ctx is None:
             return DEFAULT_USER
         email = await ctx.get_state("authenticated_user_email")
-        return email or DEFAULT_USER
-    except Exception:
+        if not email:
+            log.warning(
+                "Audit: context present but authenticated_user_email empty; "
+                "attributing to DEFAULT_USER. Likely a middleware ordering bug."
+            )
+            return DEFAULT_USER
+        return email
+    except Exception as e:
+        log.warning(
+            "Audit: failed to resolve user email (%s); attributing to DEFAULT_USER", e
+        )
         return DEFAULT_USER
 
 
@@ -168,50 +207,70 @@ class AuditLogger:
                     log.error("AUDIT_FALLBACK %s", json.dumps(entry))
 
     async def _flush(self, batch):
-        sheets = await asyncio.to_thread(self._build_sheets_for_batch, batch)
-        if sheets is None:
-            raise RuntimeError("no usable user OAuth credentials in batch")
-        try:
-            tab = datetime.now(timezone.utc).strftime("%Y-%m")
-            if tab != self._current_tab:
-                await asyncio.to_thread(self._ensure_tab, sheets, tab)
-                self._current_tab = tab
-            rows = [[e.get(h, "") for h in HEADERS] for e in batch]
-            await asyncio.to_thread(
-                sheets.spreadsheets().values().append(
-                    spreadsheetId=AUDIT_SHEET_ID,
-                    range=f"'{tab}'!A:I",
-                    valueInputOption="RAW",
-                    insertDataOption="INSERT_ROWS",
-                    body={"values": rows}).execute)
-        finally:
-            # Drop the per-flush sheets client; googleapiclient Resource trees
-            # retain circular refs that defy refcount cleanup.
-            await asyncio.to_thread(sheets.close)
-            gc.collect()
-
-    def _build_sheets_for_batch(self, batch):
-        """Fresh Sheets client per flush, built from the first user in the
-        batch whose OAuth credentials resolve and refresh cleanly. Building
-        per-flush rather than caching means token-refresh work flows through
-        the standard google-auth lifecycle naturally."""
-        seen = set()
+        # Group entries by attributed user. Each user's rows are written with
+        # that user's own OAuth credentials so Sheets revision history matches
+        # the actor recorded in the row, and so one teammate's audit data is
+        # never written by another teammate's token. Trade-off: O(distinct
+        # users in batch) Sheets API calls instead of one — fine at team
+        # scale. Entries we can't write (no resolvable creds) fall through to
+        # the stdout fallback the caller already has.
+        by_user: dict[str, list] = {}
         for entry in batch:
-            email = entry.get("user")
-            if not email or email in seen:
+            by_user.setdefault(entry.get("user") or DEFAULT_USER, []).append(entry)
+
+        tab = datetime.now(timezone.utc).strftime("%Y-%m")
+        tab_ensured_this_flush = tab == self._current_tab
+        unwritten: list = []
+
+        for email, entries in by_user.items():
+            sheets = await asyncio.to_thread(self._build_sheets_for_user, email)
+            if sheets is None:
+                unwritten.extend(entries)
                 continue
-            seen.add(email)
-            creds = _resolve_credentials(email)
-            if creds is None:
-                continue
-            if creds.expired and getattr(creds, "refresh_token", None):
-                try:
-                    creds.refresh(_GoogleAuthRequest())
-                except Exception as e:
-                    log.warning("Audit creds refresh failed for %s: %s", email, e)
-                    continue
-            return build("sheets", "v4", credentials=creds, cache_discovery=False)
-        return None
+            try:
+                if not tab_ensured_this_flush:
+                    await asyncio.to_thread(self._ensure_tab, sheets, tab)
+                    self._current_tab = tab
+                    tab_ensured_this_flush = True
+                rows = [[e.get(h, "") for h in HEADERS] for e in entries]
+                await asyncio.to_thread(
+                    sheets.spreadsheets().values().append(
+                        spreadsheetId=AUDIT_SHEET_ID,
+                        range=f"'{tab}'!A:I",
+                        valueInputOption="RAW",
+                        insertDataOption="INSERT_ROWS",
+                        body={"values": rows}).execute)
+            except Exception as e:
+                log.warning("Audit append failed for %s (%d rows): %s", email, len(entries), e)
+                unwritten.extend(entries)
+            finally:
+                # Drop the per-user sheets client; googleapiclient Resource
+                # trees retain circular refs that defy refcount cleanup.
+                await asyncio.to_thread(sheets.close)
+                gc.collect()
+
+        if unwritten:
+            raise RuntimeError(
+                f"audit flush: {len(unwritten)} of {len(batch)} rows had no usable user creds"
+            )
+
+    def _build_sheets_for_user(self, email: str):
+        """Fresh Sheets client built from the named user's OAuth credentials.
+        Returns None if the user has no resolvable credentials or refresh
+        fails. Building per-flush rather than caching means token-refresh
+        work flows through the standard google-auth lifecycle naturally."""
+        if not email:
+            return None
+        creds = _resolve_credentials(email)
+        if creds is None:
+            return None
+        if creds.expired and getattr(creds, "refresh_token", None):
+            try:
+                creds.refresh(_GoogleAuthRequest())
+            except Exception as e:
+                log.warning("Audit creds refresh failed for %s: %s", email, e)
+                return None
+        return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
     def _ensure_tab(self, sheets, tab):
         meta = sheets.spreadsheets().get(spreadsheetId=AUDIT_SHEET_ID).execute()

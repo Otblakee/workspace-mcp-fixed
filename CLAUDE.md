@@ -141,3 +141,90 @@ After this PR merges:
 2. Confirm `TOOLS` (or the tool-tier env var in use) covers `delete_gmail_draft` — either by enabling the `gmail` extended tier or by listing the tool name explicitly.
 3. No new env vars required for these fixes.
 4. No new pip dependencies — both Drive and Sheets clients were already pinned in `pyproject.toml`.
+
+## Multi-user security hardening (claude/multi-user-mcp-support-E5ujm)
+
+Five fixes that close cross-user leak surfaces before adding teammates to
+the deployment. All have unit coverage in `tests/test_multi_user_security.py`.
+
+### 1. OAuth 2.0 fallback closed in `auth/service_decorator.py`
+
+`_detect_oauth_version` previously returned `False` (meaning "use OAuth
+2.0") when `MCP_ENABLE_OAUTH21=true` but the request had no
+`authenticated_user_email` and no FastMCP access token. The OAuth 2.0 path
+then read `user_google_email` straight out of the caller's kwargs, so any
+client that default-filled that field could impersonate any other user
+whose creds happened to be cached on the server. This is the most
+plausible mechanism for upstream issue #162 (LibreChat cross-user data
+access, "can't reproduce" by maintainer).
+
+The function now raises `GoogleAuthenticationError` instead of falling
+back. Side effect: any deployment running with `MCP_ENABLE_OAUTH21=true`
+that wasn't actually completing the OAuth 2.1 flow will now hard-fail
+instead of silently impersonating. Operationally that's the right trade.
+
+### 2. Per-user audit attribution in `core/audit.py`
+
+`_flush` previously built one Sheets client from the *first* user in the
+batch whose creds resolved, then wrote every row in the batch via that
+client. Effects: Sheets revision history attributed all rows to whoever
+came first, that user's quota was burned for everyone, and they had
+indirect read access to other users' redacted `params_summary`.
+
+Replaced `_build_sheets_for_batch` with `_build_sheets_for_user`. `_flush`
+now groups the batch by `user`, builds a Sheets client per user, and
+writes only that user's rows with that user's credentials. Cost: O(distinct
+users in batch) Sheets calls per flush. Fine at team scale; revisit if
+the team grows past ~20 active users.
+
+### 3. Deep redaction in `core/audit.py`
+
+`_redact` was a one-level walk: `SENSITIVE` keys at the top of `kwargs`
+were redacted, but nested fields like `message.body`, `parts[*].content`,
+or `data["raw"]` slipped through verbatim. Now `_redact_value` walks
+dicts/lists recursively up to `_REDACT_MAX_DEPTH = 6`, applies `SENSITIVE`
+matching at every level, and truncates long strings anywhere in the tree.
+Non-JSON-serializable leaves render as `<TypeName>` via `json.dumps(default=…)`.
+
+### 4. `_resolve_user_email` warn-on-fallback in `core/audit.py`
+
+The bare `except Exception` previously swallowed every failure and
+attributed audit rows to `DEFAULT_USER` ("oli") in silence. Now logs a
+WARN when the FastMCP context is present but `authenticated_user_email`
+is empty (likely middleware ordering bug) and when `get_state` raises.
+The legitimate "no context at all" case (stdio dev, background task)
+stays quiet.
+
+### 5. Domain policy in `auth/auth_info_middleware.py`
+
+New `_claims_pass_domain_policy(claims, email)` helper, evaluated at both
+auth gates (FastMCP-validated access token and `Authorization: Bearer`
+header). Two layers, both opt-in via env:
+
+- `email_verified=False` is always rejected when the claim is present.
+  Absence is allowed (Google access tokens commonly omit it).
+- `OAUTH_ALLOWED_EMAIL_DOMAINS` (comma-separated) restricts accepted
+  identities. Prefers Google's IdP-attested `hd` claim; falls back to the
+  email domain literal when `hd` isn't in the claims. Unset → no
+  restriction (preserves single-user dev workflow).
+
+**New Render env var to set before adding any second user:**
+
+- `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk`
+
+Without this, the middleware will accept any verified Google identity
+that completes the OAuth flow against your client. The IdP-side fix
+(setting the OAuth client to Internal in your Workspace org, if the GCP
+project is in-org) is still recommended as the outer ring; this is
+defence in depth.
+
+### Not in scope of this PR (parked for follow-up)
+
+- Per-user tool ACL middleware + user registry.
+- Programmatic revoke endpoint (Google `oauth2.revoke` + session-store
+  invalidation).
+- Postgres mirror for the audit log (the per-user attribution above is
+  the minimum bar; immutable storage + service-account writer is the
+  full Phase-3 story).
+- Verifying issue #162 is fully closed by fix #1 — needs a two-account
+  reproduction harness against the live Render service.
