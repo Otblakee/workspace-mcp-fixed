@@ -41,9 +41,12 @@ def _make_attachment(
     return att
 
 
-def _unwrap(tool):
-    """Unwrap a FunctionTool + decorator chain to the original async function."""
-    fn = tool.fn  # FunctionTool stores the wrapped callable in .fn
+def _unwrap(fn):
+    """Peel functools.wraps layers down to the original implementation.
+
+    The installed FastMCP returns the original function from @server.tool()
+    rather than a FunctionTool wrapper, so we just walk __wrapped__ — same
+    pattern as tests/test_mcp_fixes.py."""
     while hasattr(fn, "__wrapped__"):
         fn = fn.__wrapped__
     return fn
