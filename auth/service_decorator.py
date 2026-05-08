@@ -102,6 +102,14 @@ def _detect_oauth_version(
 
     Returns:
         True if OAuth 2.1 should be used, False otherwise
+
+    Raises:
+        GoogleAuthenticationError: when OAuth 2.1 is enabled globally but the
+            request lacks any verified identity. Falling back to OAuth 2.0 in
+            that state would let the caller pick ``user_google_email`` from
+            tool kwargs and silently impersonate any other user whose
+            credentials happen to be cached on the server. See the multi-user
+            security audit notes in CLAUDE.md.
     """
     if not is_oauth21_enabled():
         return False
@@ -126,18 +134,16 @@ def _detect_oauth_version(
             f"[{tool_name}] Could not inspect access token for OAuth mode: {e}"
         )
 
-    # Only use version detection for unauthenticated requests
-    config = get_oauth_config()
-    request_params = {}
-    if mcp_session_id:
-        request_params["session_id"] = mcp_session_id
-
-    oauth_version = config.detect_oauth_version(request_params)
-    use_oauth21 = oauth_version == "oauth21"
-    logger.info(
-        f"[{tool_name}] OAuth version detected: {oauth_version}, will use OAuth 2.1: {use_oauth21}"
+    logger.warning(
+        f"[{tool_name}] OAuth 2.1 enabled but no authenticated identity on the "
+        f"request (authenticated_user=None, no access_token, mcp_session_id="
+        f"{mcp_session_id or 'none'}). Refusing to fall back to OAuth 2.0."
     )
-    return use_oauth21
+    raise GoogleAuthenticationError(
+        "OAuth 2.1 is enabled but this request carries no verified identity. "
+        "Re-authenticate via the OAuth 2.1 flow; OAuth 2.0 fallback is "
+        "disabled to prevent cross-user credential access."
+    )
 
 
 def _update_email_in_args(args: tuple, index: int, new_email: str) -> tuple:
