@@ -266,6 +266,27 @@ Polls Google's resumable session endpoint with `Content-Range: bytes
   tool returns a clean status string with the HTTP code, not a raw
   exception.
 
+**Host allow-list.** ``confirm_drive_upload`` attaches the user's Drive
+OAuth token to whatever URI we PUT against. Without strict validation,
+a malicious caller could substitute an attacker-controlled URL and
+exfiltrate the token, or target the cloud metadata service for
+authenticated SSRF. The tool rejects any ``upload_uri`` that isn't
+HTTPS, that carries userinfo, or whose host is outside a fixed
+allow-list of Google upload domains (`www.googleapis.com`,
+`googleapis.com`, `storage.googleapis.com`, `content.googleapis.com`).
+The list is intentionally not env-overridable — if Google ever returns
+a session URI on a new host we want this tool to break loudly rather
+than silently expand the trust boundary.
+
+### Placeholder rollback
+
+`create_drive_upload_session` rolls back the empty placeholder file in
+two failure modes: (1) Google rejects the session-init PATCH
+(non-200), and (2) the PATCH returns 200 but no `Location` header
+(undefined state, usually a flaky proxy). Both paths call
+`files().delete(fileId=..., supportsAllDrives=True)` best-effort, so
+retries don't accumulate orphan empties in Drive.
+
 ### Tool: `download_drive_file`
 
 Streams Drive → local disk in 4 MB chunks via `MediaIoBaseDownload`

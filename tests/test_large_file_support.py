@@ -213,6 +213,48 @@ class TestCreateDriveUploadSession:
         assert delete_kwargs["fileId"] == "drive-file-xyz"
         assert delete_kwargs["supportsAllDrives"] is True
 
+    @pytest.mark.asyncio
+    async def test_missing_location_header_rolls_back_placeholder(self, monkeypatch):
+        """200 OK without a Location header is undefined state — Google
+        didn't actually open a session. The placeholder must be deleted
+        so flaky proxies don't accumulate orphans on retry (Codex P2)."""
+        from gdrive import drive_tools
+
+        impl = _unwrap(drive_tools.create_drive_upload_session)
+
+        service = _make_service_with_token()
+        service.files.return_value.create.return_value.execute = MagicMock(
+            return_value={"id": "drive-file-orphan"}
+        )
+        service.files.return_value.delete.return_value.execute = MagicMock(return_value={})
+
+        async def fake_resolve(svc, fid):
+            return "folder-1"
+
+        monkeypatch.setattr(drive_tools, "resolve_folder_id", fake_resolve)
+
+        # 200 but NO Location header.
+        no_loc_response = _httpx_response(200, headers={})
+
+        async def fake_patch(self, url, headers=None, content=None):
+            return no_loc_response
+
+        monkeypatch.setattr(httpx.AsyncClient, "patch", fake_patch)
+
+        with pytest.raises(Exception, match="no Location header"):
+            await impl(
+                service=service,
+                user_google_email="u@example.com",
+                filename="big.bin",
+                mime_type="application/octet-stream",
+                parent_folder_id="folder-1",
+            )
+
+        service.files.return_value.delete.assert_called_once()
+        delete_kwargs = service.files.return_value.delete.call_args.kwargs
+        assert delete_kwargs["fileId"] == "drive-file-orphan"
+        assert delete_kwargs["supportsAllDrives"] is True
+
 
 # ---------------------------------------------------------------------------
 # Tool 2: confirm_drive_upload
@@ -280,7 +322,7 @@ class TestConfirmDriveUpload:
             service=service,
             user_google_email="u@example.com",
             file_id="drive-file-abc",
-            upload_uri="https://example.invalid/x",
+            upload_uri="https://www.googleapis.com/upload/drive/v3/files?upload_id=ABC",
         )
         assert "Upload status: incomplete" in result
         assert "bytes_received: 500" in result
@@ -303,7 +345,7 @@ class TestConfirmDriveUpload:
             service=service,
             user_google_email="u@example.com",
             file_id="drive-file-abc",
-            upload_uri="https://example.invalid/x",
+            upload_uri="https://www.googleapis.com/upload/drive/v3/files?upload_id=ABC",
         )
         assert "Upload status: incomplete" in result
         assert "bytes_received: 0" in result
@@ -327,7 +369,7 @@ class TestConfirmDriveUpload:
             service=service,
             user_google_email="u@example.com",
             file_id="drive-file-abc",
-            upload_uri="https://expired.invalid/x",
+            upload_uri="https://www.googleapis.com/upload/drive/v3/files?upload_id=EXPIRED",
         )
         assert "Upload status: failed" in result
         assert "expired or not found" in result
@@ -345,7 +387,7 @@ class TestConfirmDriveUpload:
                 service=service,
                 user_google_email="u@example.com",
                 file_id="",
-                upload_uri="https://example.invalid/x",
+                upload_uri="https://www.googleapis.com/upload/drive/v3/files?upload_id=ABC",
             )
         with pytest.raises(Exception, match="upload_uri is required"):
             await impl(
@@ -353,6 +395,105 @@ class TestConfirmDriveUpload:
                 user_google_email="u@example.com",
                 file_id="drive-file-abc",
                 upload_uri="",
+            )
+
+
+# ---------------------------------------------------------------------------
+# upload_uri host validation (Codex P1: SSRF / token exfil)
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmDriveUploadHostValidation:
+    """``confirm_drive_upload`` attaches the user's Drive OAuth token to a
+    URL the caller controls. Without strict host validation, a malicious
+    caller could either steal the token (point it at attacker.example) or
+    weaponise the server for authenticated SSRF (point it at the cloud
+    metadata service)."""
+
+    def test_validator_accepts_googleapis(self):
+        from gdrive.drive_tools import _validate_google_upload_uri
+
+        # Should not raise.
+        _validate_google_upload_uri(
+            "https://www.googleapis.com/upload/drive/v3/files?upload_id=ABC"
+        )
+        _validate_google_upload_uri(
+            "https://storage.googleapis.com/upload/drive/v3/files?upload_id=ABC"
+        )
+
+    @pytest.mark.parametrize(
+        "uri,reason",
+        [
+            ("http://www.googleapis.com/upload?upload_id=ABC", "must use https"),
+            ("https://attacker.example/steal?upload_id=ABC", "not a permitted"),
+            ("https://169.254.169.254/latest/meta-data/", "not a permitted"),
+            ("https://localhost:8080/", "not a permitted"),
+            ("https://127.0.0.1/", "not a permitted"),
+            (
+                "https://user:pass@www.googleapis.com/upload?upload_id=ABC",
+                "must not contain userinfo",
+            ),
+            # Subdomain trickery: evil.googleapis.com.attacker.example
+            (
+                "https://www.googleapis.com.attacker.example/upload?upload_id=ABC",
+                "not a permitted",
+            ),
+            # Empty / nonsense hosts
+            ("https:///nohost", "not a permitted"),
+        ],
+    )
+    def test_validator_rejects_dangerous_uris(self, uri, reason):
+        from gdrive.drive_tools import _validate_google_upload_uri
+
+        with pytest.raises(Exception, match=reason):
+            _validate_google_upload_uri(uri)
+
+    @pytest.mark.asyncio
+    async def test_confirm_rejects_non_google_host_before_sending_token(
+        self, monkeypatch
+    ):
+        """The PUT must never fire when the host isn't whitelisted —
+        otherwise the caller's Drive token reaches an attacker."""
+        from gdrive import drive_tools
+
+        impl = _unwrap(drive_tools.confirm_drive_upload)
+        service = _make_service_with_token()
+
+        async def fake_put(self, url, headers=None):  # pragma: no cover
+            raise AssertionError(
+                "PUT must not be called for a non-Google upload_uri"
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "put", fake_put)
+
+        with pytest.raises(Exception, match="not a permitted"):
+            await impl(
+                service=service,
+                user_google_email="u@example.com",
+                file_id="drive-file-abc",
+                upload_uri="https://attacker.example/leak",
+            )
+
+    @pytest.mark.asyncio
+    async def test_confirm_rejects_metadata_service_uri(self, monkeypatch):
+        """SSRF guard: cloud metadata addresses must be unreachable from
+        this tool even though they're technically routable from the host."""
+        from gdrive import drive_tools
+
+        impl = _unwrap(drive_tools.confirm_drive_upload)
+        service = _make_service_with_token()
+
+        async def fake_put(self, url, headers=None):  # pragma: no cover
+            raise AssertionError("PUT must not fire for 169.254.169.254")
+
+        monkeypatch.setattr(httpx.AsyncClient, "put", fake_put)
+
+        with pytest.raises(Exception, match="not a permitted"):
+            await impl(
+                service=service,
+                user_google_email="u@example.com",
+                file_id="drive-file-abc",
+                upload_uri="https://169.254.169.254/latest/meta-data/iam/info",
             )
 
 
