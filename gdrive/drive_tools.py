@@ -7,11 +7,13 @@ This module provides MCP tools for interacting with Google Drive API.
 import asyncio
 import logging
 import io
+import os
 import httpx
 import base64
 import ipaddress
 import socket
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 from typing import AsyncIterator, Optional, List, Dict, Any
 from tempfile import NamedTemporaryFile, SpooledTemporaryFile
@@ -2512,3 +2514,443 @@ async def set_drive_file_permissions(
     output_parts.extend(["", f"View link: {file_metadata.get('webViewLink', 'N/A')}"])
 
     return "\n".join(output_parts)
+
+
+# ---------------------------------------------------------------------------
+# Large-file support: resumable uploads and streaming downloads.
+#
+# The base64 path used by ``create_drive_file`` (and the in-memory bytes
+# buffer used by ``get_drive_file_download_url``) breaks past a few tens of
+# MB on a 512MB Render instance. The three tools below give callers a
+# direct, memory-safe path for large files:
+#
+#   * ``create_drive_upload_session`` — pre-creates an empty Drive file to
+#     reserve a real ``file_id``, then opens a Drive resumable upload
+#     session against that file. The caller PUTs bytes straight to the
+#     returned upload URI; bytes never traverse this server.
+#   * ``confirm_drive_upload`` — polls Google's resumable session endpoint
+#     for status, returns ``complete``/``incomplete``/``failed`` plus the
+#     bytes received so far, and on completion attaches the final file
+#     metadata. Status checks use ``Content-Range: bytes */*`` per the
+#     Drive resumable-upload spec.
+#   * ``download_drive_file`` — streams Drive → local disk in 4 MB chunks
+#     via ``MediaIoBaseDownload`` writing to a real file handle, never
+#     buffering the whole payload in memory. Returns a path (stdio) or a
+#     /attachments URL (HTTP) and never returns credentials.
+# ---------------------------------------------------------------------------
+
+# Resumable upload session URIs are valid for one week per Google's docs.
+_RESUMABLE_SESSION_TTL = timedelta(days=7)
+# Streaming download chunk size. 4 MB keeps peak RSS small without making
+# requests/sec dominant; tune via env if a deployment needs different.
+_DOWNLOAD_STREAM_CHUNK = int(
+    os.getenv("WORKSPACE_DOWNLOAD_CHUNK_BYTES", str(4 * 1024 * 1024))
+)
+
+
+def _resumable_session_url(file_id: str) -> str:
+    return (
+        f"https://www.googleapis.com/upload/drive/v3/files/{file_id}"
+        f"?uploadType=resumable&supportsAllDrives=true"
+    )
+
+
+async def _ensure_fresh_token(service) -> str:
+    """Return a non-expired access token for the underlying service.
+
+    The ``@require_google_service`` decorator builds the service from
+    refreshed credentials, so a token grabbed at function entry is fresh
+    for these short-lived calls. We still defensively refresh if Google's
+    own ``expired`` flag is set, since the client-side clock skew can
+    flip an otherwise-valid token to expired between the decorator and
+    here.
+    """
+    creds = service._http.credentials
+    if creds.expired and getattr(creds, "refresh_token", None):
+        from google.auth.transport.requests import Request as _GoogleAuthRequest
+
+        await asyncio.to_thread(creds.refresh, _GoogleAuthRequest())
+    return creds.token
+
+
+@server.tool()
+@handle_http_errors("create_drive_upload_session", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def create_drive_upload_session(
+    service,
+    user_google_email: str,
+    filename: str,
+    mime_type: str,
+    parent_folder_id: str = "root",
+    file_size: Optional[int] = None,
+) -> str:
+    """
+    Open a Google Drive resumable upload session for a large file.
+
+    The caller PUTs file bytes directly to the returned upload URI — bytes
+    never travel through this server or through MCP tool arguments. Use
+    this for any file over a few tens of MB; it is the only memory-safe
+    upload path for the 512MB Render instance.
+
+    Workflow:
+
+      1. Call this tool. You receive ``upload_uri`` and ``file_id``.
+      2. PUT the file bytes to ``upload_uri`` (e.g. via curl). Bytes go
+         straight to Google.
+      3. Call ``confirm_drive_upload(file_id, upload_uri)`` to verify
+         completion and close the audit record for this upload.
+
+    Example PUT (single shot — see Google's resumable-upload docs for
+    chunked / resumable variants)::
+
+        curl -X PUT --data-binary @/path/to/large.bin \\
+             -H 'Content-Type: <mime_type>' \\
+             -H 'Content-Length: <size>' \\
+             '<upload_uri>'
+
+    The session URI is valid for 7 days. If the upload never completes,
+    the empty placeholder file remains in Drive until you delete it.
+
+    Args:
+        user_google_email: The user's Google email address.
+        filename: Name to use for the new Drive file.
+        mime_type: MIME type of the file content (e.g. 'application/pdf').
+        parent_folder_id: Drive folder ID to upload into. Defaults to 'root'.
+        file_size: Optional total size in bytes. Strongly recommended when
+            known — Google uses it to pre-allocate and to detect range
+            mismatches during the upload.
+
+    Returns:
+        str: Multi-line message containing ``file_id``, ``upload_uri``,
+            ``expires_at``, and instructions for the next step.
+    """
+    if not filename or not filename.strip():
+        raise Exception("filename is required.")
+    if not mime_type or not mime_type.strip():
+        raise Exception("mime_type is required.")
+    if file_size is not None and file_size < 0:
+        raise Exception("file_size must be non-negative when provided.")
+
+    logger.info(
+        f"[create_drive_upload_session] filename='{filename}' mime='{mime_type}' "
+        f"parent='{parent_folder_id}' size={file_size}"
+    )
+
+    resolved_folder_id = await resolve_folder_id(service, parent_folder_id)
+
+    # Step 1: create an empty file so the session has a real Drive file_id.
+    metadata = {
+        "name": filename,
+        "mimeType": mime_type,
+        "parents": [resolved_folder_id],
+    }
+    created = await asyncio.to_thread(
+        service.files()
+        .create(body=metadata, supportsAllDrives=True, fields="id, name, parents")
+        .execute
+    )
+    file_id = created["id"]
+
+    # Step 2: open the resumable upload session against that file_id.
+    access_token = await _ensure_fresh_token(service)
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": mime_type,
+    }
+    if file_size is not None:
+        headers["X-Upload-Content-Length"] = str(file_size)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.patch(
+                _resumable_session_url(file_id), headers=headers, content=b""
+            )
+    except httpx.HTTPError as e:
+        # Roll back the placeholder file on network failure so we don't
+        # leave orphaned empties on transient errors.
+        await asyncio.to_thread(
+            service.files().delete(fileId=file_id, supportsAllDrives=True).execute
+        )
+        raise Exception(f"Network error initiating resumable upload session: {e}")
+
+    if resp.status_code != 200:
+        # Roll back the placeholder file on Google rejection too.
+        try:
+            await asyncio.to_thread(
+                service.files().delete(fileId=file_id, supportsAllDrives=True).execute
+            )
+        except Exception as cleanup_err:  # pragma: no cover - best effort
+            logger.warning(
+                "Failed to clean up placeholder file %s after session-init "
+                "rejection: %s",
+                file_id,
+                cleanup_err,
+            )
+        raise Exception(
+            f"Drive resumable session init failed: HTTP {resp.status_code} "
+            f"{resp.text[:200]}"
+        )
+
+    upload_uri = resp.headers.get("Location")
+    if not upload_uri:
+        raise Exception(
+            "Drive resumable session init succeeded but returned no Location header."
+        )
+
+    expires_at = (datetime.now(timezone.utc) + _RESUMABLE_SESSION_TTL).isoformat(
+        timespec="seconds"
+    )
+
+    return (
+        "Resumable upload session ready.\n"
+        f"file_id: {file_id}\n"
+        f"upload_uri: {upload_uri}\n"
+        f"expires_at: {expires_at}\n"
+        "\n"
+        "Next steps:\n"
+        f"  1. PUT the file bytes to upload_uri with Content-Type: {mime_type}\n"
+        f"     (and Content-Length: <size> if known).\n"
+        f"  2. Call confirm_drive_upload(file_id='{file_id}', upload_uri=...)\n"
+        "\n"
+        "Bytes go directly from your client to Google. They never pass "
+        "through this server."
+    )
+
+
+@server.tool()
+@handle_http_errors("confirm_drive_upload", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_file")
+async def confirm_drive_upload(
+    service,
+    user_google_email: str,
+    file_id: str,
+    upload_uri: str,
+) -> str:
+    """
+    Check the status of a Drive resumable upload session and return the
+    final outcome. Call this after PUTting bytes to the ``upload_uri``
+    returned by ``create_drive_upload_session``.
+
+    Statuses:
+
+      - ``complete``: bytes uploaded; the file is in Drive with its final
+        metadata. The audit row for this upload is closed.
+      - ``incomplete``: a partial upload exists. ``bytes_received`` tells
+        you the offset to resume from; PUT the remainder to the same
+        upload_uri starting at that offset (Content-Range:
+        bytes <offset>-<end>/<total>).
+      - ``failed``: the session expired (HTTP 404/410), the upload was
+        rejected, or some other terminal error.
+
+    Args:
+        user_google_email: The user's Google email address.
+        file_id: The Drive file ID returned by ``create_drive_upload_session``.
+        upload_uri: The resumable upload URI returned by the same tool.
+
+    Returns:
+        str: Multi-line message with ``status``, ``file_id``,
+            ``bytes_received`` (when known), and on completion the final
+            file metadata (name, size, webViewLink).
+    """
+    if not file_id or not file_id.strip():
+        raise Exception("file_id is required.")
+    if not upload_uri or not upload_uri.strip():
+        raise Exception("upload_uri is required.")
+
+    access_token = await _ensure_fresh_token(service)
+    # Per the resumable-upload spec, a status query is a PUT with
+    # Content-Length: 0 and Content-Range: bytes */* (no asterisk for size
+    # because we don't claim to know the total here — Google returns it).
+    status_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Length": "0",
+        "Content-Range": "bytes */*",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.put(upload_uri, headers=status_headers)
+    except httpx.HTTPError as e:
+        raise Exception(f"Network error querying upload status: {e}")
+
+    if resp.status_code in (200, 201):
+        meta = await asyncio.to_thread(
+            service.files()
+            .get(
+                fileId=file_id,
+                fields="id, name, mimeType, size, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute
+        )
+        size = meta.get("size", "")
+        return (
+            "Upload status: complete\n"
+            f"file_id: {meta.get('id', file_id)}\n"
+            f"name: {meta.get('name', '')}\n"
+            f"mime_type: {meta.get('mimeType', '')}\n"
+            f"size: {size} bytes\n"
+            f"webViewLink: {meta.get('webViewLink', '')}"
+        )
+
+    if resp.status_code == 308:
+        bytes_received = 0
+        rng = resp.headers.get("Range", "")
+        # Range header format on 308 is `bytes=0-<last_byte>` when any
+        # bytes have been received. Absent header means zero bytes.
+        if rng.startswith("bytes=0-"):
+            try:
+                bytes_received = int(rng[len("bytes=0-") :]) + 1
+            except ValueError:
+                bytes_received = 0
+        return (
+            "Upload status: incomplete\n"
+            f"file_id: {file_id}\n"
+            f"bytes_received: {bytes_received}\n"
+            "Resume by PUTting the remaining bytes to the upload_uri "
+            f"starting at offset {bytes_received}."
+        )
+
+    if resp.status_code in (404, 410):
+        return (
+            "Upload status: failed\n"
+            f"file_id: {file_id}\n"
+            f"reason: upload session expired or not found (HTTP {resp.status_code}). "
+            "The placeholder file may still exist in Drive — delete it manually "
+            "if you no longer need it."
+        )
+
+    return (
+        "Upload status: failed\n"
+        f"file_id: {file_id}\n"
+        f"reason: HTTP {resp.status_code}: {resp.text[:200]}"
+    )
+
+
+@server.tool()
+@handle_http_errors("download_drive_file", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def download_drive_file(
+    service,
+    user_google_email: str,
+    file_id: str,
+    destination_filename: Optional[str] = None,
+) -> str:
+    """
+    Download a Drive file by streaming chunks server-side. Handles files
+    of any size without buffering the full payload in memory.
+
+    Bytes flow Drive → this server → local disk in 4 MB chunks. The file
+    is then registered with the attachment storage so it can be served via
+    the ``/attachments/{file_id}`` route (HTTP transport) or accessed by
+    its absolute path (stdio transport). Files expire from storage after
+    1 hour. No credentials are returned to the caller at any point.
+
+    For native Google docs (Docs / Sheets / Slides) the file is exported
+    to a sensible binary format (PDF / CSV / PDF respectively); use
+    ``get_drive_file_download_url`` if you need a different export format.
+
+    Args:
+        user_google_email: The user's Google email address.
+        file_id: Drive file ID (can be a shortcut — it's resolved).
+        destination_filename: Optional filename hint to use for the saved
+            copy. Defaults to the file's Drive name.
+
+    Returns:
+        str: Multi-line message with file_id, name, mime_type, size, and
+            either a local path (stdio) or an attachments URL (HTTP).
+    """
+    if not file_id or not file_id.strip():
+        raise Exception("file_id is required.")
+
+    logger.info(f"[download_drive_file] file_id='{file_id}'")
+
+    resolved_id, meta = await resolve_drive_item(
+        service, file_id, extra_fields="size, mimeType, webViewLink"
+    )
+    file_id = resolved_id
+    file_name = meta.get("name", "Unknown File")
+    mime_type = meta.get("mimeType", "application/octet-stream")
+
+    # Native Google docs need export to a concrete binary format. Mirror
+    # the defaults from get_drive_file_download_url so callers get the
+    # same out-of-the-box behaviour.
+    export_mime_type = {
+        "application/vnd.google-apps.document": "application/pdf",
+        "application/vnd.google-apps.spreadsheet": "text/csv",
+        "application/vnd.google-apps.presentation": "application/pdf",
+    }.get(mime_type)
+
+    output_filename = destination_filename or file_name
+    output_mime_type = export_mime_type or mime_type
+    if export_mime_type and not Path(output_filename).suffix:
+        ext = {
+            "application/pdf": ".pdf",
+            "text/csv": ".csv",
+        }.get(export_mime_type, "")
+        output_filename = f"{output_filename}{ext}"
+
+    request_obj = (
+        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+        if export_mime_type
+        else service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    )
+
+    storage = get_attachment_storage()
+    saved_file_id, target_path = storage.reserve_path(output_filename)
+
+    # Stream Google → disk. MediaIoBaseDownload supports any binary
+    # file-like, so we pass a real file handle (NOT a BytesIO) — only one
+    # chunk lives in memory at a time, regardless of total file size.
+    fd = os.open(
+        target_path,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as fh:
+            downloader = MediaIoBaseDownload(
+                fh, request_obj, chunksize=_DOWNLOAD_STREAM_CHUNK
+            )
+            loop = asyncio.get_event_loop()
+            done = False
+            while not done:
+                _, done = await loop.run_in_executor(None, downloader.next_chunk)
+    except Exception:
+        # Best-effort cleanup of the partial file.
+        try:
+            os.unlink(target_path)
+        except OSError:  # pragma: no cover - best effort
+            pass
+        raise
+
+    size_bytes = os.path.getsize(target_path)
+    storage.register_existing_file(
+        file_id=saved_file_id,
+        file_path=target_path,
+        filename=output_filename,
+        mime_type=output_mime_type,
+        size=size_bytes,
+    )
+
+    if get_transport_mode() == "stdio":
+        access_line = f"path: {target_path}"
+    else:
+        access_line = (
+            f"url: {get_attachment_url(saved_file_id)} (expires in 1 hour)"
+        )
+
+    note = (
+        f"\nNote: Google native file exported to {output_mime_type}."
+        if export_mime_type
+        else ""
+    )
+    return (
+        "Download complete.\n"
+        f"file_id: {file_id}\n"
+        f"name: {output_filename}\n"
+        f"mime_type: {output_mime_type}\n"
+        f"size: {size_bytes} bytes\n"
+        f"{access_line}"
+        f"{note}"
+    )

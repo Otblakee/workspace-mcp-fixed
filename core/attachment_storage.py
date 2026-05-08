@@ -143,6 +143,62 @@ class AttachmentStorage:
 
         return SavedAttachment(file_id=file_id, path=str(file_path))
 
+    def reserve_path(self, filename: Optional[str] = None) -> tuple[str, str]:
+        """Reserve a destination path inside the storage dir, without writing
+        anything to it yet.
+
+        Used by streaming downloads that want to hand a real on-disk path to
+        ``MediaIoBaseDownload`` (or similar) so bytes never have to be held
+        in memory as a single buffer. The caller is responsible for opening
+        the path with the desired permissions, writing to it, and then
+        calling ``register_existing_file`` to add metadata.
+
+        Returns:
+            ``(file_id, file_path)`` where ``file_id`` is a UUID and
+            ``file_path`` is an absolute path inside ``STORAGE_DIR``.
+        """
+        _ensure_storage_dir()
+        file_id = str(uuid.uuid4())
+        if filename:
+            stem = Path(filename).stem
+            ext = Path(filename).suffix
+            save_name = f"{stem}_{file_id[:8]}{ext}"
+        else:
+            save_name = file_id
+        return file_id, str(STORAGE_DIR / save_name)
+
+    def register_existing_file(
+        self,
+        file_id: str,
+        file_path: str,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        size: Optional[int] = None,
+    ) -> SavedAttachment:
+        """Register a file already written into ``STORAGE_DIR`` with the
+        attachment metadata table so it can be served via the
+        ``/attachments/{file_id}`` route and aged out by ``cleanup_expired``.
+
+        Pairs with ``reserve_path``. Use this when bytes were streamed
+        directly to disk (large-file downloads) to avoid the
+        ``save_attachment`` round-trip through base64.
+        """
+        path = Path(file_path)
+        if not path.is_absolute():
+            path = (STORAGE_DIR / path).resolve()
+        if size is None:
+            size = path.stat().st_size if path.exists() else 0
+        expires_at = datetime.now() + timedelta(seconds=self.expiration_seconds)
+        self._metadata[file_id] = {
+            "file_path": str(path),
+            "filename": filename or path.name,
+            "mime_type": mime_type or "application/octet-stream",
+            "size": size,
+            "created_at": datetime.now(),
+            "expires_at": expires_at,
+        }
+        return SavedAttachment(file_id=file_id, path=str(path))
+
     def get_attachment_path(self, file_id: str) -> Optional[Path]:
         """
         Get the file path for an attachment ID.

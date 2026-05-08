@@ -41,6 +41,9 @@ drive:
     - transfer_drive_ownership
     - batch_share_drive_file
     - set_drive_file_permissions
+    - create_drive_upload_session
+    - confirm_drive_upload
+    - download_drive_file
   complete:
     - get_drive_file_permissions
     - check_drive_file_public_access
