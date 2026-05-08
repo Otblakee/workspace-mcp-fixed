@@ -41,7 +41,10 @@ SERVICE_MAP = {"drive": "drive", "gmail": "gmail", "calendar": "calendar",
 
 SENSITIVE = {"body", "text_content", "message_body", "html_body", "values",
              "data", "content", "notes", "description", "subject", "query",
-             "base64_content", "fileUrl", "attachments"}
+             "base64_content", "fileUrl", "attachments",
+             # Resumable upload session URIs are short-lived bearer-equivalent
+             # tokens — anyone with one can PUT bytes to the in-flight upload.
+             "upload_uri"}
 
 
 def _service(tool: str) -> str:
@@ -97,15 +100,37 @@ def _redact(kwargs: dict) -> str:
 
 
 def _resource_id(result: Any, kwargs: dict) -> str:
+    # Treat None values the same as missing keys. ``str(None)`` would log
+    # the literal string "None" which is useless noise in the audit sheet
+    # and confusing in queries that expect either a real ID or empty.
+    kw = kwargs or {}
     for k in ("file_id", "document_id", "spreadsheet_id", "message_id",
               "event_id", "thread_id", "calendar_id", "resource_name"):
-        if k in (kwargs or {}):
-            return str(kwargs[k])[:200]
+        v = kw.get(k)
+        if v is not None and v != "":
+            return str(v)[:200]
     if isinstance(result, dict):
         for k in ("id", "fileId", "documentId", "spreadsheetId", "messageId", "resourceName"):
-            if k in result:
-                return str(result[k])[:200]
+            v = result.get(k)
+            if v is not None and v != "":
+                return str(v)[:200]
     return ""
+
+
+def _origin_error_type(e: BaseException) -> str:
+    """Return the most informative exception class name for ``e``.
+
+    ``handle_http_errors`` re-raises Google ``HttpError`` (and other
+    framework errors) as bare ``Exception(message) from cause``. The audit
+    row used to capture ``type(e).__name__`` directly, which collapsed every
+    such failure to the unhelpful string ``"Exception"``. When the outer is
+    a plain ``Exception`` and a ``__cause__`` is attached, we prefer the
+    cause's class name so the audit row reads e.g. ``HttpError: ...``
+    instead of ``Exception: ...``.
+    """
+    if type(e) is Exception and e.__cause__ is not None:
+        return type(e.__cause__).__name__
+    return type(e).__name__
 
 
 async def _resolve_user_email() -> str:
@@ -381,7 +406,7 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                 return result
             except Exception as e:
                 status = "error"
-                err = f"{type(e).__name__}: {str(e)[:300]}"
+                err = f"{_origin_error_type(e)}: {str(e)[:300]}"
                 raise
             finally:
                 try:

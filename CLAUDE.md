@@ -228,3 +228,112 @@ defence in depth.
   full Phase-3 story).
 - Verifying issue #162 is fully closed by fix #1 — needs a two-account
   reproduction harness against the live Render service.
+
+## Large file support (feature/large-file-support)
+
+The base64 path used by `create_drive_file` and the in-memory bytes
+buffer used by `get_drive_file_download_url` cap out around 50–60 MB on
+the 512 MB Render instance. Three new Drive tools open a memory-safe
+path for arbitrarily large files. Coverage in
+`tests/test_large_file_support.py`.
+
+### Tool: `create_drive_upload_session`
+
+Pre-creates an empty placeholder file in Drive to reserve a real
+`file_id`, then opens a Google Drive resumable upload session against
+that file. Returns the upload URI (sensitive — see audit changes
+below), the placeholder `file_id`, and the URI's expiry (Google's docs
+say one week).
+
+The caller PUTs file bytes directly to the upload URI. **Bytes never
+travel through this server or through MCP tool arguments.** That's the
+whole point — the 512 MB Render instance can broker uploads of any
+size because it never sees the bytes.
+
+If session-init fails (network error, Google rejection), the
+placeholder file is rolled back so we don't litter Drive with empties.
+
+### Tool: `confirm_drive_upload`
+
+Polls Google's resumable session endpoint with `Content-Range: bytes
+*/*` per the Drive resumable-upload spec. Three terminal outcomes:
+
+- `complete` (HTTP 200/201) — upload succeeded; tool returns the
+  final file metadata fetched via `files.get`.
+- `incomplete` (HTTP 308) — partial upload; tool parses the `Range`
+  header and returns `bytes_received` so the caller can resume.
+- `failed` (HTTP 404/410 or other) — session expired or was rejected;
+  tool returns a clean status string with the HTTP code, not a raw
+  exception.
+
+### Tool: `download_drive_file`
+
+Streams Drive → local disk in 4 MB chunks via `MediaIoBaseDownload`
+writing to a real file handle (not a `BytesIO`). Only one chunk lives
+in memory at a time, regardless of file size. The downloaded file is
+registered with `core.attachment_storage` so it's served via
+`/attachments/{file_id}` (HTTP transport) or returned as an absolute
+path (stdio). Files expire from storage after 1 hour. **No
+credentials are returned to the caller at any point.**
+
+Native Google docs (Docs / Sheets / Slides) are exported to PDF / CSV
+/ PDF respectively — use the older `get_drive_file_download_url` if
+you need different export formats.
+
+Chunk size is configurable via `WORKSPACE_DOWNLOAD_CHUNK_BYTES`
+(default 4 194 304 = 4 MiB). Lower it on very tight memory; raise it
+to reduce HTTP round trips on big files over fast links.
+
+### `core/attachment_storage.py` — two new methods
+
+- `reserve_path(filename)` — returns `(file_id, absolute_path)` inside
+  the storage dir without writing anything. Lets streaming downloads
+  open the path with `O_CREAT|O_TRUNC|0600` and pass the file handle
+  to `MediaIoBaseDownload`.
+- `register_existing_file(file_id, file_path, filename, mime_type,
+  size)` — registers an already-on-disk file with the metadata table
+  so it's served and aged out by the existing `/attachments/{file_id}`
+  route + `cleanup_expired` sweep. Pairs with `reserve_path`.
+
+The original `save_attachment(base64_data, ...)` path is unchanged so
+existing callers (Gmail attachments, the Chat download tool, the
+non-streaming Drive download tool) keep working.
+
+### Audit fixes alongside the new tools
+
+- **`SENSITIVE` adds `upload_uri`.** Resumable upload session URIs are
+  short-lived bearer-equivalent tokens — anyone with one in the audit
+  window could PUT bytes to the upload. Treat them like credentials.
+  (`base64_content`, `fileUrl`, and `attachments` were already in
+  SENSITIVE; we keep them.)
+- **`_resource_id` skips `None` and `""` values.** `str(None)` was
+  emitting the literal string `"None"` into the audit sheet for tools
+  that take an optional file_id and got called without one. Both the
+  kwargs path and the result-dict path now treat None/empty the same
+  as a missing key.
+- **Audit error rows now name the original exception class.**
+  `handle_http_errors` re-raises Google `HttpError` (and other
+  framework errors) as `Exception(message) from cause`. Audit row used
+  to capture `type(e).__name__`, which collapsed every Drive failure
+  to `"Exception:"`. New helper `_origin_error_type` walks one level
+  through `__cause__` when the outer is a bare `Exception`, so audit
+  rows now read e.g. `HttpError: ...` instead of `Exception: ...`.
+  Subclasses of `Exception` (like `TransientNetworkError`) are kept
+  as-is, not unwrapped.
+
+### New env var (optional)
+
+- `WORKSPACE_DOWNLOAD_CHUNK_BYTES` — chunk size in bytes for the
+  streaming download path. Default 4194304 (4 MiB). Unset on Render
+  → default applies; no action required.
+
+### Operational notes for Render
+
+- Each `download_drive_file` call writes to `WORKSPACE_ATTACHMENT_DIR`
+  (default `~/.workspace-mcp/attachments/`) and the file lives there
+  for an hour. If the Render instance restarts before the user fetches
+  the file, the URL 404s — that's the same behaviour as the existing
+  Gmail / Chat attachment flows.
+- Resumable upload session URIs are valid for 7 days regardless of
+  this server's lifecycle. A redeploy mid-upload doesn't invalidate
+  the upload — just the audit-row correlation, which is acceptable.
