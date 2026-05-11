@@ -518,6 +518,57 @@ class TestDownloadDriveFile:
 
         assert chunk_calls["n"] == 9, f"expected 9 chunked reads, got {chunk_calls['n']}"
 
+    @pytest.mark.asyncio
+    async def test_requests_name_field_and_surfaces_actual_filename(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression: download_drive_file used to request only
+        ``size, mimeType, webViewLink`` in ``extra_fields``, which meant
+        ``resolve_drive_item`` never fetched ``name`` and the response fell
+        back to the literal string "Unknown File". Sibling tool
+        ``get_drive_file_download_url`` did the right thing. Verify both that
+        ``name`` is in the resolver request AND that the returned message
+        surfaces the actual filename."""
+        from gdrive import drive_tools
+
+        impl = _unwrap(drive_tools.download_drive_file)
+        service = _make_service_with_token()
+        request_obj = MagicMock()
+        request_obj._payload = b"data"
+        service.files.return_value.get_media.return_value = request_obj
+
+        captured = {}
+
+        async def capturing_resolve(svc, fid, extra_fields=None):
+            captured["extra_fields"] = extra_fields
+            # Mimic real Drive behaviour: only return ``name`` if it was
+            # actually requested in the fields list.
+            meta = {"mimeType": "application/octet-stream"}
+            if extra_fields and "name" in extra_fields:
+                meta["name"] = "real-report.pdf"
+            return fid, meta
+
+        monkeypatch.setattr(drive_tools, "resolve_drive_item", capturing_resolve)
+        monkeypatch.setattr(drive_tools, "MediaIoBaseDownload", _StubDownloader)
+        from core import attachment_storage
+
+        monkeypatch.setattr(attachment_storage, "STORAGE_DIR", tmp_path)
+        monkeypatch.setattr(drive_tools, "get_transport_mode", lambda: "stdio")
+
+        result = await impl(
+            service=service,
+            user_google_email="u@example.com",
+            file_id="abc",
+        )
+
+        assert captured["extra_fields"] is not None
+        assert "name" in captured["extra_fields"], (
+            f"download_drive_file must request 'name' in extra_fields, "
+            f"got: {captured['extra_fields']!r}"
+        )
+        assert "name: real-report.pdf" in result
+        assert "Unknown File" not in result
+
 
 # ---------------------------------------------------------------------------
 # Audit fixes (Step 4)
