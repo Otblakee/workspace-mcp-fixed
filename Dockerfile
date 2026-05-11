@@ -36,6 +36,12 @@ EXPOSE ${PORT:-8000}
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD sh -c 'curl -f http://localhost:${PORT:-8000}/health || exit 1'
 
+# Stream stdout/stderr unbuffered so Render's log view sees output in real
+# time, and lock encoding to UTF-8 so the startup banner's emoji don't trip
+# encoding errors on the slim base image.
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONIOENCODING=utf-8
+
 # Set environment variables for Python startup args
 ENV TOOL_TIER=""
 ENV TOOLS=""
