@@ -361,16 +361,15 @@ to `resolve_drive_item`, but `BASE_SHORTCUT_FIELDS` did not include
 Fix is one-line: add `name` to the requested fields. Regression test
 covers the contract.
 
-### Fix C — `gadmin` Admin SDK readonly module (PR #13)
+### Fix C — `gadmin` Admin SDK readonly module (PR #13, narrowed in Phase 2.5)
 
-New module `gadmin/admin_tools.py` with 16 strictly read-only tools
+New module `gadmin/admin_tools.py` with 15 strictly read-only tools
 across Directory v1 and Reports v1:
 
-Directory (11):
+Directory (10):
 `list_users`, `get_user`, `list_groups`, `get_group`,
 `list_group_members`, `list_user_groups`, `list_orgunits`,
-`get_orgunit`, `list_admin_roles`, `list_role_assignments`,
-`list_oauth_tokens_for_user`
+`get_orgunit`, `list_admin_roles`, `list_role_assignments`
 
 Reports (5):
 `query_admin_audit_log`, `query_login_audit_log`,
@@ -386,14 +385,17 @@ Read-only contract is defence-in-depth:
    `groups().insert(`, `roleAssignments().delete(`, `tokens().delete(`,
    `mobiledevices().action(`, …) and fails on any hit.
 4. The scopes module is scanned for any non-readonly admin scope URL.
+5. **All 8 scopes in `ADMIN_SCOPES` end in `.readonly`.** No
+   write-capable Admin SDK scope is granted at consent time, so even
+   if a future code change *tried* to call a write method, the API
+   would 403 — the read-only invariant is gated at the scope layer,
+   not just by code inspection.
 
 Wiring:
-- 9 admin scope constants in `auth/scopes.py` (8 `.readonly` + the one
-  broader `admin.directory.user.security` scope required by
-  `tokens.list`; gadmin never calls `tokens.delete`).
+- 8 admin scope constants in `auth/scopes.py`, all `.readonly`.
 - `admin_directory` / `admin_reports` `SERVICE_CONFIGS` in
-  `auth/service_decorator.py`. 9 scope group aliases.
-- `gadmin` section in `core/tool_tiers.yaml` covering all 16 tools.
+  `auth/service_decorator.py`. 8 scope group aliases.
+- `gadmin` section in `core/tool_tiers.yaml` covering all 15 tools.
 - `gadmin` entry in `main.py` `tool_imports` table and `--tools`
   argparse choices.
 - `core/audit.py._service()` accepts a `module` argument and tags any
@@ -421,7 +423,7 @@ For the change to take effect on Render the operator must either:
 1. Add `gadmin` to the Render `TOOLS` env var, or
 2. Clear the `TOOLS` env var so the default-load runs.
 
-Existing client sessions need re-auth after redeploy to grant the 9 new
+Existing client sessions need re-auth after redeploy to grant the 8 new
 admin scopes.
 
 #### Drive permissions policy messaging
@@ -446,10 +448,42 @@ Tests in `tests/test_drive_permissions_policy.py` assert both that
 the old hint strings are absent from `gdrive/drive_tools.py` and that
 the new policy note is referenced.
 
+#### Token-delete gated at the consent layer
+
+PR #13 originally exposed `list_oauth_tokens_for_user`, the one tool
+in the brief whose backing API (`users().tokens().list`) is *not*
+authorised by any `.readonly` Admin SDK scope. The only scope that
+grants it is `admin.directory.user.security`, which Google issues in
+pairs — the same scope also authorises `users().tokens().delete`.
+
+That gave the consent set a write-capable scope even though the
+module never invoked the delete method; the read-only contract relied
+on source-level inspection alone to block writes. Phase 2.5 narrows
+the contract:
+
+- The `list_oauth_tokens_for_user` tool is removed from the module
+  and from `core/tool_tiers.yaml`.
+- The `ADMIN_DIRECTORY_USER_SECURITY_SCOPE` constant is removed from
+  `auth/scopes.py` so `ADMIN_SCOPES` is now strictly 8 `.readonly`
+  entries.
+- The `admin_directory_user_security` scope group alias is removed
+  from `auth/service_decorator.py` so a future tool that asks for it
+  by name fails at `_resolve_scopes` rather than silently extending
+  the consent set.
+- Regression tests in `TestScopesWired` lock all three deletions in.
+
+Token grants are still observable post-Phase-2.5 via
+`query_token_audit_log` (the Reports API `token` activity feed) under
+`admin.reports.audit.readonly`, which is genuinely read-only. The
+trade-off is real but small: live `tokens().list` is gone, but the
+audit-log feed surfaces every `authorize` / `revoke` event with
+timestamp + actor + client metadata, which covers the same incident-
+response workflow.
+
 ### Manual coordination required before redeploy
 
-1. **OAuth consent screen** — add 9 scopes to the OTB GCP project's
-   OAuth consent screen:
+1. **OAuth consent screen** — add 8 strictly read-only scopes to the
+   OTB GCP project's OAuth consent screen:
    - `admin.directory.user.readonly`
    - `admin.directory.group.readonly`
    - `admin.directory.group.member.readonly`
@@ -458,14 +492,10 @@ the new policy note is referenced.
    - `admin.directory.device.mobile.readonly`
    - `admin.reports.audit.readonly`
    - `admin.reports.usage.readonly`
-   - `admin.directory.user.security` (needed for
-     `list_oauth_tokens_for_user`; if you'd rather drop that tool,
-     this scope can be removed from `ADMIN_SCOPES` in
-     `auth/scopes.py`).
 
 2. **Domain-wide delegation** — Workspace super-admin adds the OAuth
    client ID under Admin Console → Security → API Controls →
-   Domain-wide delegation with the same 9 scopes. Admin SDK calls
+   Domain-wide delegation with the same 8 scopes. Admin SDK calls
    require DwD, not just user consent; without it every gadmin tool
    returns 403.
 

@@ -19,11 +19,9 @@ Admin writes stay on GAM CLI / the Admin Console.
 
 Operational prerequisites before this module's tools can succeed:
 
-  * The OTB GCP project's OAuth consent screen must list all admin readonly
-    scopes referenced in ``auth.scopes.ADMIN_SCOPES`` (and, if the
-    ``list_oauth_tokens_for_user`` tool is enabled, the
-    ``admin.directory.user.security`` scope it depends on — see that tool's
-    docstring for the rationale).
+  * The OTB GCP project's OAuth consent screen must list all 8 admin
+    readonly scopes referenced in ``auth.scopes.ADMIN_SCOPES``. None of
+    those scopes authorise any Admin SDK write.
   * The OAuth client ID must be added in Google Workspace Admin Console →
     Security → API Controls → Domain-wide delegation with the exact same
     scope list. Without that, every tool here returns ``403`` because
@@ -544,73 +542,15 @@ async def list_role_assignments(
     return f"{len(assignments)} role assignment(s):\n" + "\n".join(lines) + suffix
 
 
-# ---------------------------------------------------------------------------
-# Directory API — OAuth Tokens
-#
-# IMPORTANT: ``users().tokens().list`` is documented in the Directory API
-# reference as requiring the ``admin.directory.user.security`` scope, which
-# is broader than the brief's eight readonly-only scopes. That scope also
-# authorizes ``tokens().delete``, which is a write operation. The gadmin
-# module never calls ``tokens().delete``; the read-only contract is enforced
-# by inspection of this file, not by scope narrowing. If the security scope
-# is not granted (consent screen + DwD), this tool returns a clean 403
-# rather than crashing.
-# ---------------------------------------------------------------------------
-
-
-@server.tool()
-@require_google_service("admin_directory", "admin_directory_user_security")
-@handle_http_errors(
-    "list_oauth_tokens_for_user",
-    is_read_only=True,
-    service_type="admin_directory",
-)
-async def list_oauth_tokens_for_user(
-    service: Resource,
-    user_google_email: str,
-    user_key: str,
-) -> str:
-    """READ-ONLY: List third-party OAuth tokens issued by a Workspace user.
-
-    Surfaces ``clientId``, ``displayText`` (the app name as shown on the
-    user's Account page), ``nativeApp`` flag, and the scopes the user has
-    granted to each client. Useful for spotting unexpected/long-tail OAuth
-    grants during incident response.
-
-    Args:
-        user_google_email: Caller's Google email (must be a Workspace admin).
-        user_key: ``primaryEmail`` or unique user ID whose tokens to list.
-
-    NOTE on scope: this tool depends on
-    ``admin.directory.user.security``, which is broader than the other
-    admin readonly scopes used in this module. See the section comment in
-    ``gadmin/admin_tools.py`` for the rationale.
-    """
-    logger.info(f"[list_oauth_tokens_for_user] user_key={user_key}")
-    result = await asyncio.to_thread(
-        service.tokens().list(userKey=user_key).execute
-    )
-    tokens = result.get("items") or []
-    if not tokens:
-        return f"User {user_key} has no third-party OAuth tokens."
-    lines = []
-    for t in tokens:
-        client_id = t.get("clientId") or "(no client_id)"
-        display = t.get("displayText") or ""
-        native = "native" if t.get("nativeApp") else "web"
-        anonymous = " anonymous=true" if t.get("anonymous") else ""
-        scopes = t.get("scopes") or []
-        scope_summary = (
-            ", ".join(scopes[:6])
-            + (f", …(+{len(scopes) - 6} more)" if len(scopes) > 6 else "")
-        )
-        lines.append(
-            f"- client_id={client_id} display={display!r} kind={native}"
-            f"{anonymous}\n    scopes: {scope_summary}"
-        )
-    return (
-        f"{len(tokens)} OAuth token(s) for {user_key}:\n" + "\n".join(lines)
-    )
+# Note on a deliberately-omitted tool: ``list_oauth_tokens_for_user`` was
+# previously exposed here. ``users().tokens().list`` requires the
+# ``admin.directory.user.security`` scope, which Google grants in pairs —
+# the same scope also authorises ``users().tokens().delete``. To keep
+# gadmin's consent set strictly read-only, we drop the tool and the
+# security scope rather than rely on source-level inspection alone to
+# block the delete capability. Token-grant visibility is still available
+# via ``query_token_audit_log`` below (authorize / revoke events) under
+# the ``admin.reports.audit.readonly`` scope, which is genuinely read-only.
 
 
 # ---------------------------------------------------------------------------

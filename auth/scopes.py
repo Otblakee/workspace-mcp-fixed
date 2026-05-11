@@ -101,17 +101,12 @@ ADMIN_REPORTS_USAGE_READONLY_SCOPE = (
     "https://www.googleapis.com/auth/admin.reports.usage.readonly"
 )
 
-# Required by ``users().tokens().list`` — the Admin SDK Directory API does
-# not authorise tokens.list under any of the readonly scopes above. This
-# scope is broader than the rest (it also authorises ``tokens().delete``,
-# a write operation). gadmin/admin_tools.py never calls tokens.delete;
-# the read-only invariant is enforced by code inspection + tests, not by
-# scope narrowing. If your deployment does not enable the
-# ``list_oauth_tokens_for_user`` tool, this scope can be dropped from
-# ADMIN_SCOPES below.
-ADMIN_DIRECTORY_USER_SECURITY_SCOPE = (
-    "https://www.googleapis.com/auth/admin.directory.user.security"
-)
+# The ``admin.directory.user.security`` scope is deliberately NOT defined
+# here. It would be the only path to ``users().tokens().list`` but the same
+# scope also authorises ``users().tokens().delete``, which would put a write
+# capability inside our consent set. Token grants are still observable via
+# ``query_token_audit_log`` in gadmin/admin_tools.py under the genuinely
+# read-only ``admin.reports.audit.readonly`` scope.
 
 # Google Apps Script API scopes
 SCRIPT_PROJECTS_SCOPE = "https://www.googleapis.com/auth/script.projects"
@@ -217,14 +212,14 @@ TASKS_SCOPES = [TASKS_SCOPE, TASKS_READONLY_SCOPE]
 
 CONTACTS_SCOPES = [CONTACTS_SCOPE, CONTACTS_READONLY_SCOPE]
 
-# Admin SDK scopes for the gadmin module. All entries except
-# ADMIN_DIRECTORY_USER_SECURITY_SCOPE are readonly. The security scope is
-# required to authorise ``tokens.list`` (see the constant's comment above);
-# even though it also authorises ``tokens.delete``, gadmin never calls
-# delete and the read-only contract is enforced by source-level tests.
-# This list drives the OAuth consent prompt — every entry must be on the
-# OTB OAuth consent screen + domain-wide delegation allowlist or admin
-# tool calls will fail with 403/insufficient_scope at runtime.
+# Admin SDK scopes for the gadmin module. STRICTLY READ-ONLY by design —
+# every scope here ends in ``.readonly``. The Admin SDK has no narrower
+# read scope for OAuth-token listing, so ``list_oauth_tokens_for_user``
+# is deliberately not exposed (see gadmin/admin_tools.py for the
+# rationale). This list drives the OAuth consent prompt — every entry
+# must be on the OTB OAuth consent screen + domain-wide delegation
+# allowlist or admin tool calls will fail with 403/insufficient_scope at
+# runtime.
 ADMIN_SCOPES = [
     ADMIN_DIRECTORY_USER_READONLY_SCOPE,
     ADMIN_DIRECTORY_GROUP_READONLY_SCOPE,
@@ -234,7 +229,6 @@ ADMIN_SCOPES = [
     ADMIN_DIRECTORY_DEVICE_MOBILE_READONLY_SCOPE,
     ADMIN_REPORTS_AUDIT_READONLY_SCOPE,
     ADMIN_REPORTS_USAGE_READONLY_SCOPE,
-    ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
 ]
 
 CUSTOM_SEARCH_SCOPES = [CUSTOM_SEARCH_SCOPE]

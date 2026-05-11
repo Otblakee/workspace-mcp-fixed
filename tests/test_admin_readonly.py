@@ -49,7 +49,6 @@ DIRECTORY_TOOLS = {
     "get_orgunit",
     "list_admin_roles",
     "list_role_assignments",
-    "list_oauth_tokens_for_user",
 }
 REPORTS_TOOLS = {
     "query_admin_audit_log",
@@ -80,35 +79,45 @@ class TestScopesWired:
                 f"{name} must be a readonly scope; got {value}"
             )
 
-    def test_admin_scopes_list_composition(self):
+    def test_admin_scopes_list_is_strictly_readonly(self):
         """ADMIN_SCOPES drives the OAuth consent prompt. It must contain
-        all 8 readonly scopes plus the one broader scope required by
-        ``users().tokens().list`` — and nothing else. If the security
-        scope were missing, ``list_oauth_tokens_for_user`` would 403 on
-        every call (Codex P1)."""
-        from auth.scopes import (
-            ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
-            ADMIN_SCOPES,
-        )
+        exactly 8 readonly Admin SDK scopes — no broader scope that
+        would also authorise a write at the API level.
 
-        assert len(ADMIN_SCOPES) == 9
-        # Exactly 8 readonly scopes and the security scope — no other
-        # write-capable Admin SDK scopes.
-        readonly = [s for s in ADMIN_SCOPES if s.endswith(".readonly")]
-        non_readonly = [s for s in ADMIN_SCOPES if not s.endswith(".readonly")]
-        assert len(readonly) == 8
-        assert non_readonly == [ADMIN_DIRECTORY_USER_SECURITY_SCOPE]
+        Previously included ``admin.directory.user.security`` so
+        ``list_oauth_tokens_for_user`` could call ``tokens.list``, but
+        that same scope authorises ``tokens.delete``. To gate the delete
+        capability at the consent layer (not just by code inspection),
+        the tool and the scope are both removed."""
+        from auth.scopes import ADMIN_SCOPES
 
-    def test_admin_user_security_scope_present_in_consent_scope_set(self):
-        """Codex P1 regression: the consent flow must request
-        admin.directory.user.security, otherwise list_oauth_tokens_for_user
-        fails with insufficient scope on every call."""
+        assert len(ADMIN_SCOPES) == 8
+        for scope in ADMIN_SCOPES:
+            assert scope.endswith(".readonly"), (
+                f"non-readonly admin scope leaked into consent set: {scope}"
+            )
+
+    def test_user_security_scope_is_not_in_consent_set(self):
+        """Regression: ensure the previously-included security scope
+        does not creep back into ADMIN_SCOPES. Keeping it strictly out
+        means a future tool addition that relies on the scope will fail
+        at code review (the scope isn't there to grant) rather than
+        silently gaining a write-capable scope."""
         from auth.scopes import ADMIN_SCOPES
 
         assert (
             "https://www.googleapis.com/auth/admin.directory.user.security"
-            in ADMIN_SCOPES
+            not in ADMIN_SCOPES
         )
+
+    def test_user_security_scope_constant_is_not_defined(self):
+        """Stronger regression: the constant for the broader scope must
+        not exist in auth/scopes.py at all. If a future contributor
+        re-introduces the constant, that's the trigger to revisit
+        whether the read-only contract still holds."""
+        from auth import scopes
+
+        assert not hasattr(scopes, "ADMIN_DIRECTORY_USER_SECURITY_SCOPE")
 
     def test_gadmin_in_scope_maps(self):
         from auth.scopes import TOOL_READONLY_SCOPES_MAP, TOOL_SCOPES_MAP
@@ -167,15 +176,16 @@ class TestServiceDecoratorWired:
             assert key in SCOPE_GROUPS
             assert SCOPE_GROUPS[key].endswith(".readonly")
 
-    def test_user_security_scope_group_resolvable(self):
-        """Codex P1 regression: the symbolic name used by
-        list_oauth_tokens_for_user must resolve to the correct URL."""
+    def test_user_security_scope_group_is_not_defined(self):
+        """Regression: the previously-exported symbolic name
+        ``admin_directory_user_security`` must not be reachable through
+        SCOPE_GROUPS. That keeps the broader scope un-grantable via the
+        usual decorator path so a future tool that asks for it fails at
+        ``_resolve_scopes`` rather than silently extending the consent
+        set."""
         from auth.service_decorator import SCOPE_GROUPS
 
-        assert (
-            SCOPE_GROUPS["admin_directory_user_security"]
-            == "https://www.googleapis.com/auth/admin.directory.user.security"
-        )
+        assert "admin_directory_user_security" not in SCOPE_GROUPS
 
 
 class TestReadOnlyContract:

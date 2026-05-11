@@ -224,7 +224,6 @@ gadmin:
   extended:
     - list_admin_roles
     - list_role_assignments
-    - list_oauth_tokens_for_user
     - query_admin_audit_log
     - query_login_audit_log
     - query_token_audit_log
