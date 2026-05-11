@@ -47,7 +47,20 @@ SENSITIVE = {"body", "text_content", "message_body", "html_body", "values",
              "upload_uri"}
 
 
-def _service(tool: str) -> str:
+# Module-prefix overrides for service tagging. Used when the tool's bare
+# name would be ambiguous under SERVICE_MAP substring matching — e.g.
+# ``query_drive_audit_log`` lives in ``gadmin.admin_tools`` and must be tagged
+# ``gadmin``, not ``drive``. Modules win over name heuristics.
+_MODULE_SERVICE_MAP = {
+    "gadmin": "gadmin",
+}
+
+
+def _service(tool: str, module: str = "") -> str:
+    if module:
+        for prefix, svc in _MODULE_SERVICE_MAP.items():
+            if module.startswith(prefix):
+                return svc
     n = tool.lower()
     for k, v in SERVICE_MAP.items():
         if k in n:
@@ -426,7 +439,7 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                     logger().submit({
                         "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                         "user": user,
-                        "service": _service(fn.__name__),
+                        "service": _service(fn.__name__, getattr(fn, "__module__", "")),
                         "tool": fn.__name__,
                         "params_summary": _redact(kwargs),
                         "resource_id": resource_id,

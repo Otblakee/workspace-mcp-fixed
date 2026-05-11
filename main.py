@@ -136,6 +136,7 @@ def main():
             "contacts",
             "search",
             "appscript",
+            "gadmin",
         ],
         help="Specify which tools to register. If not provided, all tools are registered.",
     )
@@ -260,6 +261,7 @@ def main():
         "contacts": lambda: import_module("gcontacts.contacts_tools"),
         "search": lambda: import_module("gsearch.search_tools"),
         "appscript": lambda: import_module("gappsscript.apps_script_tools"),
+        "gadmin": lambda: import_module("gadmin.admin_tools"),
     }
 
     tool_icons = {
@@ -275,7 +277,14 @@ def main():
         "contacts": "👤",
         "search": "🔍",
         "appscript": "📜",
+        "gadmin": "🛡️",
     }
+
+    # Modules excluded from the "default-load all tools" behaviour. Operators
+    # must opt in explicitly via the TOOLS env var (or --tools CLI arg) once
+    # the necessary OAuth consent screen entries and Workspace domain-wide
+    # delegation are in place. See gadmin/admin_tools.py for prerequisites.
+    OPT_IN_TOOLS = {"gadmin"}
 
     # Determine which tools to import based on arguments
     if args.tool_tier is not None:
@@ -302,8 +311,14 @@ def main():
         # Don't filter individual tools when using explicit service list only
         set_enabled_tool_names(None)
     else:
-        # Default: import all tools
-        tools_to_import = tool_imports.keys()
+        # Default: import all tools EXCEPT opt-in modules (e.g. gadmin).
+        # Opt-in modules pull in scopes that require prior coordination with
+        # the OAuth consent screen / domain-wide delegation; loading them
+        # silently on every fresh deploy would break the existing user's
+        # consent flow.
+        tools_to_import = [
+            t for t in tool_imports.keys() if t not in OPT_IN_TOOLS
+        ]
         # Don't filter individual tools when importing all
         set_enabled_tool_names(None)
 

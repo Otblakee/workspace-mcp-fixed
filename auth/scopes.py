@@ -69,6 +69,38 @@ CONTACTS_READONLY_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 # Google Custom Search API scope
 CUSTOM_SEARCH_SCOPE = "https://www.googleapis.com/auth/cse"
 
+# Google Admin SDK scopes (READ-ONLY ONLY).
+#
+# These scopes are reserved for the gadmin module, which exposes Directory API
+# and Reports API tools that are strictly read-only. No admin write scope
+# (e.g. admin.directory.user, admin.directory.group) is defined here, because
+# the gadmin module must never write — admin writes stay on GAM CLI / the
+# Admin Console. See gadmin/admin_tools.py for the read-only invariant.
+ADMIN_DIRECTORY_USER_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.user.readonly"
+)
+ADMIN_DIRECTORY_GROUP_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.group.readonly"
+)
+ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.group.member.readonly"
+)
+ADMIN_DIRECTORY_ORGUNIT_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.orgunit.readonly"
+)
+ADMIN_DIRECTORY_ROLEMANAGEMENT_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.rolemanagement.readonly"
+)
+ADMIN_DIRECTORY_DEVICE_MOBILE_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.device.mobile.readonly"
+)
+ADMIN_REPORTS_AUDIT_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.reports.audit.readonly"
+)
+ADMIN_REPORTS_USAGE_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.reports.usage.readonly"
+)
+
 # Google Apps Script API scopes
 SCRIPT_PROJECTS_SCOPE = "https://www.googleapis.com/auth/script.projects"
 SCRIPT_PROJECTS_READONLY_SCOPE = (
@@ -173,6 +205,20 @@ TASKS_SCOPES = [TASKS_SCOPE, TASKS_READONLY_SCOPE]
 
 CONTACTS_SCOPES = [CONTACTS_SCOPE, CONTACTS_READONLY_SCOPE]
 
+# Admin SDK readonly scopes — no broader admin scope is added intentionally.
+# The gadmin module is read-only; under no circumstances should a write
+# scope appear in this list.
+ADMIN_SCOPES = [
+    ADMIN_DIRECTORY_USER_READONLY_SCOPE,
+    ADMIN_DIRECTORY_GROUP_READONLY_SCOPE,
+    ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE,
+    ADMIN_DIRECTORY_ORGUNIT_READONLY_SCOPE,
+    ADMIN_DIRECTORY_ROLEMANAGEMENT_READONLY_SCOPE,
+    ADMIN_DIRECTORY_DEVICE_MOBILE_READONLY_SCOPE,
+    ADMIN_REPORTS_AUDIT_READONLY_SCOPE,
+    ADMIN_REPORTS_USAGE_READONLY_SCOPE,
+]
+
 CUSTOM_SEARCH_SCOPES = [CUSTOM_SEARCH_SCOPE]
 
 SCRIPT_SCOPES = [
@@ -199,6 +245,9 @@ TOOL_SCOPES_MAP = {
     "contacts": CONTACTS_SCOPES,
     "search": CUSTOM_SEARCH_SCOPES,
     "appscript": SCRIPT_SCOPES,
+    # Admin SDK is read-only by design; identical entry in TOOL_SCOPES_MAP
+    # and TOOL_READONLY_SCOPES_MAP because there is no "write" variant.
+    "gadmin": ADMIN_SCOPES,
 }
 
 # Tool-to-read-only-scopes mapping
@@ -213,6 +262,7 @@ TOOL_READONLY_SCOPES_MAP = {
     "slides": [SLIDES_READONLY_SCOPE],
     "tasks": [TASKS_READONLY_SCOPE],
     "contacts": [CONTACTS_READONLY_SCOPE],
+    "gadmin": ADMIN_SCOPES,
     "search": CUSTOM_SEARCH_SCOPES,
     "appscript": [
         SCRIPT_PROJECTS_READONLY_SCOPE,
