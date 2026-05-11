@@ -337,3 +337,147 @@ non-streaming Drive download tool) keep working.
 - Resumable upload session URIs are valid for 7 days regardless of
   this server's lifecycle. A redeploy mid-upload doesn't invalidate
   the upload — just the audit-row correlation, which is acceptable.
+
+## Phase 2: download_drive_file filename fix + Admin SDK readonly module
+
+Three changes, two of which landed as new code, one of which was a
+verified no-op.
+
+### Fix A — audit-log redaction extension (no-op)
+
+The Phase 2 brief asked to add `base64_content`, `fileUrl`, and
+`attachments` to the audit `SENSITIVE` set. Verified against the live
+audit Sheet that all three keys were already present (added in commit
+`4b82d4b`, PR #4 on 2026-05-05) and that response URLs are not written
+into any audit column — the decorator nullifies `result` before
+submitting. The "Render attachment URL leak" the brief described does
+not exist in current code. **No commit was needed for Fix A.**
+
+### Fix B — `download_drive_file` filename (PR #12, commit d10fc7a)
+
+`download_drive_file` passed `extra_fields="size, mimeType, webViewLink"`
+to `resolve_drive_item`, but `BASE_SHORTCUT_FIELDS` did not include
+`name`, so `meta.get("name", "Unknown File")` always hit the fallback.
+Fix is one-line: add `name` to the requested fields. Regression test
+covers the contract.
+
+### Fix C — `gadmin` Admin SDK readonly module (PR #13)
+
+New module `gadmin/admin_tools.py` with 16 strictly read-only tools
+across Directory v1 and Reports v1:
+
+Directory (11):
+`list_users`, `get_user`, `list_groups`, `get_group`,
+`list_group_members`, `list_user_groups`, `list_orgunits`,
+`get_orgunit`, `list_admin_roles`, `list_role_assignments`,
+`list_oauth_tokens_for_user`
+
+Reports (5):
+`query_admin_audit_log`, `query_login_audit_log`,
+`query_token_audit_log`, `query_drive_audit_log`,
+`query_usage_report`
+
+Read-only contract is defence-in-depth:
+
+1. Every tool's `@handle_http_errors` carries `is_read_only=True`.
+2. Every docstring starts with `READ-ONLY:`.
+3. `tests/test_admin_readonly.py` runs a parametrised source scan
+   for 29 Admin SDK write-method shapes (`users().delete(`,
+   `groups().insert(`, `roleAssignments().delete(`, `tokens().delete(`,
+   `mobiledevices().action(`, …) and fails on any hit.
+4. The scopes module is scanned for any non-readonly admin scope URL.
+
+Wiring:
+- 9 admin scope constants in `auth/scopes.py` (8 `.readonly` + the one
+  broader `admin.directory.user.security` scope required by
+  `tokens.list`; gadmin never calls `tokens.delete`).
+- `admin_directory` / `admin_reports` `SERVICE_CONFIGS` in
+  `auth/service_decorator.py`. 9 scope group aliases.
+- `gadmin` section in `core/tool_tiers.yaml` covering all 16 tools.
+- `gadmin` entry in `main.py` `tool_imports` table and `--tools`
+  argparse choices.
+- `core/audit.py._service()` accepts a `module` argument and tags any
+  tool whose `__module__` starts with `"gadmin"` as
+  `service=gadmin`, regardless of name. Without this,
+  `query_drive_audit_log` would substring-match `"drive"`.
+
+### Phase 2.5 follow-ups
+
+After merging Phase 2 and starting live verification, two adjustments
+went on to a separate branch.
+
+#### gadmin default-on
+
+Phase 2 shipped `gadmin` behind an `OPT_IN_TOOLS = {"gadmin"}` guard
+that excluded it from the default tool set, so the explicit Render
+`TOOLS` env var (`gmail drive calendar docs sheets contacts`) didn't
+pick it up and the tools weren't visible to the deployed connector.
+Phase 2.5 removes that guard: the default-load path now imports every
+module in `tool_imports`, and tier-mode passes `suggested_services`
+through unchanged. Tests `TestMainDefaultOn` lock the posture so a
+future refactor can't quietly re-introduce a silent skip.
+
+For the change to take effect on Render the operator must either:
+1. Add `gadmin` to the Render `TOOLS` env var, or
+2. Clear the `TOOLS` env var so the default-load runs.
+
+Existing client sessions need re-auth after redeploy to grant the 9 new
+admin scopes.
+
+#### Drive permissions policy messaging
+
+`get_drive_file_permissions` and `check_drive_file_public_access` both
+ended their "no public access" branches with the actionable hint
+`Right-click → Share → Anyone with the link → Viewer`. That hint
+satisfies Google's `insert_doc_image_url` API requirement, but it
+breaches OTB's groups-only sharing policy and would mislead Wave 2
+teammates following tool output literally.
+
+Fix lifts the message to a single source-of-truth constant
+`NO_PUBLIC_ACCESS_POLICY_NOTE` in `gdrive/drive_helpers.py` and reuses
+it from both response sites. The new note rejects the public-link
+remediation explicitly and points users to policy-compliant
+alternatives (share with the recipient group + embed as link, or
+upload the image directly via the Google Docs UI). The dead
+`format_public_sharing_error` helper was updated for consistency so
+the breach can't slip back in via a future re-wiring.
+
+Tests in `tests/test_drive_permissions_policy.py` assert both that
+the old hint strings are absent from `gdrive/drive_tools.py` and that
+the new policy note is referenced.
+
+### Manual coordination required before redeploy
+
+1. **OAuth consent screen** — add 9 scopes to the OTB GCP project's
+   OAuth consent screen:
+   - `admin.directory.user.readonly`
+   - `admin.directory.group.readonly`
+   - `admin.directory.group.member.readonly`
+   - `admin.directory.orgunit.readonly`
+   - `admin.directory.rolemanagement.readonly`
+   - `admin.directory.device.mobile.readonly`
+   - `admin.reports.audit.readonly`
+   - `admin.reports.usage.readonly`
+   - `admin.directory.user.security` (needed for
+     `list_oauth_tokens_for_user`; if you'd rather drop that tool,
+     this scope can be removed from `ADMIN_SCOPES` in
+     `auth/scopes.py`).
+
+2. **Domain-wide delegation** — Workspace super-admin adds the OAuth
+   client ID under Admin Console → Security → API Controls →
+   Domain-wide delegation with the same 9 scopes. Admin SDK calls
+   require DwD, not just user consent; without it every gadmin tool
+   returns 403.
+
+3. **Render env var** — either remove the `TOOLS` env var from the
+   Render dashboard so the default-load runs, or update it to include
+   `gadmin` alongside the other services.
+
+Existing sessions are invalidated by the JTI rotation pattern from
+earlier deploys; clients will re-consent on the next call.
+
+### Smoke test after deploy
+
+`list_users(max_results=1)` exercises auth + DwD + scope wiring + a
+Directory API call in one go. If it returns the OTB user list, the
+whole stack is wired.
