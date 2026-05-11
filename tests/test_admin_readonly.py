@@ -365,46 +365,51 @@ class TestToolTierWiring:
         )
 
 
-class TestMainOptIn:
-    def test_gadmin_is_opt_in(self):
-        """gadmin must be present in tool_imports but excluded from the
-        default tool set so existing Render deploys do not silently
-        request admin scopes without prior coordination."""
+class TestMainDefaultOn:
+    """gadmin is loaded by default once the OAuth consent screen and
+    Workspace domain-wide delegation have the 9 admin scopes. The earlier
+    OPT_IN_TOOLS safety net (which excluded gadmin from the default
+    ``tool_imports.keys()`` walk and the tier-resolved suggested_services
+    list) has been removed; these tests lock that posture in so a future
+    refactor can't accidentally re-introduce a silent skip."""
+
+    def test_gadmin_in_tool_imports_and_choices(self):
         main_path = Path(__file__).resolve().parent.parent / "main.py"
         src = main_path.read_text()
-        # Sanity: gadmin appears in the imports table and in --tools choices.
+        # gadmin must remain a member of both the importer table and the
+        # --tools argparse choices, otherwise the explicit-list path
+        # (TOOLS env var) can't pull it in either.
         assert '"gadmin": lambda: import_module("gadmin.admin_tools")' in src
-        # The OPT_IN_TOOLS guard must reference gadmin.
-        assert 'OPT_IN_TOOLS = {"gadmin"}' in src
-        # And the default-tools branch must apply the OPT_IN_TOOLS filter.
-        assert "if t not in OPT_IN_TOOLS" in src
+        assert '"gadmin",\n' in src  # appears in --tools choices list
 
-    def test_tier_mode_also_applies_opt_in_filter(self):
-        """Codex P2 regression: ``--tool-tier core`` without ``--tools``
-        used to pull in gadmin because gadmin has a core tier section in
-        tool_tiers.yaml. The opt-in filter must apply in the tier path
-        too — both for the services list AND for the tier_tools list
-        passed to ``set_enabled_tool_names``."""
+    def test_default_branch_does_not_filter_gadmin(self):
+        """Regression: the default-load path must not exclude gadmin.
+        Earlier code had ``OPT_IN_TOOLS = {"gadmin"}`` and filtered the
+        default tool list through it; removing that gating is what
+        ``Put the env on by default`` requested."""
         main_path = Path(__file__).resolve().parent.parent / "main.py"
         src = main_path.read_text()
-        # Suggested services list is filtered.
-        assert "s for s in suggested_services if s not in OPT_IN_TOOLS" in src
-        # The corresponding tool names are stripped from tier_tools so
-        # set_enabled_tool_names isn't whitelisting unreachable tools.
-        assert "excluded_tools = _tools_in_services(OPT_IN_TOOLS)" in src
-        assert "tier_tools = [t for t in tier_tools if t not in excluded_tools]" in src
+        assert "OPT_IN_TOOLS" not in src
+        assert "tools_to_import = list(tool_imports.keys())" in src
 
-    def test_tools_in_services_helper_returns_all_gadmin_tools(self):
-        """The _tools_in_services helper used by the tier-mode filter must
-        return every tool declared under gadmin across all three tiers.
-        Without that, ``set_enabled_tool_names`` would whitelist gadmin
-        tools while ``tools_to_import`` excludes the module — a silent
-        inconsistency."""
+    def test_tier_branch_does_not_filter_gadmin(self):
+        """Tier mode must surface gadmin's tier entries (gadmin.core etc.)
+        as well — no extra gating on top of the tier yaml."""
+        main_path = Path(__file__).resolve().parent.parent / "main.py"
+        src = main_path.read_text()
+        # The tier-resolved suggested_services list is used as-is.
+        assert "tools_to_import = suggested_services" in src
+        # The earlier helper that walked the yaml to strip opt-in tools is gone.
+        assert "_tools_in_services" not in src
+
+    def test_gadmin_tier_yaml_is_authoritative(self):
+        """The yaml must declare exactly the 16 tools the module exposes.
+        Without that, --tool-tier core would either skip admin tools or
+        whitelist tool names that don't exist."""
         from core.tool_tier_loader import ToolTierLoader
 
-        # Mirror the helper's behaviour (defined inline in main.py;
-        # importing main.py would execute its argparse, so we replicate
-        # the few-line logic here).
         loader = ToolTierLoader()
         gadmin_tools = set(loader.get_tools_up_to_tier("complete", ["gadmin"]))
         assert gadmin_tools == ALL_ADMIN_TOOLS
+
+

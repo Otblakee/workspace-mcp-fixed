@@ -280,30 +280,6 @@ def main():
         "gadmin": "🛡️",
     }
 
-    # Modules excluded from the "default-load all tools" behaviour. Operators
-    # must opt in explicitly via the TOOLS env var (or --tools CLI arg) once
-    # the necessary OAuth consent screen entries and Workspace domain-wide
-    # delegation are in place. See gadmin/admin_tools.py for prerequisites.
-    OPT_IN_TOOLS = {"gadmin"}
-
-    def _tools_in_services(services):
-        """Return every tool name declared under the given services in
-        ``core/tool_tiers.yaml``. Used to filter opt-in services out of
-        tier-resolved tool lists so tier mode honours the opt-in contract.
-
-        Walks all three tiers (``core``, ``extended``, ``complete``) for
-        each named service so the filter is independent of which
-        ``--tool-tier`` the operator picked."""
-        from core.tool_tier_loader import ToolTierLoader
-
-        loader = ToolTierLoader()
-        services_list = list(services)
-        if not services_list:
-            return set()
-        # get_tools_up_to_tier("complete", [svc]) returns every tool name
-        # declared under that service across all tier levels.
-        return set(loader.get_tools_up_to_tier("complete", services_list))
-
     # Determine which tools to import based on arguments
     if args.tool_tier is not None:
         # Use tier-based tool selection, optionally filtered by services
@@ -313,22 +289,11 @@ def main():
             )
 
             # If --tools specified, use those services; otherwise use all
-            # services that have tier tools — minus opt-in modules that
-            # weren't explicitly named. Without this, ``--tool-tier core``
-            # alone would load gadmin (because gadmin has a core tier in
-            # tool_tiers.yaml) and request admin scopes silently, defeating
-            # the opt-in safety net.
+            # services that have tier tools.
             if args.tools is not None:
                 tools_to_import = args.tools
             else:
-                tools_to_import = [
-                    s for s in suggested_services if s not in OPT_IN_TOOLS
-                ]
-                # Strip the corresponding tool names from tier_tools so
-                # set_enabled_tool_names doesn't whitelist tools we aren't
-                # actually importing.
-                excluded_tools = _tools_in_services(OPT_IN_TOOLS)
-                tier_tools = [t for t in tier_tools if t not in excluded_tools]
+                tools_to_import = suggested_services
 
             # Set the specific tools that should be registered
             set_enabled_tool_names(set(tier_tools))
@@ -341,14 +306,12 @@ def main():
         # Don't filter individual tools when using explicit service list only
         set_enabled_tool_names(None)
     else:
-        # Default: import all tools EXCEPT opt-in modules (e.g. gadmin).
-        # Opt-in modules pull in scopes that require prior coordination with
-        # the OAuth consent screen / domain-wide delegation; loading them
-        # silently on every fresh deploy would break the existing user's
-        # consent flow.
-        tools_to_import = [
-            t for t in tool_imports.keys() if t not in OPT_IN_TOOLS
-        ]
+        # Default: import all tools.
+        # NOTE: enabling gadmin requires the OTB GCP OAuth consent screen
+        # to list the 9 admin scopes (8 readonly + admin.directory.user.security)
+        # and matching Workspace domain-wide delegation. With those in place,
+        # gadmin loads alongside the other modules on a fresh deploy.
+        tools_to_import = list(tool_imports.keys())
         # Don't filter individual tools when importing all
         set_enabled_tool_names(None)
 
