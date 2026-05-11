@@ -29,7 +29,6 @@ from core.config import (
 )
 from core.audit import audit_log, logger as audit_logger
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _auth_provider: Optional[GoogleProvider] = None

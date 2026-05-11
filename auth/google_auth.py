@@ -32,8 +32,6 @@ try:
 except ImportError:
     get_fastmcp_context = None
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 

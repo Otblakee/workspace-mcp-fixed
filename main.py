@@ -45,15 +45,21 @@ logger = logging.getLogger(__name__)
 configure_file_logging()
 
 
+# Set to True after argparse if running with --transport stdio. In stdio
+# mode, any byte on stderr risks corrupting clients that parse stdout JSON
+# alongside stderr; suppress the banner to be safe. HTTP transport (Render,
+# local dev) has no such constraint and should always emit the banner —
+# the previous isatty() gate fired for any non-TTY environment and silently
+# dropped the entire startup output on Render.
+_SUPPRESS_STARTUP_OUTPUT = False
+
+
 def safe_print(text):
     # Don't print in CLI mode - we want clean output
     if _CLI_MODE:
         return
 
-    # Don't print to stderr when running as MCP server via uvx to avoid JSON parsing errors
-    # Check if we're running as MCP server (no TTY and uvx in process name)
-    if not sys.stderr.isatty():
-        # Running as MCP server, suppress output to avoid JSON parsing errors
+    if _SUPPRESS_STARTUP_OUTPUT:
         logger.debug(f"[MCP Server] {text}")
         return
 
@@ -156,6 +162,13 @@ def main():
         help="Run in read-only mode - requests only read-only scopes and disables tools requiring write permissions",
     )
     args = parser.parse_args()
+
+    # Stdio transport multiplexes JSON-RPC over stdout; banner text on stderr
+    # is allowed but some clients still get confused, so we keep the old
+    # suppression behaviour for stdio only. HTTP transport (Render, local
+    # dev, any containerised non-TTY host) gets the banner.
+    global _SUPPRESS_STARTUP_OUTPUT
+    _SUPPRESS_STARTUP_OUTPUT = args.transport == "stdio" and not _CLI_MODE
 
     # Clean up CLI args - argparse.REMAINDER may include leading dashes from first arg
     if args.cli is not None:
