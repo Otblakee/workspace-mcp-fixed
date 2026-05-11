@@ -56,6 +56,15 @@ from auth.scopes import (
     SCRIPT_PROJECTS_READONLY_SCOPE,
     SCRIPT_DEPLOYMENTS_SCOPE,
     SCRIPT_DEPLOYMENTS_READONLY_SCOPE,
+    ADMIN_DIRECTORY_USER_READONLY_SCOPE,
+    ADMIN_DIRECTORY_GROUP_READONLY_SCOPE,
+    ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE,
+    ADMIN_DIRECTORY_ORGUNIT_READONLY_SCOPE,
+    ADMIN_DIRECTORY_ROLEMANAGEMENT_READONLY_SCOPE,
+    ADMIN_DIRECTORY_DEVICE_MOBILE_READONLY_SCOPE,
+    ADMIN_REPORTS_AUDIT_READONLY_SCOPE,
+    ADMIN_REPORTS_USAGE_READONLY_SCOPE,
+    ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
     has_required_scopes,
 )
 
@@ -421,6 +430,12 @@ SERVICE_CONFIGS = {
     "people": {"service": "people", "version": "v1"},
     "customsearch": {"service": "customsearch", "version": "v1"},
     "script": {"service": "script", "version": "v1"},
+    # Admin SDK has two distinct surfaces. Both use the "admin" service name
+    # but different API versions; the directory_v1 service exposes Users,
+    # Groups, OrgUnits, Roles, etc., while reports_v1 exposes Activities and
+    # UserUsageReport. Tools in gadmin pick the appropriate service_type.
+    "admin_directory": {"service": "admin", "version": "directory_v1"},
+    "admin_reports": {"service": "admin", "version": "reports_v1"},
 }
 
 
@@ -471,6 +486,19 @@ SCOPE_GROUPS = {
     "script_projects": SCRIPT_PROJECTS_SCOPE,
     "script_deployments": SCRIPT_DEPLOYMENTS_SCOPE,
     "script_deployments_readonly": SCRIPT_DEPLOYMENTS_READONLY_SCOPE,
+    # Admin SDK readonly scope groups. No write variant — by design.
+    "admin_directory_user_read": ADMIN_DIRECTORY_USER_READONLY_SCOPE,
+    "admin_directory_group_read": ADMIN_DIRECTORY_GROUP_READONLY_SCOPE,
+    "admin_directory_group_member_read": ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE,
+    "admin_directory_orgunit_read": ADMIN_DIRECTORY_ORGUNIT_READONLY_SCOPE,
+    "admin_directory_rolemanagement_read": ADMIN_DIRECTORY_ROLEMANAGEMENT_READONLY_SCOPE,
+    "admin_directory_device_mobile_read": ADMIN_DIRECTORY_DEVICE_MOBILE_READONLY_SCOPE,
+    "admin_reports_audit_read": ADMIN_REPORTS_AUDIT_READONLY_SCOPE,
+    "admin_reports_usage_read": ADMIN_REPORTS_USAGE_READONLY_SCOPE,
+    # Broader-than-readonly. See the constant's comment in auth/scopes.py
+    # for the rationale (tokens.list is not authorised by any readonly
+    # scope). Used only by list_oauth_tokens_for_user.
+    "admin_directory_user_security": ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
 }
 
 

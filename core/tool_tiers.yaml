@@ -204,3 +204,30 @@ appscript:
     - list_script_processes
     - get_script_metrics
   complete: []
+
+# Admin SDK (Directory + Reports) — READ-ONLY ONLY.
+#
+# This module never writes. Admin writes stay on GAM CLI / the Admin Console.
+# Before enabling on Render, the OAuth consent screen and Workspace
+# domain-wide delegation must be updated for the 8 admin readonly scopes
+# listed in auth/scopes.ADMIN_SCOPES.
+gadmin:
+  core:
+    - list_users
+    - get_user
+    - list_groups
+    - get_group
+    - list_group_members
+    - list_user_groups
+    - list_orgunits
+    - get_orgunit
+  extended:
+    - list_admin_roles
+    - list_role_assignments
+    - list_oauth_tokens_for_user
+    - query_admin_audit_log
+    - query_login_audit_log
+    - query_token_audit_log
+    - query_drive_audit_log
+    - query_usage_report
+  complete: []

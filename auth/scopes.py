@@ -69,6 +69,50 @@ CONTACTS_READONLY_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 # Google Custom Search API scope
 CUSTOM_SEARCH_SCOPE = "https://www.googleapis.com/auth/cse"
 
+# Google Admin SDK scopes (READ-ONLY ONLY).
+#
+# These scopes are reserved for the gadmin module, which exposes Directory API
+# and Reports API tools that are strictly read-only. No admin write scope
+# (e.g. admin.directory.user, admin.directory.group) is defined here, because
+# the gadmin module must never write — admin writes stay on GAM CLI / the
+# Admin Console. See gadmin/admin_tools.py for the read-only invariant.
+ADMIN_DIRECTORY_USER_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.user.readonly"
+)
+ADMIN_DIRECTORY_GROUP_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.group.readonly"
+)
+ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.group.member.readonly"
+)
+ADMIN_DIRECTORY_ORGUNIT_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.orgunit.readonly"
+)
+ADMIN_DIRECTORY_ROLEMANAGEMENT_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.rolemanagement.readonly"
+)
+ADMIN_DIRECTORY_DEVICE_MOBILE_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.device.mobile.readonly"
+)
+ADMIN_REPORTS_AUDIT_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.reports.audit.readonly"
+)
+ADMIN_REPORTS_USAGE_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.reports.usage.readonly"
+)
+
+# Required by ``users().tokens().list`` — the Admin SDK Directory API does
+# not authorise tokens.list under any of the readonly scopes above. This
+# scope is broader than the rest (it also authorises ``tokens().delete``,
+# a write operation). gadmin/admin_tools.py never calls tokens.delete;
+# the read-only invariant is enforced by code inspection + tests, not by
+# scope narrowing. If your deployment does not enable the
+# ``list_oauth_tokens_for_user`` tool, this scope can be dropped from
+# ADMIN_SCOPES below.
+ADMIN_DIRECTORY_USER_SECURITY_SCOPE = (
+    "https://www.googleapis.com/auth/admin.directory.user.security"
+)
+
 # Google Apps Script API scopes
 SCRIPT_PROJECTS_SCOPE = "https://www.googleapis.com/auth/script.projects"
 SCRIPT_PROJECTS_READONLY_SCOPE = (
@@ -173,6 +217,26 @@ TASKS_SCOPES = [TASKS_SCOPE, TASKS_READONLY_SCOPE]
 
 CONTACTS_SCOPES = [CONTACTS_SCOPE, CONTACTS_READONLY_SCOPE]
 
+# Admin SDK scopes for the gadmin module. All entries except
+# ADMIN_DIRECTORY_USER_SECURITY_SCOPE are readonly. The security scope is
+# required to authorise ``tokens.list`` (see the constant's comment above);
+# even though it also authorises ``tokens.delete``, gadmin never calls
+# delete and the read-only contract is enforced by source-level tests.
+# This list drives the OAuth consent prompt — every entry must be on the
+# OTB OAuth consent screen + domain-wide delegation allowlist or admin
+# tool calls will fail with 403/insufficient_scope at runtime.
+ADMIN_SCOPES = [
+    ADMIN_DIRECTORY_USER_READONLY_SCOPE,
+    ADMIN_DIRECTORY_GROUP_READONLY_SCOPE,
+    ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE,
+    ADMIN_DIRECTORY_ORGUNIT_READONLY_SCOPE,
+    ADMIN_DIRECTORY_ROLEMANAGEMENT_READONLY_SCOPE,
+    ADMIN_DIRECTORY_DEVICE_MOBILE_READONLY_SCOPE,
+    ADMIN_REPORTS_AUDIT_READONLY_SCOPE,
+    ADMIN_REPORTS_USAGE_READONLY_SCOPE,
+    ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
+]
+
 CUSTOM_SEARCH_SCOPES = [CUSTOM_SEARCH_SCOPE]
 
 SCRIPT_SCOPES = [
@@ -199,6 +263,9 @@ TOOL_SCOPES_MAP = {
     "contacts": CONTACTS_SCOPES,
     "search": CUSTOM_SEARCH_SCOPES,
     "appscript": SCRIPT_SCOPES,
+    # Admin SDK is read-only by design; identical entry in TOOL_SCOPES_MAP
+    # and TOOL_READONLY_SCOPES_MAP because there is no "write" variant.
+    "gadmin": ADMIN_SCOPES,
 }
 
 # Tool-to-read-only-scopes mapping
@@ -213,6 +280,7 @@ TOOL_READONLY_SCOPES_MAP = {
     "slides": [SLIDES_READONLY_SCOPE],
     "tasks": [TASKS_READONLY_SCOPE],
     "contacts": [CONTACTS_READONLY_SCOPE],
+    "gadmin": ADMIN_SCOPES,
     "search": CUSTOM_SEARCH_SCOPES,
     "appscript": [
         SCRIPT_PROJECTS_READONLY_SCOPE,
