@@ -2866,7 +2866,7 @@ async def download_drive_file(
     logger.info(f"[download_drive_file] file_id='{file_id}'")
 
     resolved_id, meta = await resolve_drive_item(
-        service, file_id, extra_fields="size, mimeType, webViewLink"
+        service, file_id, extra_fields="name, size, mimeType, webViewLink"
     )
     file_id = resolved_id
     file_name = meta.get("name", "Unknown File")
