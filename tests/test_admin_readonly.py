@@ -80,13 +80,35 @@ class TestScopesWired:
                 f"{name} must be a readonly scope; got {value}"
             )
 
-    def test_admin_scopes_list_has_eight_entries(self):
+    def test_admin_scopes_list_composition(self):
+        """ADMIN_SCOPES drives the OAuth consent prompt. It must contain
+        all 8 readonly scopes plus the one broader scope required by
+        ``users().tokens().list`` — and nothing else. If the security
+        scope were missing, ``list_oauth_tokens_for_user`` would 403 on
+        every call (Codex P1)."""
+        from auth.scopes import (
+            ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
+            ADMIN_SCOPES,
+        )
+
+        assert len(ADMIN_SCOPES) == 9
+        # Exactly 8 readonly scopes and the security scope — no other
+        # write-capable Admin SDK scopes.
+        readonly = [s for s in ADMIN_SCOPES if s.endswith(".readonly")]
+        non_readonly = [s for s in ADMIN_SCOPES if not s.endswith(".readonly")]
+        assert len(readonly) == 8
+        assert non_readonly == [ADMIN_DIRECTORY_USER_SECURITY_SCOPE]
+
+    def test_admin_user_security_scope_present_in_consent_scope_set(self):
+        """Codex P1 regression: the consent flow must request
+        admin.directory.user.security, otherwise list_oauth_tokens_for_user
+        fails with insufficient scope on every call."""
         from auth.scopes import ADMIN_SCOPES
 
-        assert len(ADMIN_SCOPES) == 8
-        # No write scope must ever creep in.
-        for s in ADMIN_SCOPES:
-            assert s.endswith(".readonly"), s
+        assert (
+            "https://www.googleapis.com/auth/admin.directory.user.security"
+            in ADMIN_SCOPES
+        )
 
     def test_gadmin_in_scope_maps(self):
         from auth.scopes import TOOL_READONLY_SCOPES_MAP, TOOL_SCOPES_MAP
@@ -144,6 +166,16 @@ class TestServiceDecoratorWired:
         ):
             assert key in SCOPE_GROUPS
             assert SCOPE_GROUPS[key].endswith(".readonly")
+
+    def test_user_security_scope_group_resolvable(self):
+        """Codex P1 regression: the symbolic name used by
+        list_oauth_tokens_for_user must resolve to the correct URL."""
+        from auth.service_decorator import SCOPE_GROUPS
+
+        assert (
+            SCOPE_GROUPS["admin_directory_user_security"]
+            == "https://www.googleapis.com/auth/admin.directory.user.security"
+        )
 
 
 class TestReadOnlyContract:
@@ -346,3 +378,33 @@ class TestMainOptIn:
         assert 'OPT_IN_TOOLS = {"gadmin"}' in src
         # And the default-tools branch must apply the OPT_IN_TOOLS filter.
         assert "if t not in OPT_IN_TOOLS" in src
+
+    def test_tier_mode_also_applies_opt_in_filter(self):
+        """Codex P2 regression: ``--tool-tier core`` without ``--tools``
+        used to pull in gadmin because gadmin has a core tier section in
+        tool_tiers.yaml. The opt-in filter must apply in the tier path
+        too — both for the services list AND for the tier_tools list
+        passed to ``set_enabled_tool_names``."""
+        main_path = Path(__file__).resolve().parent.parent / "main.py"
+        src = main_path.read_text()
+        # Suggested services list is filtered.
+        assert "s for s in suggested_services if s not in OPT_IN_TOOLS" in src
+        # The corresponding tool names are stripped from tier_tools so
+        # set_enabled_tool_names isn't whitelisting unreachable tools.
+        assert "excluded_tools = _tools_in_services(OPT_IN_TOOLS)" in src
+        assert "tier_tools = [t for t in tier_tools if t not in excluded_tools]" in src
+
+    def test_tools_in_services_helper_returns_all_gadmin_tools(self):
+        """The _tools_in_services helper used by the tier-mode filter must
+        return every tool declared under gadmin across all three tiers.
+        Without that, ``set_enabled_tool_names`` would whitelist gadmin
+        tools while ``tools_to_import`` excludes the module — a silent
+        inconsistency."""
+        from core.tool_tier_loader import ToolTierLoader
+
+        # Mirror the helper's behaviour (defined inline in main.py;
+        # importing main.py would execute its argparse, so we replicate
+        # the few-line logic here).
+        loader = ToolTierLoader()
+        gadmin_tools = set(loader.get_tools_up_to_tier("complete", ["gadmin"]))
+        assert gadmin_tools == ALL_ADMIN_TOOLS

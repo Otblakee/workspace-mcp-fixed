@@ -286,6 +286,24 @@ def main():
     # delegation are in place. See gadmin/admin_tools.py for prerequisites.
     OPT_IN_TOOLS = {"gadmin"}
 
+    def _tools_in_services(services):
+        """Return every tool name declared under the given services in
+        ``core/tool_tiers.yaml``. Used to filter opt-in services out of
+        tier-resolved tool lists so tier mode honours the opt-in contract.
+
+        Walks all three tiers (``core``, ``extended``, ``complete``) for
+        each named service so the filter is independent of which
+        ``--tool-tier`` the operator picked."""
+        from core.tool_tier_loader import ToolTierLoader
+
+        loader = ToolTierLoader()
+        services_list = list(services)
+        if not services_list:
+            return set()
+        # get_tools_up_to_tier("complete", [svc]) returns every tool name
+        # declared under that service across all tier levels.
+        return set(loader.get_tools_up_to_tier("complete", services_list))
+
     # Determine which tools to import based on arguments
     if args.tool_tier is not None:
         # Use tier-based tool selection, optionally filtered by services
@@ -294,11 +312,23 @@ def main():
                 args.tool_tier, args.tools
             )
 
-            # If --tools specified, use those services; otherwise use all services that have tier tools
+            # If --tools specified, use those services; otherwise use all
+            # services that have tier tools — minus opt-in modules that
+            # weren't explicitly named. Without this, ``--tool-tier core``
+            # alone would load gadmin (because gadmin has a core tier in
+            # tool_tiers.yaml) and request admin scopes silently, defeating
+            # the opt-in safety net.
             if args.tools is not None:
                 tools_to_import = args.tools
             else:
-                tools_to_import = suggested_services
+                tools_to_import = [
+                    s for s in suggested_services if s not in OPT_IN_TOOLS
+                ]
+                # Strip the corresponding tool names from tier_tools so
+                # set_enabled_tool_names doesn't whitelist tools we aren't
+                # actually importing.
+                excluded_tools = _tools_in_services(OPT_IN_TOOLS)
+                tier_tools = [t for t in tier_tools if t not in excluded_tools]
 
             # Set the specific tools that should be registered
             set_enabled_tool_names(set(tier_tools))

@@ -64,6 +64,7 @@ from auth.scopes import (
     ADMIN_DIRECTORY_DEVICE_MOBILE_READONLY_SCOPE,
     ADMIN_REPORTS_AUDIT_READONLY_SCOPE,
     ADMIN_REPORTS_USAGE_READONLY_SCOPE,
+    ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
     has_required_scopes,
 )
 
@@ -494,6 +495,10 @@ SCOPE_GROUPS = {
     "admin_directory_device_mobile_read": ADMIN_DIRECTORY_DEVICE_MOBILE_READONLY_SCOPE,
     "admin_reports_audit_read": ADMIN_REPORTS_AUDIT_READONLY_SCOPE,
     "admin_reports_usage_read": ADMIN_REPORTS_USAGE_READONLY_SCOPE,
+    # Broader-than-readonly. See the constant's comment in auth/scopes.py
+    # for the rationale (tokens.list is not authorised by any readonly
+    # scope). Used only by list_oauth_tokens_for_user.
+    "admin_directory_user_security": ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
 }
 
 

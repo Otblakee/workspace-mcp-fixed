@@ -559,10 +559,7 @@ async def list_role_assignments(
 
 
 @server.tool()
-@require_google_service(
-    "admin_directory",
-    "https://www.googleapis.com/auth/admin.directory.user.security",
-)
+@require_google_service("admin_directory", "admin_directory_user_security")
 @handle_http_errors(
     "list_oauth_tokens_for_user",
     is_read_only=True,
