@@ -28,6 +28,22 @@ def check_public_link_permission(permissions: List[Dict[str, Any]]) -> bool:
     )
 
 
+# OTB governance: the Drive sharing policy is groups-only. Permission tools
+# previously suggested enabling "Anyone with the link" as a remediation for
+# the Google Docs image-insertion API requirement that the source URL be
+# publicly accessible. That hint contradicts policy, so this helper renders
+# the policy-aware alternative instead. Used by both
+# ``get_drive_file_permissions`` and ``check_drive_file_public_access``.
+NO_PUBLIC_ACCESS_POLICY_NOTE = (
+    "OTB sharing policy is groups-only — do NOT enable 'Anyone with the "
+    "link' as a workaround. Alternatives that respect policy:\n"
+    "  - share the file with the recipient group/individuals and embed it "
+    "as a link in the Doc, or\n"
+    "  - download the image and upload it directly into the Doc body via "
+    "the Google Docs UI (Insert → Image → Upload from computer)."
+)
+
+
 def format_public_sharing_error(file_name: str, file_id: str) -> str:
     """
     Format error message for files without public sharing.
@@ -40,8 +56,9 @@ def format_public_sharing_error(file_name: str, file_id: str) -> str:
         str: Formatted error message
     """
     return (
-        f"❌ Permission Error: '{file_name}' not shared publicly. "
-        f"Set 'Anyone with the link' → 'Viewer' in Google Drive sharing. "
+        f"❌ Permission Error: '{file_name}' is not shared with 'Anyone with "
+        f"the link', so it cannot be embedded via insert_doc_image_url. "
+        f"{NO_PUBLIC_ACCESS_POLICY_NOTE} "
         f"File: https://drive.google.com/file/d/{file_id}/view"
     )
 

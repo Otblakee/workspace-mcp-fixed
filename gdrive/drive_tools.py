@@ -33,6 +33,7 @@ from core.config import get_transport_mode
 from gdrive.drive_helpers import (
     DRIVE_QUERY_PATTERNS,
     FOLDER_MIME_TYPE,
+    NO_PUBLIC_ACCESS_POLICY_NOTE,
     build_drive_list_params,
     check_public_link_permission,
     format_permission_info,
@@ -1490,8 +1491,8 @@ async def get_drive_file_permissions(
             output_parts.extend(
                 [
                     "",
-                    "❌ This file is NOT shared with 'Anyone with the link' - it cannot be inserted into Google Docs",
-                    "   To fix: Right-click the file in Google Drive → Share → Anyone with the link → Viewer",
+                    "❌ This file is NOT shared with 'Anyone with the link' — it cannot be embedded in a Doc via insert_doc_image_url.",
+                    NO_PUBLIC_ACCESS_POLICY_NOTE,
                 ]
             )
 
@@ -1591,8 +1592,8 @@ async def check_drive_file_public_access(
     else:
         output_parts.extend(
             [
-                "❌ NO PUBLIC ACCESS - Cannot insert into Google Docs",
-                "Fix: Drive → Share → 'Anyone with the link' → 'Viewer'",
+                "❌ NO PUBLIC ACCESS — cannot embed in a Doc via insert_doc_image_url.",
+                NO_PUBLIC_ACCESS_POLICY_NOTE,
             ]
         )
 
