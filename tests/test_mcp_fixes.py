@@ -152,6 +152,108 @@ class TestCreateDriveFileBase64:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2.5 Fix C — file:// rejected up-front in streamable-http mode
+# ---------------------------------------------------------------------------
+
+class TestCreateDriveFileFileUrlRemoteRejection:
+    @pytest.mark.asyncio
+    async def test_streamable_http_rejects_file_url_with_actionable_message(
+        self, monkeypatch
+    ):
+        """When the server runs in streamable-http (remote MCP) mode, file://
+        URLs from the caller's filesystem can never resolve. The previous
+        error fell out of a path-existence check and advised "Docker volume
+        or HTTP URL" — unactionable from a sandboxed LLM client. The new
+        error fires before the path lookup and names the two paths that
+        actually work: base64_content for <10 MB, create_drive_upload_session
+        for larger files."""
+        from gdrive.drive_tools import create_drive_file
+        import gdrive.drive_tools as mod
+
+        monkeypatch.setattr(mod, "get_transport_mode", lambda: "streamable-http")
+        # Make sure we never reach the path-lookup code: resolve_folder_id
+        # would call the Drive API. If the error fires up front, this stays
+        # untouched.
+        called = {"resolve": 0}
+
+        async def fail_resolve(*a, **kw):
+            called["resolve"] += 1
+            return "root"
+
+        monkeypatch.setattr(mod, "resolve_folder_id", fail_resolve)
+
+        impl = _unwrap(create_drive_file)
+        service = MagicMock()
+        with pytest.raises(Exception) as ei:
+            await impl(
+                service=service,
+                user_google_email=LIVE_USER,
+                file_name="x.bin",
+                fileUrl="file:///home/claude/does-not-exist.bin",
+            )
+        msg = str(ei.value)
+        assert "base64_content" in msg
+        assert "create_drive_upload_session" in msg
+        assert "remote MCP clients" in msg
+        # No Drive API call should have been attempted.
+        service.files.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stdio_mode_still_attempts_local_file_read(self, monkeypatch, tmp_path):
+        """Local stdio dev workflow must keep working: file:// URLs to files
+        actually on the server's disk should be read and uploaded. We don't
+        run a real upload here — just confirm the streamable-http guard
+        doesn't fire."""
+        from gdrive.drive_tools import create_drive_file
+        import gdrive.drive_tools as mod
+
+        monkeypatch.setattr(mod, "get_transport_mode", lambda: "stdio")
+
+        async def ok_resolve(*a, **kw):
+            return "root"
+
+        monkeypatch.setattr(mod, "resolve_folder_id", ok_resolve)
+
+        # Point at a path that doesn't exist — under stdio mode we expect
+        # the "Local file does not exist" path, NOT the streamable-http
+        # remote-MCP rejection.
+        impl = _unwrap(create_drive_file)
+        service = MagicMock()
+        missing = tmp_path / "absent.bin"
+        with pytest.raises(Exception) as ei:
+            await impl(
+                service=service,
+                user_google_email=LIVE_USER,
+                file_name="x.bin",
+                fileUrl=f"file://{missing}",
+            )
+        msg = str(ei.value)
+        # The exact wording of the not-found error is owned by
+        # validate_file_path / path-existence checks. The point of this test
+        # is that the streamable-http remote-MCP rejection did NOT fire.
+        assert "remote MCP clients" not in msg
+        assert "base64_content" not in msg
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.5 Fix D — create_drive_file docstring warning
+# ---------------------------------------------------------------------------
+
+class TestCreateDriveFileDocstringWarning:
+    def test_docstring_warns_against_file_url_from_remote_clients(self):
+        """Defence in depth for Fix C: the docstring (which calling LLMs
+        read when choosing how to call the tool) must steer them away from
+        file:// URLs in the first place."""
+        from gdrive.drive_tools import create_drive_file
+
+        doc = _unwrap(create_drive_file).__doc__ or ""
+        assert "WARNING" in doc
+        assert "file://" in doc
+        assert "base64_content" in doc
+        assert "create_drive_upload_session" in doc
+
+
+# ---------------------------------------------------------------------------
 # Issue 4 — delete_gmail_draft
 # ---------------------------------------------------------------------------
 
