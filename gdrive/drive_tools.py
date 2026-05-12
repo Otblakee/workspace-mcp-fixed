@@ -1483,15 +1483,14 @@ async def get_drive_file_permissions(
             output_parts.extend(
                 [
                     "",
-                    "✅ This file is shared with 'Anyone with the link' - it can be inserted into Google Docs",
+                    "Note: this file is shared with 'Anyone with the link'. Review whether that matches your org's sharing policy.",
                 ]
             )
         else:
             output_parts.extend(
                 [
                     "",
-                    "❌ This file is NOT shared with 'Anyone with the link' - it cannot be inserted into Google Docs",
-                    "   To fix: Right-click the file in Google Drive → Share → Anyone with the link → Viewer",
+                    "✅ File access is restricted to its current permission set.",
                 ]
             )
 
