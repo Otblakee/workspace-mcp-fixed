@@ -625,8 +625,24 @@ async def create_drive_file(
             transport_mode = get_transport_mode()
             running_streamable = transport_mode == "streamable-http"
             if running_streamable:
+                # Reject up-front rather than letting the path lookup fall
+                # through to a misleading FileNotFoundError. The previous
+                # advice ("ensure the file is accessible, e.g. Docker volume")
+                # is unactionable for sandboxed LLM clients whose filesystem
+                # the server cannot see; point at the two paths that actually
+                # work from a sandbox.
                 logger.warning(
-                    "[create_drive_file] file:// URL requested while server runs in streamable-http mode. Ensure the file path is accessible to the server (e.g., Docker volume) or use an HTTP(S) URL."
+                    "[create_drive_file] file:// URL rejected: server is in "
+                    "streamable-http mode and cannot reach the caller's filesystem."
+                )
+                raise Exception(
+                    "file:// URLs are not supported for remote MCP clients. "
+                    "The MCP server cannot access files in your local "
+                    "execution environment. To upload local files:\n"
+                    "  - For files under 10 MB: base64-encode the content and "
+                    "use the `base64_content` parameter\n"
+                    "  - For files 10 MB and larger: use `create_drive_upload_session` "
+                    "to upload directly to Google"
                 )
 
             # Convert file:// URL to a cross-platform local path
@@ -639,19 +655,9 @@ async def create_drive_file(
             # Validate path safety and verify file exists
             path_obj = validate_file_path(file_path)
             if not path_obj.exists():
-                extra = (
-                    " The server is running via streamable-http, so file:// URLs must point to files inside the container or remote host."
-                    if running_streamable
-                    else ""
-                )
-                raise Exception(f"Local file does not exist: {file_path}.{extra}")
+                raise Exception(f"Local file does not exist: {file_path}.")
             if not path_obj.is_file():
-                extra = (
-                    " In streamable-http/Docker deployments, mount the file into the container or provide an HTTP(S) URL."
-                    if running_streamable
-                    else ""
-                )
-                raise Exception(f"Path is not a file: {file_path}.{extra}")
+                raise Exception(f"Path is not a file: {file_path}.")
 
             logger.info(f"[create_drive_file] Reading local file: {file_path}")
 
