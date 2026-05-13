@@ -47,12 +47,29 @@ SENSITIVE = {"body", "text_content", "message_body", "html_body", "values",
              "upload_uri"}
 
 
-# Module-prefix overrides for service tagging. Used when the tool's bare
-# name would be ambiguous under SERVICE_MAP substring matching — e.g.
-# ``query_drive_audit_log`` lives in ``gadmin.admin_tools`` and must be tagged
-# ``gadmin``, not ``drive``. Modules win over name heuristics.
+# Module-prefix overrides for service tagging. The bare-name SERVICE_MAP
+# heuristic below is unreliable for tools whose names lack one of its
+# substring keys (e.g. ``update_paragraph_style``, ``add_conditional_formatting``,
+# ``debug_table_structure``, ``query_freebusy``) — those fall through to
+# ``unknown``, which breaks per-service filtering in any audit dashboard.
+# Tagging by source module gives every tool a deterministic, correct service
+# regardless of how it's named. Modules win over name heuristics, so this also
+# resolves cross-module ambiguities like ``query_drive_audit_log`` (in
+# ``gadmin``, not ``drive``).
 _MODULE_SERVICE_MAP = {
     "gadmin": "gadmin",
+    "gdrive": "drive",
+    "gmail": "gmail",
+    "gcalendar": "calendar",
+    "gdocs": "docs",
+    "gsheets": "sheets",
+    "gcontacts": "contacts",
+    "gappsscript": "apps_script",
+    "gchat": "chat",
+    "gforms": "forms",
+    "gslides": "slides",
+    "gtasks": "tasks",
+    "gsearch": "search",
 }
 
 

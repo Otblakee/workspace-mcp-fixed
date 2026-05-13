@@ -116,6 +116,38 @@ class TestRedactDeep:
         assert "binary-blob" not in out
         assert "<redacted:" in out
 
+    def test_gmail_attachments_kwarg_shape_redacted(self):
+        """Phase 2.5 Fix E verification. The real `attachments` kwarg passed
+        to send_gmail_message / draft_gmail_message is a list of dicts whose
+        ``content`` field carries base64-encoded file bytes. Confirm the
+        full list collapses to a single redacted token — the payload never
+        reaches the audit sheet."""
+        from core.audit import SENSITIVE, _redact
+
+        # Acceptance check 1: ``attachments`` is in the SENSITIVE constant.
+        assert "attachments" in SENSITIVE
+
+        # Acceptance check 2: a realistic kwargs shape gets redacted.
+        raw_payload = "AAAA" * 2048  # ~8 KB base64 blob
+        out = _redact(
+            {
+                "user_google_email": "oliver@otbgroup.co.uk",
+                "to": "client@example.com",
+                "subject": "Q1 report",
+                "attachments": [
+                    {
+                        "filename": "report.pdf",
+                        "content": raw_payload,
+                        "mime_type": "application/pdf",
+                    }
+                ],
+            }
+        )
+        assert raw_payload not in out
+        assert "report.pdf" not in out  # whole list collapses, filename too
+        assert '"attachments":' in out
+        assert "<redacted:list:1>" in out
+
     def test_sensitive_in_list_under_neutral_key_still_redacted(self):
         """``parts`` isn't sensitive, but each part has a sensitive ``content``."""
         from core.audit import _redact

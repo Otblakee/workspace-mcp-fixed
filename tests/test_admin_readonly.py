@@ -344,6 +344,40 @@ class TestAuditServiceTagging:
         # Bare call with no module still falls back to the substring heuristic.
         assert _service("search_drive_files") == "drive"
 
+    def test_module_prefix_rescues_names_with_no_substring_match(self):
+        """Tools whose names contain none of the SERVICE_MAP substring keys
+        (``update_paragraph_style``, ``debug_table_structure``,
+        ``add_conditional_formatting``, ``query_freebusy``) used to fall
+        through to ``unknown``. With the module-prefix map covering all
+        product modules, they're tagged from the module instead."""
+        from core.audit import _service
+
+        assert _service("update_paragraph_style", "gdocs.docs_tools") == "docs"
+        assert _service("debug_table_structure", "gdocs.docs_tools") == "docs"
+        assert (
+            _service("add_conditional_formatting", "gsheets.sheets_tools")
+            == "sheets"
+        )
+        assert (
+            _service("update_conditional_formatting", "gsheets.sheets_tools")
+            == "sheets"
+        )
+        assert (
+            _service("delete_conditional_formatting", "gsheets.sheets_tools")
+            == "sheets"
+        )
+        assert _service("query_freebusy", "gcalendar.calendar_tools") == "calendar"
+
+    def test_module_prefix_wins_over_misleading_substring(self):
+        """``import_to_google_doc`` lives in gdrive but contains ``doc``;
+        the substring heuristic would tag it ``docs``. The module-prefix
+        map keeps it on ``drive`` where its API calls actually live."""
+        from core.audit import _service
+
+        assert (
+            _service("import_to_google_doc", "gdrive.drive_tools") == "drive"
+        )
+
 
 class TestToolTierWiring:
     def test_gadmin_section_in_tool_tiers(self):

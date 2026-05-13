@@ -568,13 +568,19 @@ async def create_drive_file(
     binary content. Exactly one of these sources must be provided (unless
     creating a folder).
 
+    WARNING: Do NOT use `fileUrl=file://...` from remote MCP clients (e.g.
+    Claude sandbox). The server cannot access your local filesystem. For
+    binary uploads from a sandbox:
+      - Under 10 MB: read bytes, base64-encode, pass via `base64_content`
+      - 10 MB and larger: use `create_drive_upload_session` for direct-to-Google upload
+
     Args:
         user_google_email (str): The user's Google email address. Required.
         file_name (str): The name for the new file.
         content (Optional[str]): If provided, text content to write to the file (encoded as UTF-8).
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
         mime_type (str): The MIME type of the file. Defaults to 'text/plain'. For binary uploads via base64_content, set this to the actual MIME type (e.g. 'image/png', 'application/pdf').
-        fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
+        fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports http:// and https:// for remote MCP clients; file:// is local-only and rejected when the server runs in streamable-http mode (see warning above).
         base64_content (Optional[str]): If provided, standard base64-encoded (NOT urlsafe) bytes to upload as the file. Use for binary file types such as PNG, PDF, etc. Set mime_type to the actual file MIME type when using this.
 
     Returns:
@@ -625,8 +631,24 @@ async def create_drive_file(
             transport_mode = get_transport_mode()
             running_streamable = transport_mode == "streamable-http"
             if running_streamable:
+                # Reject up-front rather than letting the path lookup fall
+                # through to a misleading FileNotFoundError. The previous
+                # advice ("ensure the file is accessible, e.g. Docker volume")
+                # is unactionable for sandboxed LLM clients whose filesystem
+                # the server cannot see; point at the two paths that actually
+                # work from a sandbox.
                 logger.warning(
-                    "[create_drive_file] file:// URL requested while server runs in streamable-http mode. Ensure the file path is accessible to the server (e.g., Docker volume) or use an HTTP(S) URL."
+                    "[create_drive_file] file:// URL rejected: server is in "
+                    "streamable-http mode and cannot reach the caller's filesystem."
+                )
+                raise Exception(
+                    "file:// URLs are not supported for remote MCP clients. "
+                    "The MCP server cannot access files in your local "
+                    "execution environment. To upload local files:\n"
+                    "  - For files under 10 MB: base64-encode the content and "
+                    "use the `base64_content` parameter\n"
+                    "  - For files 10 MB and larger: use `create_drive_upload_session` "
+                    "to upload directly to Google"
                 )
 
             # Convert file:// URL to a cross-platform local path
@@ -639,19 +661,9 @@ async def create_drive_file(
             # Validate path safety and verify file exists
             path_obj = validate_file_path(file_path)
             if not path_obj.exists():
-                extra = (
-                    " The server is running via streamable-http, so file:// URLs must point to files inside the container or remote host."
-                    if running_streamable
-                    else ""
-                )
-                raise Exception(f"Local file does not exist: {file_path}.{extra}")
+                raise Exception(f"Local file does not exist: {file_path}.")
             if not path_obj.is_file():
-                extra = (
-                    " In streamable-http/Docker deployments, mount the file into the container or provide an HTTP(S) URL."
-                    if running_streamable
-                    else ""
-                )
-                raise Exception(f"Path is not a file: {file_path}.{extra}")
+                raise Exception(f"Path is not a file: {file_path}.")
 
             logger.info(f"[create_drive_file] Reading local file: {file_path}")
 
@@ -1483,15 +1495,14 @@ async def get_drive_file_permissions(
             output_parts.extend(
                 [
                     "",
-                    "✅ This file is shared with 'Anyone with the link' - it can be inserted into Google Docs",
+                    "Note: this file is shared with 'Anyone with the link'. Review whether that matches your org's sharing policy.",
                 ]
             )
         else:
             output_parts.extend(
                 [
                     "",
-                    "❌ This file is NOT shared with 'Anyone with the link' - it cannot be inserted into Google Docs",
-                    "   To fix: Right-click the file in Google Drive → Share → Anyone with the link → Viewer",
+                    "✅ File access is restricted to its current permission set.",
                 ]
             )
 
