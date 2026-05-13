@@ -44,6 +44,12 @@ drive:
     - create_drive_upload_session
     - confirm_drive_upload
     - download_drive_file
+    - create_shared_drive
+    - get_shared_drive
+    - update_shared_drive
+    - delete_shared_drive
+    - add_shared_drive_member
+    - remove_shared_drive_member
   complete:
     - get_drive_file_permissions
     - check_drive_file_public_access

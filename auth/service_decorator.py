@@ -29,6 +29,7 @@ from auth.scopes import (
     GMAIL_MODIFY_SCOPE,
     GMAIL_LABELS_SCOPE,
     GMAIL_SETTINGS_BASIC_SCOPE,
+    DRIVE_SCOPE,
     DRIVE_READONLY_SCOPE,
     DRIVE_FILE_SCOPE,
     DOCS_READONLY_SCOPE,
@@ -451,6 +452,10 @@ SCOPE_GROUPS = {
     # Drive scopes
     "drive_read": DRIVE_READONLY_SCOPE,
     "drive_file": DRIVE_FILE_SCOPE,
+    # Full drive scope — required for Shared Drive management (drives().create
+    # / get / update / delete). drive.file is scoped to app-created files and
+    # cannot manage Shared Drives.
+    "drive_full": DRIVE_SCOPE,
     # Docs scopes
     "docs_read": DOCS_READONLY_SCOPE,
     "docs_write": DOCS_WRITE_SCOPE,

@@ -12,6 +12,7 @@ import httpx
 import base64
 import ipaddress
 import socket
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -2964,4 +2965,401 @@ async def download_drive_file(
         f"size: {size_bytes} bytes\n"
         f"{access_line}"
         f"{note}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared Drive management
+#
+# These tools operate on Shared Drives themselves (the container), not on the
+# files inside them. They require the full ``https://www.googleapis.com/auth/drive``
+# scope — ``drive.file`` is too narrow because it only authorises app-created
+# files. The ``drive_full`` scope group resolves to that URL.
+# ---------------------------------------------------------------------------
+
+
+SHARED_DRIVE_MEMBER_ROLES = (
+    "organizer",
+    "fileOrganizer",
+    "writer",
+    "commenter",
+    "reader",
+)
+
+
+@server.tool()
+@handle_http_errors("create_shared_drive", is_read_only=False, service_type="drive")
+@require_google_service("drive", "drive_full")
+async def create_shared_drive(
+    service,
+    user_google_email: str,
+    name: str,
+    request_id: Optional[str] = None,
+) -> str:
+    """
+    Creates a new Shared Drive.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        name (str): Name for the new Shared Drive. Required.
+        request_id (Optional[str]): Idempotency token. If omitted, a UUID4 is
+            generated. Reusing the same request_id within a short window will
+            return the previously created drive instead of creating a duplicate.
+
+    Returns:
+        str: Confirmation with the new drive's ID, name, and URL.
+    """
+    resolved_request_id = request_id or str(uuid.uuid4())
+    logger.info(
+        f"[create_shared_drive] Invoked. Email: '{user_google_email}', Name: '{name}', Request ID: '{resolved_request_id}'"
+    )
+
+    created_drive = await asyncio.to_thread(
+        service.drives()
+        .create(requestId=resolved_request_id, body={"name": name})
+        .execute
+    )
+
+    drive_id = created_drive.get("id", "N/A")
+    drive_name = created_drive.get("name", name)
+    drive_url = f"https://drive.google.com/drive/folders/{drive_id}"
+
+    output_parts = [
+        f"Successfully created Shared Drive '{drive_name}'",
+        "",
+        f"Drive ID: {drive_id}",
+        f"Name: {drive_name}",
+        f"URL: {drive_url}",
+    ]
+    return "\n".join(output_parts)
+
+
+@server.tool()
+@handle_http_errors("get_shared_drive", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_full")
+async def get_shared_drive(
+    service,
+    user_google_email: str,
+    drive_id: str,
+) -> str:
+    """
+    Gets metadata for a Shared Drive, including capabilities and restrictions.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        drive_id (str): The ID of the Shared Drive. Required.
+
+    Returns:
+        str: Formatted summary of drive metadata, capabilities, and restrictions.
+    """
+    logger.info(
+        f"[get_shared_drive] Invoked. Email: '{user_google_email}', Drive ID: '{drive_id}'"
+    )
+
+    drive = await asyncio.to_thread(
+        service.drives()
+        .get(
+            driveId=drive_id,
+            useDomainAdminAccess=False,
+            fields="id, name, createdTime, capabilities, restrictions",
+        )
+        .execute
+    )
+
+    capabilities = drive.get("capabilities", {}) or {}
+    restrictions = drive.get("restrictions", {}) or {}
+
+    cap_keys = (
+        "canAddChildren",
+        "canManageMembers",
+        "canShare",
+        "canCopy",
+        "canDeleteDrive",
+        "canDownload",
+        "canEdit",
+        "canRename",
+        "canRenameDrive",
+        "canChangeDriveBackground",
+        "canChangeDriveMembersOnlyRestriction",
+        "canChangeCopyRequiresWriterPermissionRestriction",
+        "canChangeDomainUsersOnlyRestriction",
+        "canChangeSharingFoldersRequiresOrganizerPermissionRestriction",
+        "canTrashChildren",
+    )
+    restriction_keys = (
+        "adminManagedRestrictions",
+        "copyRequiresWriterPermission",
+        "domainUsersOnly",
+        "driveMembersOnly",
+        "sharingFoldersRequiresOrganizerPermission",
+    )
+
+    output_parts = [
+        f"Shared Drive: {drive.get('name', 'Unknown')}",
+        f"  ID: {drive.get('id', 'N/A')}",
+        f"  Created: {drive.get('createdTime', 'N/A')}",
+        f"  URL: https://drive.google.com/drive/folders/{drive.get('id', '')}",
+        "",
+        "Capabilities:",
+    ]
+    for key in cap_keys:
+        if key in capabilities:
+            output_parts.append(f"  - {key}: {capabilities[key]}")
+    extra_caps = sorted(k for k in capabilities if k not in cap_keys)
+    for key in extra_caps:
+        output_parts.append(f"  - {key}: {capabilities[key]}")
+
+    output_parts.extend(["", "Restrictions:"])
+    for key in restriction_keys:
+        output_parts.append(f"  - {key}: {restrictions.get(key, False)}")
+
+    return "\n".join(output_parts)
+
+
+@server.tool()
+@handle_http_errors("update_shared_drive", is_read_only=False, service_type="drive")
+@require_google_service("drive", "drive_full")
+async def update_shared_drive(
+    service,
+    user_google_email: str,
+    drive_id: str,
+    new_name: Optional[str] = None,
+    restrictions: Optional[Dict[str, bool]] = None,
+) -> str:
+    """
+    Updates a Shared Drive's name and/or restrictions. Only the fields that
+    are actually supplied are sent in the update body.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        drive_id (str): The ID of the Shared Drive. Required.
+        new_name (Optional[str]): New name for the drive. If omitted, name is unchanged.
+        restrictions (Optional[Dict[str, bool]]): Restriction flags to set. Valid keys:
+            - adminManagedRestrictions (bool)
+            - copyRequiresWriterPermission (bool)
+            - domainUsersOnly (bool)
+            - driveMembersOnly (bool)
+            - sharingFoldersRequiresOrganizerPermission (bool)
+            Any other keys are rejected. Only supplied keys are sent.
+
+    Returns:
+        str: Confirmation listing the fields that changed.
+    """
+    logger.info(
+        f"[update_shared_drive] Invoked. Email: '{user_google_email}', Drive ID: '{drive_id}', New name: {new_name!r}, Restrictions keys: {list(restrictions.keys()) if restrictions else None}"
+    )
+
+    valid_restriction_keys = {
+        "adminManagedRestrictions",
+        "copyRequiresWriterPermission",
+        "domainUsersOnly",
+        "driveMembersOnly",
+        "sharingFoldersRequiresOrganizerPermission",
+    }
+
+    body: Dict[str, Any] = {}
+    if new_name is not None:
+        body["name"] = new_name
+
+    if restrictions:
+        invalid = sorted(set(restrictions.keys()) - valid_restriction_keys)
+        if invalid:
+            raise ValueError(
+                f"Invalid restriction key(s): {invalid}. Valid keys: {sorted(valid_restriction_keys)}"
+            )
+        body["restrictions"] = {k: bool(v) for k, v in restrictions.items()}
+
+    if not body:
+        raise ValueError(
+            "Must provide at least one of: new_name, restrictions"
+        )
+
+    updated = await asyncio.to_thread(
+        service.drives()
+        .update(
+            driveId=drive_id,
+            body=body,
+            fields="id, name, restrictions",
+        )
+        .execute
+    )
+
+    output_parts = [
+        f"Successfully updated Shared Drive '{updated.get('name', 'Unknown')}' (ID: {updated.get('id', drive_id)})",
+        "",
+        "Changes applied:",
+    ]
+    if "name" in body:
+        output_parts.append(f"  - name -> {body['name']}")
+    if "restrictions" in body:
+        for k, v in body["restrictions"].items():
+            output_parts.append(f"  - restrictions.{k} -> {v}")
+
+    return "\n".join(output_parts)
+
+
+@server.tool()
+@handle_http_errors("delete_shared_drive", is_read_only=False, service_type="drive")
+@require_google_service("drive", "drive_full")
+async def delete_shared_drive(
+    service,
+    user_google_email: str,
+    drive_id: str,
+    confirm: bool = False,
+) -> str:
+    """
+    Deletes a Shared Drive. Refuses to act unless ``confirm=True`` AND the
+    drive is empty. The drive must contain zero files (including trashed
+    items visible to ``files.list`` with ``corpora=drive``).
+
+    This is irreversible. The Drive itself disappears; member permissions
+    are revoked.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        drive_id (str): The ID of the Shared Drive. Required.
+        confirm (bool): Must be True to proceed. Defaults to False.
+
+    Returns:
+        str: Confirmation of deletion, or an error explaining why the call was refused.
+    """
+    logger.info(
+        f"[delete_shared_drive] Invoked. Email: '{user_google_email}', Drive ID: '{drive_id}', Confirm: {confirm}"
+    )
+
+    if not confirm:
+        raise ValueError(
+            "Refused: delete_shared_drive requires confirm=True. "
+            "This is an irreversible operation."
+        )
+
+    # Look up the drive name first so the error / success message can name it.
+    drive_meta = await asyncio.to_thread(
+        service.drives()
+        .get(driveId=drive_id, fields="id, name")
+        .execute
+    )
+    drive_name = drive_meta.get("name", "Unknown")
+
+    # HARD GUARD: refuse if any files are present in the drive.
+    listing = await asyncio.to_thread(
+        service.files()
+        .list(
+            corpora="drive",
+            driveId=drive_id,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            fields="files(id)",
+            pageSize=10,
+        )
+        .execute
+    )
+    files_in_drive = listing.get("files", []) or []
+    if files_in_drive:
+        n = len(files_in_drive)
+        # files.list capped at pageSize=10; indicate "10+" when at cap.
+        n_label = f"{n}+" if n >= 10 else str(n)
+        raise ValueError(
+            f"Refused: Shared Drive '{drive_name}' is not empty ({n_label} items). "
+            "Empty it before deleting."
+        )
+
+    await asyncio.to_thread(
+        service.drives().delete(driveId=drive_id).execute
+    )
+
+    return (
+        f"Successfully deleted Shared Drive '{drive_name}' (ID: {drive_id}) "
+        f"for {user_google_email}."
+    )
+
+
+@server.tool()
+@handle_http_errors("add_shared_drive_member", is_read_only=False, service_type="drive")
+@require_google_service("drive", "drive_full")
+async def add_shared_drive_member(
+    service,
+    user_google_email: str,
+    drive_id: str,
+    email: str,
+    role: str,
+) -> str:
+    """
+    Adds a user as a member of a Shared Drive with the specified role.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        drive_id (str): The ID of the Shared Drive. Required.
+        email (str): Email address of the user to add. Required.
+        role (str): One of 'organizer', 'fileOrganizer', 'writer', 'commenter', 'reader'. Required.
+
+    Returns:
+        str: Confirmation with the new permissionId.
+    """
+    logger.info(
+        f"[add_shared_drive_member] Invoked. Email: '{user_google_email}', Drive ID: '{drive_id}', Member: '{email}', Role: '{role}'"
+    )
+
+    if role not in SHARED_DRIVE_MEMBER_ROLES:
+        raise ValueError(
+            f"Invalid role '{role}'. Must be one of: {list(SHARED_DRIVE_MEMBER_ROLES)}"
+        )
+
+    created_permission = await asyncio.to_thread(
+        service.permissions()
+        .create(
+            fileId=drive_id,
+            supportsAllDrives=True,
+            body={"type": "user", "role": role, "emailAddress": email},
+            fields="id, type, role, emailAddress",
+        )
+        .execute
+    )
+
+    permission_id = created_permission.get("id", "N/A")
+    return (
+        f"Successfully added '{email}' as '{role}' to Shared Drive '{drive_id}'.\n"
+        f"Permission ID: {permission_id}"
+    )
+
+
+@server.tool()
+@handle_http_errors(
+    "remove_shared_drive_member", is_read_only=False, service_type="drive"
+)
+@require_google_service("drive", "drive_full")
+async def remove_shared_drive_member(
+    service,
+    user_google_email: str,
+    drive_id: str,
+    permission_id: str,
+) -> str:
+    """
+    Removes a member from a Shared Drive by their permission ID.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        drive_id (str): The ID of the Shared Drive. Required.
+        permission_id (str): The permission ID to remove (from get_drive_file_permissions on the drive). Required.
+
+    Returns:
+        str: Confirmation of removal.
+    """
+    logger.info(
+        f"[remove_shared_drive_member] Invoked. Email: '{user_google_email}', Drive ID: '{drive_id}', Permission ID: '{permission_id}'"
+    )
+
+    await asyncio.to_thread(
+        service.permissions()
+        .delete(
+            fileId=drive_id,
+            permissionId=permission_id,
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+
+    return (
+        f"Successfully removed permission '{permission_id}' from Shared Drive "
+        f"'{drive_id}' for {user_google_email}."
     )
