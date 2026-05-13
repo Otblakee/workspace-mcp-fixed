@@ -2547,6 +2547,47 @@ _DOWNLOAD_STREAM_CHUNK = int(
     os.getenv("WORKSPACE_DOWNLOAD_CHUNK_BYTES", str(4 * 1024 * 1024))
 )
 
+# Hosts permitted as ``upload_uri`` values in confirm_drive_upload. The
+# tool attaches a Bearer access token to whatever URI we PUT against, so
+# anything outside Google's upload surface would either exfiltrate that
+# token or, for internal addresses (cloud metadata service, RFC1918, etc.),
+# enable an authenticated SSRF. Strict allow-list here, no env override —
+# if Google ever returns a session URI on a new host we'd rather break
+# loud than expand the trust boundary silently.
+_ALLOWED_UPLOAD_HOSTS = frozenset(
+    {
+        "www.googleapis.com",
+        "googleapis.com",
+        "storage.googleapis.com",
+        "content.googleapis.com",
+    }
+)
+
+
+def _validate_google_upload_uri(uri: str) -> None:
+    """Reject ``upload_uri`` values that aren't Google upload endpoints.
+
+    Raises:
+        Exception: when the URI isn't HTTPS, carries userinfo, or has a
+            host outside ``_ALLOWED_UPLOAD_HOSTS``. The caller's OAuth
+            token would otherwise be sent to whatever destination was
+            supplied — an SSRF / token-exfil primitive.
+    """
+    try:
+        parsed = urlparse(uri)
+    except Exception as e:
+        raise Exception(f"upload_uri is not a parseable URL: {e}")
+    if parsed.scheme != "https":
+        raise Exception("upload_uri must use https.")
+    if parsed.username or parsed.password:
+        raise Exception("upload_uri must not contain userinfo.")
+    host = (parsed.hostname or "").lower()
+    if host not in _ALLOWED_UPLOAD_HOSTS:
+        raise Exception(
+            f"upload_uri host '{host}' is not a permitted Google upload "
+            f"endpoint. Refusing to send credentials to an untrusted host."
+        )
+
 
 def _resumable_session_url(file_id: str) -> str:
     return (
@@ -2694,6 +2735,21 @@ async def create_drive_upload_session(
 
     upload_uri = resp.headers.get("Location")
     if not upload_uri:
+        # 200 OK without a Location header is an undefined state — Google
+        # didn't actually open a session for us. Roll the placeholder back
+        # so a flaky proxy or partial response doesn't leave orphan empties
+        # in Drive on retry.
+        try:
+            await asyncio.to_thread(
+                service.files().delete(fileId=file_id, supportsAllDrives=True).execute
+            )
+        except Exception as cleanup_err:  # pragma: no cover - best effort
+            logger.warning(
+                "Failed to clean up placeholder file %s after Location-less "
+                "session init: %s",
+                file_id,
+                cleanup_err,
+            )
         raise Exception(
             "Drive resumable session init succeeded but returned no Location header."
         )
@@ -2757,6 +2813,9 @@ async def confirm_drive_upload(
         raise Exception("file_id is required.")
     if not upload_uri or not upload_uri.strip():
         raise Exception("upload_uri is required.")
+    # Validate before grabbing the access token — never let the token
+    # leave this server unless we know the destination is Google.
+    _validate_google_upload_uri(upload_uri)
 
     access_token = await _ensure_fresh_token(service)
     # Per the resumable-upload spec, a status query is a PUT with
