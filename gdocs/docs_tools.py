@@ -56,6 +56,52 @@ import json
 logger = logging.getLogger(__name__)
 
 
+# Map non-Doc Workspace mime types to the tool family the caller probably
+# meant to use. Anything else returns a generic-but-still-clearer hint.
+_WORKSPACE_TYPE_LABELS: Dict[str, tuple] = {
+    "application/vnd.google-apps.spreadsheet":
+        ("Google Sheet", "Sheets tool (e.g. read_sheet_values)"),
+    "application/vnd.google-apps.presentation":
+        ("Google Slides presentation", "Slides tool"),
+    "application/vnd.google-apps.form":
+        ("Google Form", "Forms tool"),
+    "application/vnd.google-apps.folder":
+        ("Drive folder", "Drive tool (e.g. list_drive_items)"),
+    "application/vnd.google-apps.drawing":
+        ("Google Drawing", "Drive tool"),
+}
+
+
+async def _wrong_workspace_type_hint(
+    drive_service: Any, file_id: str, expected_label: str
+) -> str:
+    """Best-effort hint for a 404 from a Docs/Slides/Sheets tool.
+
+    Looks up the file's mime type via Drive. If it resolves to a different
+    Workspace type, return a clear sentence the LLM can act on; otherwise
+    return an empty string so the caller re-raises the original error.
+    """
+    try:
+        meta = await asyncio.to_thread(
+            drive_service.files()
+            .get(fileId=file_id, fields="mimeType,name", supportsAllDrives=True)
+            .execute
+        )
+    except Exception:
+        return ""
+    mime = meta.get("mimeType", "")
+    if not mime or mime == "application/vnd.google-apps.document":
+        return ""
+    label, tool_hint = _WORKSPACE_TYPE_LABELS.get(
+        mime, (f"file of type {mime}", "the appropriate Workspace tool")
+    )
+    name = meta.get("name", file_id)
+    return (
+        f"ID '{file_id}' (name: {name!r}) belongs to a {label}, not a "
+        f"{expected_label}. Use a {tool_hint} instead."
+    )
+
+
 @server.tool()
 @handle_http_errors("search_docs", is_read_only=True, service_type="docs")
 @require_google_service("drive", "drive_read")
@@ -1700,10 +1746,22 @@ async def get_doc_as_markdown(
         f"[get_doc_as_markdown] Doc={document_id}, comments={include_comments}, mode={comment_mode}"
     )
 
-    # Fetch document content via Docs API
-    doc = await asyncio.to_thread(
-        docs_service.documents().get(documentId=document_id).execute
-    )
+    # Fetch document content via Docs API. On 404, fall back to a single Drive
+    # metadata lookup so we can return a clear "this ID belongs to a Sheet"
+    # message instead of Google's generic "Requested entity was not found." —
+    # the latter triggers a false governance alarm when an LLM passes a Sheet
+    # ID to a Docs tool by mistake.
+    from googleapiclient.errors import HttpError as _DocsHttpError
+    try:
+        doc = await asyncio.to_thread(
+            docs_service.documents().get(documentId=document_id).execute
+        )
+    except _DocsHttpError as e:
+        if getattr(e, "resp", None) is not None and e.resp.status == 404:
+            hint = await _wrong_workspace_type_hint(drive_service, document_id, "Doc")
+            if hint:
+                raise Exception(hint) from e
+        raise
 
     markdown = convert_doc_to_markdown(doc)
 

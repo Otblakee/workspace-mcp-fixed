@@ -95,7 +95,9 @@ class TableOperationManager:
                 metadata,
             )
 
-        except Exception as e:
+        except (ValueError, KeyError) as e:
+            # Let Google HttpErrors propagate to handle_http_errors / audit;
+            # only validation/key errors collapse to a structured return.
             logger.error(f"Failed to create and populate table: {str(e)}")
             return False, f"Table creation failed: {str(e)}", {}
 
@@ -314,7 +316,8 @@ class TableOperationManager:
                 metadata,
             )
 
-        except Exception as e:
+        except (ValueError, KeyError) as e:
+            # Let Google HttpErrors propagate to handle_http_errors / audit.
             return False, f"Failed to populate existing table: {str(e)}", {}
 
     async def _populate_existing_table_cells(
