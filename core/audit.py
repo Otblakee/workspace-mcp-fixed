@@ -32,7 +32,15 @@ SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 ENABLED = bool(AUDIT_SHEET_ID)
 
 HEADERS = ["timestamp_utc", "user", "service", "tool", "params_summary",
-           "resource_id", "status", "error", "latency_ms"]
+           "resource_id", "status", "error", "latency_ms", "client"]
+
+# A1 range covering all HEADERS columns. Bumped from A:I to A:J when the
+# ``client`` column was appended in the Wave 2 audit-hardening change.
+# Historical tabs (pre-deploy) still have their A1:I1 header row; new rows
+# written there will populate column J without a matching column header
+# until the operator backfills it manually.
+_SHEET_RANGE_ALL_COLS = f"A:{chr(ord('A') + len(HEADERS) - 1)}"
+_SHEET_RANGE_HEADER_ROW = f"A1:{chr(ord('A') + len(HEADERS) - 1)}1"
 
 SERVICE_MAP = {"drive": "drive", "gmail": "gmail", "calendar": "calendar",
     "event": "calendar", "doc": "docs", "comment": "docs", "spreadsheet": "sheets",
@@ -145,6 +153,106 @@ def _resource_id(result: Any, kwargs: dict) -> str:
             if v is not None and v != "":
                 return str(v)[:200]
     return ""
+
+
+# --- MCP client attribution -------------------------------------------------
+#
+# Classify the calling MCP client via the request User-Agent. We keep the
+# label coarse (claude-code / claude-web / claude-desktop / other:<snippet>)
+# so the audit sheet stays human-readable and queryable without leaking the
+# full UA. Patterns are substring-based and lowercased; anything unknown is
+# preserved verbatim under the ``other:`` prefix (capped at 40 chars) so we
+# can still triage surprise clients from the log.
+_CLIENT_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("claude code", "claude-code"),
+    ("claude-code", "claude-code"),
+    ("claudecode", "claude-code"),
+    ("claude desktop", "claude-desktop"),
+    ("claude-desktop", "claude-desktop"),
+    ("anthropic-claude-desktop", "claude-desktop"),
+    ("claude.ai", "claude-web"),
+    ("anthropic/web", "claude-web"),
+    ("anthropic-web", "claude-web"),
+)
+
+
+def _classify_client(user_agent: str | None) -> str:
+    """Map a User-Agent string to a short client label.
+
+    Returns ``""`` when there is no UA to classify (stdio / background task).
+    Falls back to ``other:<snippet>`` for any UA that doesn't match the known
+    Claude client patterns, so unknown callers stay visible without dumping
+    the entire raw header.
+    """
+    if not user_agent:
+        return ""
+    ua = user_agent.strip()
+    lower = ua.lower()
+    for needle, label in _CLIENT_PATTERNS:
+        if needle in lower:
+            return label
+    snippet = ua[:40]
+    return f"other:{snippet}"
+
+
+def _resolve_client() -> str:
+    """Read the request User-Agent off FastMCP HTTP headers, then classify.
+
+    Fail-soft: any exception (no HTTP transport, no headers available, etc.)
+    returns ``""`` rather than blowing up the audit row.
+    """
+    try:
+        from fastmcp.server.dependencies import get_http_headers
+        headers = get_http_headers() or {}
+        ua = headers.get("user-agent") or headers.get("User-Agent") or ""
+        return _classify_client(ua)
+    except Exception:
+        return ""
+
+
+# --- Result-shape error detection -------------------------------------------
+#
+# Defence in depth for Fix 1: even when a tool layer swallows a Google API
+# failure and returns a "successful" value, we inspect the returned shape for
+# common error markers and override status to ``error`` so the audit row is
+# truthful. Cheap pattern match — no parsing, no I/O.
+_STR_ERROR_PREFIXES = ("error:", "❌", "failed:", "batch operation failed",
+                       "table creation failed", "api error in ")
+
+
+def _inspect_result_for_error(result: Any) -> tuple[bool, str]:
+    """Return ``(is_error, detail)`` if ``result`` looks like an error payload.
+
+    Catches three shapes commonly emitted by the Google clients and the
+    older swallow-and-return-string tool patterns:
+
+    1. A string starting with ``Error:`` / ``❌`` / ``Failed:`` etc.
+    2. A dict with an ``error`` key at the top level (Google API JSON error).
+    3. A dict whose ``replies`` array contains an item with an ``error`` key
+       (per-operation failure inside an otherwise-200 batchUpdate response).
+    """
+    if isinstance(result, str):
+        head = result.lstrip().lower()
+        for prefix in _STR_ERROR_PREFIXES:
+            if head.startswith(prefix):
+                return True, result.strip()[:300]
+        return False, ""
+    if isinstance(result, dict):
+        err = result.get("error")
+        if err:
+            if isinstance(err, dict):
+                msg = err.get("message") or str(err)
+            else:
+                msg = str(err)
+            return True, f"result.error: {msg}"[:300]
+        replies = result.get("replies")
+        if isinstance(replies, list):
+            for i, reply in enumerate(replies):
+                if isinstance(reply, dict) and reply.get("error"):
+                    detail = reply["error"]
+                    msg = detail.get("message") if isinstance(detail, dict) else str(detail)
+                    return True, f"replies[{i}].error: {msg}"[:300]
+    return False, ""
 
 
 def _origin_error_type(e: BaseException) -> str:
@@ -291,7 +399,7 @@ class AuditLogger:
                 await asyncio.to_thread(
                     sheets.spreadsheets().values().append(
                         spreadsheetId=AUDIT_SHEET_ID,
-                        range=f"'{tab}'!A:I",
+                        range=f"'{tab}'!{_SHEET_RANGE_ALL_COLS}",
                         valueInputOption="RAW",
                         insertDataOption="INSERT_ROWS",
                         body={"values": rows}).execute)
@@ -335,7 +443,7 @@ class AuditLogger:
                 body={"requests": [{"addSheet": {"properties": {"title": tab}}}]}).execute()
             sheets.spreadsheets().values().update(
                 spreadsheetId=AUDIT_SHEET_ID,
-                range=f"'{tab}'!A1:I1",
+                range=f"'{tab}'!{_SHEET_RANGE_HEADER_ROW}",
                 valueInputOption="RAW",
                 body={"values": [HEADERS]}).execute()
             try:
@@ -348,7 +456,7 @@ class AuditLogger:
         grid_range = {
             "sheetId": sheet_id,
             "startRowIndex": 1, "endRowIndex": 1000,
-            "startColumnIndex": 0, "endColumnIndex": 9,
+            "startColumnIndex": 0, "endColumnIndex": len(HEADERS),
         }
         write_ops_re = ('=REGEXMATCH($D2,"^(create|modify|send|delete|update|share|'
                        'set|add|remove|transfer|batch|draft|import|copy|format|'
@@ -440,6 +548,15 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                 raise
             finally:
                 try:
+                    # Defence in depth (Wave 2 audit-hardening): even if the
+                    # tool layer swallowed a Google API failure and returned
+                    # a "success" payload, inspect the shape for common error
+                    # markers and override status. Cheap & local.
+                    if status == "success":
+                        is_err, detail = _inspect_result_for_error(result)
+                        if is_err:
+                            status = "error"
+                            err = detail
                     # Extract resource_id eagerly so we can drop the full
                     # response body before yielding to the queue submit.
                     # Sheets calls with includeValuesInResponse=True can echo
@@ -453,6 +570,7 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                             user = user_resolver() or DEFAULT_USER
                         except Exception:
                             pass
+                    client = _resolve_client()
                     logger().submit({
                         "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                         "user": user,
@@ -463,6 +581,7 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                         "status": status,
                         "error": err,
                         "latency_ms": int((time.perf_counter() - t0) * 1000),
+                        "client": client,
                     })
                 except Exception as ae:
                     log.error("Audit submit failed (non-fatal): %s", ae)

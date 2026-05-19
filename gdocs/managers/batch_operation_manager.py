@@ -95,7 +95,13 @@ class BatchOperationManager:
                 metadata,
             )
 
-        except Exception as e:
+        except (ValueError, KeyError) as e:
+            # Validation errors (raised internally with operation index context)
+            # stay as a structured False return so the tool surfaces a useful
+            # message to the LLM. Google API failures (HttpError) and anything
+            # else MUST propagate to ``handle_http_errors`` and on to the audit
+            # decorator — otherwise the audit row records ``status=success``
+            # for what was actually a Google 400/404. (Wave 2 audit-hardening.)
             logger.error(f"Failed to execute batch operations: {str(e)}")
             return False, f"Batch operation failed: {str(e)}", {}
 
