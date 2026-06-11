@@ -50,6 +50,14 @@ services:
       - key: WORKSPACE_MCP_STATELESS_MODE
         value: "false"
 
+      # ---- tool surface: the six live services only ----
+      # appscript is additionally opt-in-gated in main.py (OPT_IN_TOOLS);
+      # per CLAUDE.md it must not be enabled until audit logging has been
+      # live and reviewed for 30 days. If the dashboard already defines
+      # TOOLS, reconcile it with this value before syncing the blueprint.
+      - key: TOOLS
+        value: gmail drive calendar docs sheets contacts
+
       # ---- OAuth 2.1 mode (per CLAUDE.md, single-user oliver@otbgroup.co.uk) ----
       - key: MCP_ENABLE_OAUTH21
         value: "true"

@@ -107,6 +107,7 @@ def validate_file_path(file_path: str) -> Path:
         ".kube",
         ".gnupg",
         ".config/gcloud",
+        ".docker",
     )
     for sensitive_dir in sensitive_dirs:
         home = Path.home()
@@ -115,6 +116,24 @@ def validate_file_path(file_path: str) -> Path:
             raise ValueError(
                 f"Access to '{resolved_str}' is not allowed: "
                 "path is in a directory that commonly contains secrets or credentials."
+            )
+
+    # Block this MCP's own credential caches (refresh tokens live here).
+    # Mirrors the env-var resolution in auth.google_auth.get_default_credentials_dir
+    # without importing it (avoids a core<->auth import cycle).
+    mcp_credential_dirs = (
+        os.environ.get("WORKSPACE_MCP_CREDENTIALS_DIR"),
+        os.environ.get("GOOGLE_MCP_CREDENTIALS_DIR"),
+        str(Path.home() / ".google_workspace_mcp"),
+    )
+    for cred_dir in mcp_credential_dirs:
+        if not cred_dir:
+            continue
+        blocked = Path(cred_dir).expanduser().resolve()
+        if resolved == blocked or str(resolved).startswith(str(blocked) + "/"):
+            raise ValueError(
+                f"Access to '{resolved_str}' is not allowed: "
+                "path is inside the MCP credential store."
             )
 
     # Block other credential/secret file patterns
@@ -130,7 +149,6 @@ def validate_file_path(file_path: str) -> Path:
         ".pypirc",
         ".netrc",
         ".git-credentials",
-        ".docker/config.json",
     }
     if file_name in sensitive_names:
         raise ValueError(

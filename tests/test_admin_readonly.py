@@ -408,8 +408,11 @@ class TestMainOptIn:
         src = main_path.read_text()
         # Sanity: gadmin appears in the imports table and in --tools choices.
         assert '"gadmin": lambda: import_module("gadmin.admin_tools")' in src
-        # The OPT_IN_TOOLS guard must reference gadmin.
-        assert 'OPT_IN_TOOLS = {"gadmin"}' in src
+        # The OPT_IN_TOOLS guard must reference gadmin (importable since it
+        # was hoisted to module scope alongside the appscript gate).
+        import main
+
+        assert "gadmin" in main.OPT_IN_TOOLS
         # And the default-tools branch must apply the OPT_IN_TOOLS filter.
         assert "if t not in OPT_IN_TOOLS" in src
 

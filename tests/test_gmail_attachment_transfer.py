@@ -239,7 +239,7 @@ class TestResolveTransferFolder:
         )
 
         folder_id = await xfer.resolve_transfer_folder(
-            drive_service, "Claude Inbox/_attachment-transfer"
+            drive_service, "Claude Inbox/_attachment-transfer", user_email="a@example.com"
         )
         assert folder_id == "folder-b"
         assert files_api.create.call_count == 2
@@ -251,14 +251,44 @@ class TestResolveTransferFolder:
         assert second_body["name"] == "_attachment-transfer"
         assert second_body["parents"] == ["folder-a"]
 
-        # Second call hits the module cache: no extra list (or create) calls.
+        # Second call for the same user hits the cache: no extra list calls.
         list_calls_before = files_api.list.call_count
         folder_id_again = await xfer.resolve_transfer_folder(
-            drive_service, "Claude Inbox/_attachment-transfer"
+            drive_service, "Claude Inbox/_attachment-transfer", user_email="a@example.com"
         )
         assert folder_id_again == "folder-b"
         assert files_api.list.call_count == list_calls_before
         assert files_api.create.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cache_is_not_shared_across_users(self, monkeypatch):
+        """User B must never receive a folder ID resolved under user A's
+        Drive client — the cache is keyed by (user, path)."""
+        from core import attachment_transfer as xfer
+
+        monkeypatch.setattr(xfer, "_folder_id_cache", {})
+
+        drive_service = MagicMock()
+        files_api = drive_service.files.return_value
+        files_api.list.return_value.execute = MagicMock(
+            return_value={"files": [{"id": "folder-x"}]}
+        )
+
+        await xfer.resolve_transfer_folder(
+            drive_service, "Claude Inbox", user_email="a@example.com"
+        )
+        list_calls_after_a = files_api.list.call_count
+
+        # Different user, same path: must re-resolve, not reuse A's entry.
+        await xfer.resolve_transfer_folder(
+            drive_service, "Claude Inbox", user_email="b@example.com"
+        )
+        assert files_api.list.call_count > list_calls_after_a
+
+        # No user identity: cache must be bypassed entirely.
+        await xfer.resolve_transfer_folder(drive_service, "Claude Inbox")
+        await xfer.resolve_transfer_folder(drive_service, "Claude Inbox")
+        assert files_api.list.call_count == list_calls_after_a + 3
 
     @pytest.mark.asyncio
     async def test_query_escapes_single_quotes(self, monkeypatch):

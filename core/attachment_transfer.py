@@ -33,9 +33,12 @@ FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 # session (matches Google's recommended resumable threshold).
 RESUMABLE_THRESHOLD_BYTES = 5 * 1024 * 1024
 
-# Resolved folder-path -> Drive folder ID. Optimisation only: a cold cache
-# (process restart, multi-instance) just re-resolves via find-or-create.
-_folder_id_cache: Dict[str, str] = {}
+# (user email, resolved folder-path) -> Drive folder ID. Keyed per user:
+# resolution runs under a per-user Drive client, so a path-only key would
+# hand user B a folder ID living in user A's My Drive. Optimisation only:
+# a cold cache (process restart, multi-instance) just re-resolves via
+# find-or-create.
+_folder_id_cache: Dict[tuple, str] = {}
 
 
 class TransferredAttachment(NamedTuple):
@@ -71,18 +74,24 @@ def _escape_drive_query(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-async def resolve_transfer_folder(drive_service, path: str) -> str:
+async def resolve_transfer_folder(
+    drive_service, path: str, user_email: Optional[str] = None
+) -> str:
     """Resolve a slash-separated folder path from the My Drive root,
     creating any missing segments, and return the leaf folder ID.
+
+    ``user_email`` keys the resolution cache; when it is None the cache is
+    bypassed entirely (never share folder IDs across unknown identities).
     """
     segments = [s.strip() for s in path.split("/") if s.strip()]
     if not segments:
         raise ValueError(f"Transfer folder path is empty: {path!r}")
 
-    cache_key = "/".join(segments)
-    cached = _folder_id_cache.get(cache_key)
-    if cached:
-        return cached
+    cache_key = (user_email, "/".join(segments)) if user_email else None
+    if cache_key:
+        cached = _folder_id_cache.get(cache_key)
+        if cached:
+            return cached
 
     parent_id = "root"
     for segment in segments:
@@ -116,10 +125,11 @@ async def resolve_transfer_folder(drive_service, path: str) -> str:
             parent_id = created["id"]
             logger.info(
                 f"[attachment_transfer] Created Drive folder '{segment}' "
-                f"(id={parent_id}) for transfer path '{cache_key}'"
+                f"(id={parent_id}) for transfer path '{'/'.join(segments)}'"
             )
 
-    _folder_id_cache[cache_key] = parent_id
+    if cache_key:
+        _folder_id_cache[cache_key] = parent_id
     return parent_id
 
 
@@ -129,14 +139,18 @@ async def upload_attachment_to_drive(
     filename: str,
     mime_type: str,
     folder_path: Optional[str] = None,
+    user_email: Optional[str] = None,
 ) -> TransferredAttachment:
     """Upload attachment bytes to the Drive transfer folder.
 
     The Drive file name is prefixed with a ``YYYYMMDD-HHMMSS_`` timestamp so
-    repeated downloads of the same attachment don't collide.
+    repeated downloads of the same attachment don't collide. ``user_email``
+    enables per-user caching of the resolved folder ID.
     """
     resolved_path = folder_path or get_transfer_folder_path()
-    folder_id = await resolve_transfer_folder(drive_service, resolved_path)
+    folder_id = await resolve_transfer_folder(
+        drive_service, resolved_path, user_email=user_email
+    )
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     drive_name = f"{timestamp}_{filename}"

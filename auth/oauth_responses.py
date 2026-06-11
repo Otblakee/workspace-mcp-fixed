@@ -3,7 +3,12 @@ Shared OAuth callback response templates.
 
 Provides reusable HTML response templates for OAuth authentication flows
 to eliminate duplication between server.py and oauth_callback_server.py.
+
+All interpolated values are HTML-escaped: the callback endpoints reflect
+attacker-controllable query parameters (error, state) into these pages.
 """
+
+import html
 
 from fastapi.responses import HTMLResponse
 from typing import Optional
@@ -20,12 +25,13 @@ def create_error_response(error_message: str, status_code: int = 400) -> HTMLRes
     Returns:
         HTMLResponse with error page
     """
+    safe_message = html.escape(str(error_message))
     content = f"""
         <html>
         <head><title>Authentication Error</title></head>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; text-align: center;">
             <h2 style="color: #d32f2f;">Authentication Error</h2>
-            <p>{error_message}</p>
+            <p>{safe_message}</p>
             <p>Please ensure you grant the requested permissions. You can close this window and try again.</p>
             <script>setTimeout(function() {{ window.close(); }}, 10000);</script>
         </body>
@@ -45,7 +51,7 @@ def create_success_response(verified_user_id: Optional[str] = None) -> HTMLRespo
         HTMLResponse with success page
     """
     # Handle the case where no user ID is provided
-    user_display = verified_user_id if verified_user_id else "Google User"
+    user_display = html.escape(str(verified_user_id)) if verified_user_id else "Google User"
 
     content = f"""<html>
 <head>
@@ -209,12 +215,13 @@ def create_server_error_response(error_detail: str) -> HTMLResponse:
     Returns:
         HTMLResponse with server error page
     """
+    safe_detail = html.escape(str(error_detail))
     content = f"""
         <html>
         <head><title>Authentication Processing Error</title></head>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; text-align: center;">
             <h2 style="color: #d32f2f;">Authentication Processing Error</h2>
-            <p>An unexpected error occurred while processing your authentication: {error_detail}</p>
+            <p>An unexpected error occurred while processing your authentication: {safe_detail}</p>
             <p>Please try again. You can close this window.</p>
             <script>setTimeout(function() {{ window.close(); }}, 10000);</script>
         </body>
