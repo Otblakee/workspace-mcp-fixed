@@ -151,27 +151,6 @@ def _apply_visibility_if_valid(
         )
 
 
-def _preserve_existing_fields(
-    event_body: Dict[str, Any],
-    existing_event: Dict[str, Any],
-    field_mappings: Dict[str, Any],
-) -> None:
-    """
-    Helper function to preserve existing event fields when not explicitly provided.
-
-    Args:
-        event_body: The event body being built for the API call
-        existing_event: The existing event data from the API
-        field_mappings: Dict mapping field names to their new values (None means preserve existing)
-    """
-    for field_name, new_value in field_mappings.items():
-        if new_value is None and field_name in existing_event:
-            event_body[field_name] = existing_event[field_name]
-            logger.info(f"[modify_event] Preserving existing {field_name}")
-        elif new_value is not None:
-            event_body[field_name] = new_value
-
-
 def _format_attendee_details(
     attendees: List[Dict[str, Any]], indent: str = "  "
 ) -> str:
@@ -899,28 +878,10 @@ async def modify_event(
         reminder_data = {}
         if use_default_reminders is not None:
             reminder_data["useDefault"] = use_default_reminders
-        else:
-            # Preserve existing event's useDefault value if not explicitly specified
-            try:
-                existing_event = (
-                    service.events()
-                    .get(calendarId=calendar_id, eventId=event_id)
-                    .execute()
-                )
-                reminder_data["useDefault"] = existing_event.get("reminders", {}).get(
-                    "useDefault", True
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[modify_event] Could not fetch existing event for reminders: {e}"
-                )
-                reminder_data["useDefault"] = (
-                    True  # Fallback to True if unable to fetch
-                )
 
         # If custom reminders are provided, automatically disable default reminders
         if reminders is not None:
-            if reminder_data.get("useDefault", False):
+            if reminder_data.get("useDefault", True):
                 reminder_data["useDefault"] = False
                 logger.info(
                     "[modify_event] Custom reminders provided - disabling default reminders"
@@ -969,6 +930,25 @@ async def modify_event(
             "[modify_event] Timezone provided but start_time and end_time are missing. Timezone will not be applied unless start/end times are also provided."
         )
 
+    # Handle Google Meet conference data
+    if add_google_meet is not None:
+        if add_google_meet:
+            # Add Google Meet
+            request_id = str(uuid.uuid4())
+            event_body["conferenceData"] = {
+                "createRequest": {
+                    "requestId": request_id,
+                    "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                }
+            }
+            logger.info(
+                f"[modify_event] Adding Google Meet conference with request ID: {request_id}"
+            )
+        else:
+            # Remove Google Meet by setting conferenceData to empty
+            event_body["conferenceData"] = {}
+            logger.info("[modify_event] Removing Google Meet conference")
+
     if not event_body:
         message = "No fields provided to modify the event."
         logger.warning(f"[modify_event] {message}")
@@ -976,74 +956,16 @@ async def modify_event(
 
     # Log the event ID for debugging
     logger.info(
-        f"[modify_event] Attempting to update event with ID: '{event_id}' in calendar '{calendar_id}'"
+        f"[modify_event] Attempting to patch event with ID: '{event_id}' in calendar '{calendar_id}'"
     )
 
-    # Get the existing event to preserve fields that aren't being updated
-    try:
-        existing_event = await asyncio.to_thread(
-            lambda: (
-                service.events().get(calendarId=calendar_id, eventId=event_id).execute()
-            )
-        )
-        logger.info(
-            "[modify_event] Successfully retrieved existing event before update"
-        )
-
-        # Preserve existing fields if not provided in the update
-        _preserve_existing_fields(
-            event_body,
-            existing_event,
-            {
-                "summary": summary,
-                "description": description,
-                "location": location,
-                # Use the already-normalized attendee objects (if provided); otherwise preserve existing
-                "attendees": event_body.get("attendees"),
-                "colorId": event_body.get("colorId"),
-            },
-        )
-
-        # Handle Google Meet conference data
-        if add_google_meet is not None:
-            if add_google_meet:
-                # Add Google Meet
-                request_id = str(uuid.uuid4())
-                event_body["conferenceData"] = {
-                    "createRequest": {
-                        "requestId": request_id,
-                        "conferenceSolutionKey": {"type": "hangoutsMeet"},
-                    }
-                }
-                logger.info(
-                    f"[modify_event] Adding Google Meet conference with request ID: {request_id}"
-                )
-            else:
-                # Remove Google Meet by setting conferenceData to empty
-                event_body["conferenceData"] = {}
-                logger.info("[modify_event] Removing Google Meet conference")
-        elif "conferenceData" in existing_event:
-            # Preserve existing conference data if not specified
-            event_body["conferenceData"] = existing_event["conferenceData"]
-            logger.info("[modify_event] Preserving existing conference data")
-
-    except HttpError as get_error:
-        if get_error.resp.status == 404:
-            logger.error(
-                f"[modify_event] Event not found during pre-update verification: {get_error}"
-            )
-            message = f"Event not found during verification. The event with ID '{event_id}' could not be found in calendar '{calendar_id}'. This may be due to incorrect ID format or the event no longer exists."
-            raise Exception(message)
-        else:
-            logger.warning(
-                f"[modify_event] Error during pre-update verification, but proceeding with update: {get_error}"
-            )
-
-    # Proceed with the update
+    # Patch sends only the fields the caller actually provided; everything
+    # else (start/end, recurrence, reminders, conferenceData, ...) is
+    # preserved server-side.
     updated_event = await asyncio.to_thread(
         lambda: (
             service.events()
-            .update(
+            .patch(
                 calendarId=calendar_id,
                 eventId=event_id,
                 body=event_body,

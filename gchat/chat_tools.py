@@ -349,15 +349,22 @@ async def search_messages(
     """
     logger.info(f"[search_messages] Email={user_google_email}, Query='{query}'")
 
+    # spaces.messages.list only supports filtering on createTime and
+    # thread.name, so list recent messages and match the query client-side.
+    query_lower = query.lower()
+
+    def _matches(msg: dict) -> bool:
+        return query_lower in msg.get("text", "").lower()
+
     # If specific space provided, search within that space
     if space_id:
         response = await asyncio.to_thread(
             chat_service.spaces()
             .messages()
-            .list(parent=space_id, pageSize=page_size, filter=f'text:"{query}"')
+            .list(parent=space_id, pageSize=page_size)
             .execute
         )
-        messages = response.get("messages", [])
+        messages = [msg for msg in response.get("messages", []) if _matches(msg)]
         context = f"space '{space_id}'"
     else:
         # Search across all accessible spaces (this may require iterating through spaces)
@@ -373,17 +380,16 @@ async def search_messages(
                 space_messages = await asyncio.to_thread(
                     chat_service.spaces()
                     .messages()
-                    .list(
-                        parent=space.get("name"), pageSize=5, filter=f'text:"{query}"'
-                    )
+                    .list(parent=space.get("name"), pageSize=5)
                     .execute
                 )
-                space_msgs = space_messages.get("messages", [])
-                for msg in space_msgs:
+                for msg in space_messages.get("messages", []):
+                    if not _matches(msg):
+                        continue
                     msg["_space_name"] = space.get("displayName", "Unknown")
-                messages.extend(space_msgs)
+                    messages.append(msg)
             except HttpError as e:
-                logger.debug(
+                logger.warning(
                     "Skipping space %s during search: %s", space.get("name"), e
                 )
                 continue

@@ -958,9 +958,11 @@ async def batch_update_contacts(
             if resource_name and etag:
                 etags[resource_name] = etag
 
-        # Build batch update body
-        update_bodies = []
-        update_fields_set: set = set()
+        # Group updates by their exact field-set. The People API clears any
+        # masked field that is absent from a person's body, so a single union
+        # updateMask across heterogeneous updates would wipe fields on every
+        # contact that doesn't set them.
+        update_groups: Dict[frozenset, List[Dict[str, Any]]] = {}
 
         for update in updates:
             contact_id = update.get("contact_id", "")
@@ -982,34 +984,37 @@ async def batch_update_contacts(
             )
 
             if body:
+                update_fields = frozenset(
+                    field
+                    for field in (
+                        "names",
+                        "emailAddresses",
+                        "phoneNumbers",
+                        "organizations",
+                    )
+                    if field in body
+                )
                 body["resourceName"] = contact_id
                 body["etag"] = etag
-                update_bodies.append({"person": body})
+                update_groups.setdefault(update_fields, []).append({"person": body})
 
-                # Track which fields are being updated
-                if "names" in body:
-                    update_fields_set.add("names")
-                if "emailAddresses" in body:
-                    update_fields_set.add("emailAddresses")
-                if "phoneNumbers" in body:
-                    update_fields_set.add("phoneNumbers")
-                if "organizations" in body:
-                    update_fields_set.add("organizations")
-
-        if not update_bodies:
+        if not update_groups:
             raise Exception("No valid update data provided.")
 
-        batch_body = {
-            "contacts": update_bodies,
-            "updateMask": ",".join(update_fields_set),
-            "readMask": DEFAULT_PERSON_FIELDS,
-        }
+        # One batchUpdateContacts call per distinct field-set, each with only
+        # that group's mask and contacts.
+        update_results: Dict[str, Any] = {}
+        for update_fields, update_bodies in update_groups.items():
+            batch_body = {
+                "contacts": update_bodies,
+                "updateMask": ",".join(sorted(update_fields)),
+                "readMask": DEFAULT_PERSON_FIELDS,
+            }
 
-        result = await asyncio.to_thread(
-            service.people().batchUpdateContacts(body=batch_body).execute
-        )
-
-        update_results = result.get("updateResult", {})
+            result = await asyncio.to_thread(
+                service.people().batchUpdateContacts(body=batch_body).execute
+            )
+            update_results.update(result.get("updateResult", {}))
 
         response = f"Batch Update Results for {user_google_email}:\n\n"
         response += f"Updated {len(update_results)} contacts:\n\n"

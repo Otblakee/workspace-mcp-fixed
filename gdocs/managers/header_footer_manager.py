@@ -9,6 +9,8 @@ import logging
 import asyncio
 from typing import Any, Optional
 
+from gdocs.docs_helpers import create_insert_text_segment_request
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +84,7 @@ class HeaderFooterManager:
 
             # Update the content
             success = await self._replace_section_content(
-                document_id, target_section, content
+                document_id, target_section, section_id, content
             )
 
             if success:
@@ -154,7 +156,7 @@ class HeaderFooterManager:
         return None, None
 
     async def _replace_section_content(
-        self, document_id: str, section: dict[str, Any], new_content: str
+        self, document_id: str, section: dict[str, Any], section_id: str, new_content: str
     ) -> bool:
         """
         Replace the content in a header or footer section.
@@ -162,6 +164,8 @@ class HeaderFooterManager:
         Args:
             document_id: Document ID
             section: Section data containing content elements
+            section_id: Segment ID of the header/footer (targets the requests
+                at the section instead of the document body)
             new_content: New content to insert
 
         Returns:
@@ -189,6 +193,7 @@ class HeaderFooterManager:
                 {
                     "deleteContentRange": {
                         "range": {
+                            "segmentId": section_id,
                             "startIndex": start_index,
                             "endIndex": end_index - 1,  # Keep the paragraph end marker
                         }
@@ -198,7 +203,7 @@ class HeaderFooterManager:
 
         # Insert new content
         requests.append(
-            {"insertText": {"location": {"index": start_index}, "text": new_content}}
+            create_insert_text_segment_request(start_index, new_content, section_id)
         )
 
         try:

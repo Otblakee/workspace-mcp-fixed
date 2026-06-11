@@ -1498,6 +1498,49 @@ async def import_to_google_doc(
     return confirmation
 
 
+async def _list_file_permissions(service, file_id: str) -> List[Dict[str, Any]]:
+    """
+    Page through permissions().list for a file.
+
+    Drive v3 does not populate the ``permissions`` field on files().get for
+    items in shared drives, so permission checks must fall back to this.
+    """
+    permissions: List[Dict[str, Any]] = []
+    page_token: Optional[str] = None
+    while True:
+        list_params = {
+            "fileId": file_id,
+            "supportsAllDrives": True,
+            "fields": "nextPageToken, permissions(id, type, role, emailAddress, "
+            "domain, expirationTime, permissionDetails)",
+        }
+        if page_token:
+            list_params["pageToken"] = page_token
+        response = await asyncio.to_thread(
+            service.permissions().list(**list_params).execute
+        )
+        permissions.extend(response.get("permissions", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return permissions
+
+
+async def _resolve_file_permissions(
+    service, file_id: str, file_metadata: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Return the file's permissions, falling back to permissions().list for
+    shared-drive items (driveId set) where files().get leaves them empty.
+    """
+    permissions = file_metadata.get("permissions", [])
+    if file_metadata.get("driveId") or (
+        not permissions and file_metadata.get("shared")
+    ):
+        permissions = await _list_file_permissions(service, file_id)
+    return permissions
+
+
 @server.tool()
 @handle_http_errors(
     "get_drive_file_permissions", is_read_only=True, service_type="drive"
@@ -1531,7 +1574,7 @@ async def get_drive_file_permissions(
             service.files()
             .get(
                 fileId=file_id,
-                fields="id, name, mimeType, size, modifiedTime, owners, "
+                fields="id, name, mimeType, size, modifiedTime, owners, driveId, "
                 "permissions(id, type, role, emailAddress, domain, expirationTime, permissionDetails), "
                 "webViewLink, webContentLink, shared, sharingUser, viewersCanCopyContent",
                 supportsAllDrives=True,
@@ -1559,7 +1602,7 @@ async def get_drive_file_permissions(
             )
 
         # Process permissions
-        permissions = file_metadata.get("permissions", [])
+        permissions = await _resolve_file_permissions(service, file_id, file_metadata)
         if permissions:
             output_parts.append(f"  Number of permissions: {len(permissions)}")
             output_parts.append("  Permissions:")
@@ -1665,13 +1708,13 @@ async def check_drive_file_public_access(
         service.files()
         .get(
             fileId=file_id,
-            fields="id, name, mimeType, permissions, webViewLink, webContentLink, shared",
+            fields="id, name, mimeType, permissions, webViewLink, webContentLink, shared, driveId",
             supportsAllDrives=True,
         )
         .execute
     )
 
-    permissions = file_metadata.get("permissions", [])
+    permissions = await _resolve_file_permissions(service, file_id, file_metadata)
 
     has_public_link = check_public_link_permission(permissions)
 
@@ -1909,7 +1952,7 @@ async def get_drive_shareable_link(
         service.files()
         .get(
             fileId=file_id,
-            fields="id, name, mimeType, webViewLink, webContentLink, shared, "
+            fields="id, name, mimeType, webViewLink, webContentLink, shared, driveId, "
             "permissions(id, type, role, emailAddress, domain, expirationTime)",
             supportsAllDrives=True,
         )
@@ -1930,7 +1973,7 @@ async def get_drive_shareable_link(
     if web_content_link:
         output_parts.append(f"  Download: {web_content_link}")
 
-    permissions = file_metadata.get("permissions", [])
+    permissions = await _resolve_file_permissions(service, file_id, file_metadata)
     if permissions:
         output_parts.append("")
         output_parts.append("Current permissions:")
