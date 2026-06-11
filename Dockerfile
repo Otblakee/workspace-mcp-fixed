@@ -46,6 +46,12 @@ ENV PYTHONIOENCODING=utf-8
 ENV TOOL_TIER=""
 ENV TOOLS=""
 
+# Don't re-sync the environment at container start: dependencies were already
+# installed at build time with `uv sync --no-dev`. A plain `uv run` would
+# implicitly re-sync (including dev deps), needing network access and slowing
+# every cold start.
+ENV UV_NO_SYNC=1
+
 # Use entrypoint for the base command and CMD for args
 ENTRYPOINT ["/bin/sh", "-c"]
 CMD ["uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]

@@ -66,9 +66,13 @@ id=draft_id)`. Uses `GMAIL_COMPOSE_SCOPE` (same scope as
 `draft_gmail_message`). Registered in `core/tool_tiers.yaml` under
 `gmail.extended`.
 
-**Render env-var update**: ensure `TOOLS` (or whichever tier env var is
-active) covers `gmail` extended tier, or add `delete_gmail_draft` explicitly.
-Listed `TOOLS` should include it after `draft_gmail_message`.
+**Render env-var update**: `TOOLS` must contain SERVICE names only (it feeds
+`--tools` via the Dockerfile CMD, and argparse restricts that flag to service
+names — a tool name like `delete_gmail_draft` in `TOOLS` makes the container
+exit 2 in a boot loop). Keep `TOOLS` as e.g.
+`gmail drive calendar docs sheets contacts` and set `TOOL_TIER=extended`
+(feeds `--tool-tier` via the Dockerfile CMD) so extended-tier tools such as
+`delete_gmail_draft` are loaded.
 
 ### `create_doc` — new `content_format` parameter (`'plain'` | `'markdown'`)
 Default `'plain'` is unchanged: `documents.create({title})` followed by an
@@ -138,7 +142,7 @@ in the repo now carry the appropriate flags.
 
 After this PR merges:
 1. Trigger a Render redeploy.
-2. Confirm `TOOLS` (or the tool-tier env var in use) covers `delete_gmail_draft` — either by enabling the `gmail` extended tier or by listing the tool name explicitly.
+2. Confirm `delete_gmail_draft` is loaded: keep `TOOLS` to service names only (e.g. `gmail drive calendar docs sheets contacts` — never tool names, which crash-loop the container with argparse exit 2) and set `TOOL_TIER=extended` so the `gmail.extended` tier (which includes `delete_gmail_draft`) is picked up.
 3. No new env vars required for these fixes.
 4. No new pip dependencies — both Drive and Sheets clients were already pinned in `pyproject.toml`.
 

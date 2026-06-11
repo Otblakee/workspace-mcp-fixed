@@ -31,6 +31,24 @@ from core.audit import audit_log, logger as audit_logger
 
 logger = logging.getLogger(__name__)
 
+
+def get_package_version() -> str:
+    """Resolve the installed distribution version.
+
+    This fork is distributed as ``workspace-mcp-fixed`` (see pyproject.toml);
+    the upstream name ``workspace-mcp`` is kept as a fallback so the lookup
+    still works on environments installed from the upstream package. Returns
+    "dev" only when neither distribution is installed (e.g. running from a
+    plain source checkout without ``uv sync`` / ``pip install``).
+    """
+    for dist_name in ("workspace-mcp-fixed", "workspace-mcp"):
+        try:
+            return metadata.version(dist_name)
+        except metadata.PackageNotFoundError:
+            continue
+    return "dev"
+
+
 _auth_provider: Optional[GoogleProvider] = None
 _legacy_callback_registered = False
 
@@ -474,10 +492,7 @@ def get_auth_provider() -> Optional[GoogleProvider]:
 @server.custom_route("/", methods=["GET"])
 @server.custom_route("/health", methods=["GET"])
 async def health_check(request: Request):
-    try:
-        version = metadata.version("workspace-mcp")
-    except metadata.PackageNotFoundError:
-        version = "dev"
+    version = get_package_version()
     return JSONResponse(
         {
             "status": "healthy",

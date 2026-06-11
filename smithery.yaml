@@ -33,6 +33,10 @@ startCommand:
         type: number
         default: 8000
         description: "Port the server listens on"
+      workspaceExternalUrl:
+        type: string
+        default: ""
+        description: "External URL for reverse-proxy setups (e.g. https://your-domain.com) - overrides base URI:port for OAuth endpoints"
       mcpSingleUserMode:
         type: boolean
         default: false
@@ -77,9 +81,12 @@ startCommand:
         args.push(...config.tools.split(',').map(t => t.trim()).filter(t => t));
       }
       
+      // Return the args array we just built — previously this was hardcoded
+      // to ['run', 'python', 'main.py'], which dropped the transport/tools/
+      // single-user flags and started a stdio server on HTTP deployments.
       return {
         command: 'uv',
-        args: ['run', 'python', 'main.py'],
+        args: args,
         env: {
           GOOGLE_OAUTH_CLIENT_ID: config.googleOauthClientId,
           GOOGLE_OAUTH_CLIENT_SECRET: config.googleOauthClientSecret,

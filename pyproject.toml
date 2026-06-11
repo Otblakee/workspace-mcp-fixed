@@ -19,10 +19,13 @@ dependencies = [
  "google-auth-oauthlib>=1.2.2",
  "httpx>=0.28.1",
  "py-key-value-aio>=0.3.0",
+ "pydantic>=2.0.0",
  "pyjwt>=2.10.1",
  "python-dotenv>=1.1.0",
  "pyyaml>=6.0.2",
  "cryptography>=45.0.0",
+ "starlette>=0.40.0",
+ "uvicorn>=0.30.0",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -108,8 +111,12 @@ py-modules = [ "fastmcp_server", "main"]
 where = ["."]
 exclude = ["tests*", "docs*", "build", "dist"]
 
+# NOTE: collect_ignore_glob is a conftest.py variable, not an ini option —
+# declaring it here was silently ignored (pytest warned "Unknown config
+# option") and tests/gappsscript/manual_test.py was collected, producing
+# 8 collection errors. --ignore-glob is the supported ini-level equivalent.
 [tool.pytest.ini_options]
-collect_ignore_glob = ["**/manual_test.py"]
+addopts = "--ignore-glob=**/manual_test.py"
 
 [tool.setuptools.package-data]
 core = ["tool_tiers.yaml"]
