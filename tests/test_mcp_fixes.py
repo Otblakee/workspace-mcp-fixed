@@ -2,10 +2,10 @@
 fix/drive-base64-locale-draft-delete-docfmt.
 
 Covers Issues 1–5. Unit tests verify parameter contracts, validation logic
-and registration; live-API tests are guarded by environment variables and
-skipped by default. The live tests are the only way to confirm Google-side
-behaviour (e.g. that the Drive markdown converter actually applies Heading 1
-to a `# H1` line) — run them manually with credentials when needed.
+and registration. The test_live_* stubs are unimplemented placeholders
+(marked skip unconditionally) documenting what a future live harness must
+verify Google-side (e.g. that the Drive markdown converter actually applies
+Heading 1 to a `# H1` line); they do not run anything today.
 """
 
 from __future__ import annotations
@@ -22,10 +22,10 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Live tests require a real OAuth-authenticated session; skip unless opted in.
-LIVE = os.environ.get("OTB_MCP_LIVE_TESTS") == "1"
+# The live-integration tests below are unimplemented stubs and are marked
+# with a plain @pytest.mark.skip until a harness with real OAuth credentials
+# exists. LIVE_USER doubles as the dummy user email for the unit tests.
 LIVE_USER = os.environ.get("OTB_MCP_LIVE_USER", "oliver@otbgroup.co.uk")
-SHARED_DRIVE_FOLDER = os.environ.get("OTB_MCP_LIVE_SHARED_DRIVE_FOLDER", "")
 
 
 def _unwrap(fn):
@@ -56,12 +56,9 @@ class TestCreateSpreadsheetLocale:
             "Expected 'locale' set alongside 'title' on the create body."
         )
 
-    @pytest.mark.skipif(not LIVE, reason="Set OTB_MCP_LIVE_TESTS=1 to run live")
+    @pytest.mark.skip(reason="live stub — not implemented; see docstring")
     def test_live_default_locale_is_en_gb(self):
         """Live: a default-args spreadsheet must come back with locale en_GB."""
-        # Stub — wire into the test harness used in CI when available. Without
-        # live creds we cannot exercise this end-to-end here.
-        pytest.skip("Live integration stub — implement against the OTB MCP harness.")
 
 
 # ---------------------------------------------------------------------------
@@ -132,23 +129,18 @@ class TestCreateDriveFileBase64:
         finally:
             mod.resolve_folder_id = original
 
-    @pytest.mark.skipif(not LIVE, reason="Set OTB_MCP_LIVE_TESTS=1 to run live")
+    @pytest.mark.skip(reason="live stub — not implemented; see docstring")
     def test_live_png_roundtrip(self):
         """Live: upload a 1x1 PNG via base64_content, download it, byte-compare."""
-        pytest.skip("Live integration stub — implement against the OTB MCP harness.")
 
-    @pytest.mark.skipif(not LIVE, reason="Set OTB_MCP_LIVE_TESTS=1 to run live")
+    @pytest.mark.skip(reason="live stub — not implemented; see docstring")
     def test_live_pdf_roundtrip(self):
-        pytest.skip("Live integration stub — implement against the OTB MCP harness.")
+        """Live: upload a small PDF via base64_content, download it, byte-compare."""
 
-    @pytest.mark.skipif(
-        not (LIVE and SHARED_DRIVE_FOLDER),
-        reason="Requires OTB_MCP_LIVE_TESTS=1 and OTB_MCP_LIVE_SHARED_DRIVE_FOLDER",
-    )
+    @pytest.mark.skip(reason="live stub — not implemented; see docstring")
     def test_live_shared_drive_upload(self):
         """Live: uploading into a 0A… Shared Drive folder must land in the
-        Shared Drive, not My Drive."""
-        pytest.skip("Live integration stub — implement against the OTB MCP harness.")
+        Shared Drive, not My Drive. Requires OTB_MCP_LIVE_SHARED_DRIVE_FOLDER."""
 
 
 # ---------------------------------------------------------------------------
@@ -285,11 +277,10 @@ class TestDeleteGmailDraft:
             "async def delete_gmail_draft("
         ) in src
 
-    @pytest.mark.skipif(not LIVE, reason="Set OTB_MCP_LIVE_TESTS=1 to run live")
+    @pytest.mark.skip(reason="live stub — not implemented; see docstring")
     def test_live_create_then_delete(self):
         """Live: draft_gmail_message → delete_gmail_draft must succeed,
         and a follow-up read must 404."""
-        pytest.skip("Live integration stub — implement against the OTB MCP harness.")
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +459,7 @@ class TestCreateDocMarkdown:
             content_format="markdown",
         )
 
-    @pytest.mark.skipif(not LIVE, reason="Set OTB_MCP_LIVE_TESTS=1 to run live")
+    @pytest.mark.skip(reason="live stub — not implemented; see docstring")
     def test_live_h1_and_bullet_render_as_native_styles(self):
         """Live: create_doc(content='# H1\\n- a\\n- b', content_format='markdown')
         then read back the structure and assert the first paragraph is
@@ -478,7 +469,6 @@ class TestCreateDocMarkdown:
         This is the only test that actually verifies Google's converter does
         the right thing. Run after each markdown-converter behaviour change.
         """
-        pytest.skip("Live integration stub — implement against the OTB MCP harness.")
 
 
 # ---------------------------------------------------------------------------

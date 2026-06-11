@@ -3,7 +3,7 @@ import logging
 import os
 import socket
 import sys
-from importlib import metadata, import_module
+from importlib import import_module
 from dotenv import load_dotenv
 
 # Check for CLI mode early - before loading oauth_config
@@ -16,7 +16,12 @@ if _CLI_MODE:
 from auth.oauth_config import reload_oauth_config, is_stateless_mode  # noqa: E402
 from core.log_formatter import EnhancedLogFormatter, configure_file_logging  # noqa: E402
 from core.utils import check_credentials_directory_permissions  # noqa: E402
-from core.server import server, set_transport_mode, configure_server_for_http  # noqa: E402
+from core.server import (  # noqa: E402
+    server,
+    set_transport_mode,
+    configure_server_for_http,
+    get_package_version,
+)
 from core.tool_tier_loader import resolve_tools_from_tier  # noqa: E402
 from core.tool_registry import (  # noqa: E402
     set_enabled_tools as set_enabled_tool_names,
@@ -67,6 +72,28 @@ def safe_print(text):
         print(text, file=sys.stderr)
     except UnicodeEncodeError:
         print(text.encode("ascii", errors="replace").decode(), file=sys.stderr)
+
+
+def validate_tools_argument(tools):
+    """Reject an explicitly-empty --tools list.
+
+    ``--tools`` uses ``nargs="*"``, so a bare ``--tools`` (e.g. from the
+    Dockerfile's ``${TOOLS:+--tools $TOOLS}`` expansion when TOOLS is
+    whitespace) parses to ``[]`` — which is not ``None`` — and the server
+    would boot "healthy" with zero tool modules loaded. Fail fast with an
+    actionable message instead.
+
+    Raises SystemExit(2) when ``tools == []``; passes through otherwise.
+    """
+    if tools is not None and len(tools) == 0:
+        safe_print(
+            "❌ --tools was supplied with no service names. Either omit --tools "
+            "entirely (loads all default services) or pass at least one service "
+            "name, e.g. --tools gmail drive calendar. If using the Docker image, "
+            "check that the TOOLS env var is unset or contains service names "
+            "(not blank/whitespace)."
+        )
+        sys.exit(2)
 
 
 def configure_safe_logging():
@@ -164,6 +191,9 @@ def main():
     )
     args = parser.parse_args()
 
+    # An explicitly-empty --tools list would silently load zero tools.
+    validate_tools_argument(args.tools)
+
     # Stdio transport multiplexes JSON-RPC over stdout; banner text on stderr
     # is allowed but some clients still get confused, so we keep the old
     # suppression behaviour for stdio only. HTTP transport (Render, local
@@ -186,10 +216,7 @@ def main():
     safe_print("🔧 Google Workspace MCP Server")
     safe_print("=" * 35)
     safe_print("📋 Server Information:")
-    try:
-        version = metadata.version("workspace-mcp")
-    except metadata.PackageNotFoundError:
-        version = "dev"
+    version = get_package_version()
     safe_print(f"   📦 Version: {version}")
     safe_print(f"   🌐 Transport: {args.transport}")
     if args.transport == "streamable-http":

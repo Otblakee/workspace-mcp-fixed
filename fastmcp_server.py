@@ -148,6 +148,7 @@ import gchat.chat_tools
 import gforms.forms_tools
 import gslides.slides_tools
 import gtasks.tasks_tools
+import gcontacts.contacts_tools
 import gsearch.search_tools
 
 # Configure tool registration
@@ -164,6 +165,7 @@ all_services = [
     "forms",
     "slides",
     "tasks",
+    "contacts",
     "search",
 ]
 set_enabled_tools(all_services)  # Set enabled services for scopes
