@@ -402,6 +402,8 @@ export USER_GOOGLE_EMAIL=\
 | `WORKSPACE_MCP_HOST` | Server bind host | `0.0.0.0` |
 | `WORKSPACE_EXTERNAL_URL` | External URL for reverse proxy setups | None |
 | `WORKSPACE_ATTACHMENT_DIR` | Directory for downloaded attachments | `~/.workspace-mcp/attachments/` |
+| `ATTACHMENT_INLINE_MAX_BYTES` | Max Gmail attachment size returned inline as base64 in HTTP mode | `524288` (512 KiB) |
+| `ATTACHMENT_TRANSFER_FOLDER` | Drive folder path (from My Drive root) for over-cap Gmail attachment transfers | `Claude Inbox/_attachment-transfer` |
 | `GOOGLE_OAUTH_REDIRECT_URI` | Override OAuth callback URL | Auto-constructed |
 | `USER_GOOGLE_EMAIL` | Default auth email | None |
 
@@ -908,18 +910,16 @@ attachments=[{
 <details>
 <summary><b>📥 Downloaded Attachment Storage</b> <sub><sup>← Where downloaded files are saved</sup></sub></summary>
 
-When downloading Gmail attachments (`get_gmail_attachment_content`) or Drive files (`get_drive_file_download_url`), files are saved to a persistent local directory rather than a temporary folder in the working directory.
+**Gmail attachments are delivered statelessly** (`get_gmail_attachment_content`). In **HTTP mode**, attachments up to `ATTACHMENT_INLINE_MAX_BYTES` (default 512 KiB) are returned inline as base64 content; larger attachments are uploaded to the Drive folder set by `ATTACHMENT_TRANSFER_FOLDER` (default `Claude Inbox/_attachment-transfer`) in the user's own Drive, and the tool returns the Drive file ID and link to read back via the Drive tools. No server-local URLs are involved, so delivery survives restarts and multi-instance deployments. In **stdio mode**, the attachment is saved to local disk and the absolute path returned.
 
-**Default location:** `~/.workspace-mcp/attachments/`
+**Chat and Drive download tools** (`get_chat_attachment_content`, `get_drive_file_download_url`, `download_drive_file`) still use the local relay: files are saved under `WORKSPACE_ATTACHMENT_DIR` (default `~/.workspace-mcp/attachments/`) with their original filename plus a short UUID suffix (e.g., `invoice_a1b2c3d4.pdf`), and HTTP mode returns a `/attachments/{file_id}` download URL.
 
-Files are saved with their original filename plus a short UUID suffix for uniqueness (e.g., `invoice_a1b2c3d4.pdf`). In **stdio mode**, the tool returns the absolute file path for direct filesystem access. In **HTTP mode**, it returns a download URL via the `/attachments/{file_id}` endpoint.
+**Relay URL caveats:** `/attachments/{file_id}` URLs are instance-local — the metadata lives in process memory, so they do not survive a restart or redeploy and will 404 on any other instance behind a load balancer. Saved files expire after 1 hour and are cleaned up automatically.
 
-To customize the storage directory:
+To customize the relay storage directory:
 ```bash
 export WORKSPACE_ATTACHMENT_DIR="/path/to/custom/dir"
 ```
-
-Saved files expire after 1 hour and are cleaned up automatically.
 
 </details>
 

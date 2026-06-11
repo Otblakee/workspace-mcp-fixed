@@ -7,6 +7,7 @@ This module provides MCP tools for interacting with the Gmail API.
 import logging
 import asyncio
 import base64
+import os
 import ssl
 import mimetypes
 from html.parser import HTMLParser
@@ -20,7 +21,7 @@ from email.utils import formataddr
 
 from pydantic import Field
 
-from auth.service_decorator import require_google_service
+from auth.service_decorator import require_google_service, require_multiple_services
 from core.utils import handle_http_errors, validate_file_path
 from core.server import server
 from auth.scopes import (
@@ -839,20 +840,37 @@ async def get_gmail_messages_content_batch(
 
 @server.tool()
 @handle_http_errors(
-    "get_gmail_attachment_content", is_read_only=True, service_type="gmail"
+    "get_gmail_attachment_content", is_read_only=False, service_type="gmail"
 )
-@require_google_service("gmail", "gmail_read")
+@require_multiple_services(
+    [
+        {
+            "service_type": "gmail",
+            "scopes": "gmail_read",
+            "param_name": "gmail_service",
+        },
+        {
+            "service_type": "drive",
+            "scopes": "drive_file",
+            "param_name": "drive_service",
+        },
+    ]
+)
 async def get_gmail_attachment_content(
-    service,
+    gmail_service,
+    drive_service,
     message_id: str,
     attachment_id: str,
     user_google_email: str,
 ) -> str:
     """
-    Downloads an email attachment and saves it to local disk.
+    Downloads an email attachment and delivers it statelessly.
 
-    In stdio mode, returns the local file path for direct access.
-    In HTTP mode, returns a temporary download URL (valid for 1 hour).
+    In stdio mode, saves to local disk and returns the file path.
+    In HTTP mode, small attachments (<= ATTACHMENT_INLINE_MAX_BYTES,
+    default 512 KiB) are returned inline as base64; larger ones are
+    uploaded to a Drive transfer folder and the Drive file details are
+    returned. No instance-local /attachments/ URLs are minted.
     May re-fetch message metadata to resolve filename and MIME type.
 
     Args:
@@ -861,7 +879,8 @@ async def get_gmail_attachment_content(
         user_google_email (str): The user's Google email address. Required.
 
     Returns:
-        str: Attachment metadata with either a local file path or download URL.
+        str: Attachment metadata with a local file path, inline base64
+        content, or Drive transfer details.
     """
     logger.info(
         f"[get_gmail_attachment_content] Invoked. Message ID: '{message_id}', Email: '{user_google_email}'"
@@ -871,7 +890,7 @@ async def get_gmail_attachment_content(
     # to resolve filename and MIME type for the saved file.
     try:
         attachment = await asyncio.to_thread(
-            service.users()
+            gmail_service.users()
             .messages()
             .attachments()
             .get(userId="me", messageId=message_id, id=attachment_id)
@@ -910,110 +929,158 @@ async def get_gmail_attachment_content(
         )
         return "\n".join(result_lines)
 
-    # Save attachment to local disk and return file path
+    from core.config import get_transport_mode
+
+    instance = os.getenv("RENDER_INSTANCE_ID", "unknown")
+
+    # Try to get filename and mime type from message
+    filename = None
+    mime_type = None
     try:
-        from core.attachment_storage import get_attachment_storage, get_attachment_url
-        from core.config import get_transport_mode
+        # Use format="full" with fields to limit response to attachment metadata only
+        message_full = await asyncio.to_thread(
+            gmail_service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=message_id,
+                format="full",
+                fields="payload(parts(filename,mimeType,body(attachmentId,size)),body(attachmentId,size),filename,mimeType)",
+            )
+            .execute
+        )
+        payload = message_full.get("payload", {})
+        attachments = _extract_attachments(payload)
 
-        storage = get_attachment_storage()
+        # First try exact attachmentId match
+        for att in attachments:
+            if att.get("attachmentId") == attachment_id:
+                filename = att.get("filename")
+                mime_type = att.get("mimeType")
+                break
 
-        # Try to get filename and mime type from message
-        filename = None
-        mime_type = None
-        try:
-            # Use format="full" with fields to limit response to attachment metadata only
-            message_full = await asyncio.to_thread(
-                service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=message_id,
-                    format="full",
-                    fields="payload(parts(filename,mimeType,body(attachmentId,size)),body(attachmentId,size),filename,mimeType)",
+        # Fallback: match by size if exactly one attachment matches (IDs are ephemeral)
+        if not filename and attachments:
+            size_matches = [
+                att
+                for att in attachments
+                if att.get("size") and abs(att["size"] - size_bytes) < 100
+            ]
+            if len(size_matches) == 1:
+                filename = size_matches[0].get("filename")
+                mime_type = size_matches[0].get("mimeType")
+                logger.warning(
+                    f"Attachment {attachment_id} matched by size fallback as '{filename}'"
                 )
-                .execute
-            )
-            payload = message_full.get("payload", {})
-            attachments = _extract_attachments(payload)
 
-            # First try exact attachmentId match
-            for att in attachments:
-                if att.get("attachmentId") == attachment_id:
-                    filename = att.get("filename")
-                    mime_type = att.get("mimeType")
-                    break
-
-            # Fallback: match by size if exactly one attachment matches (IDs are ephemeral)
-            if not filename and attachments:
-                size_matches = [
-                    att
-                    for att in attachments
-                    if att.get("size") and abs(att["size"] - size_bytes) < 100
-                ]
-                if len(size_matches) == 1:
-                    filename = size_matches[0].get("filename")
-                    mime_type = size_matches[0].get("mimeType")
-                    logger.warning(
-                        f"Attachment {attachment_id} matched by size fallback as '{filename}'"
-                    )
-
-            # Last resort: if only one attachment, use its name
-            if not filename and len(attachments) == 1:
-                filename = attachments[0].get("filename")
-                mime_type = attachments[0].get("mimeType")
-        except Exception:
-            logger.debug(
-                f"Could not fetch attachment metadata for {attachment_id}, using defaults"
-            )
-
-        # Save attachment to local disk
-        result = storage.save_attachment(
-            base64_data=base64_data, filename=filename, mime_type=mime_type
+        # Last resort: if only one attachment, use its name
+        if not filename and len(attachments) == 1:
+            filename = attachments[0].get("filename")
+            mime_type = attachments[0].get("mimeType")
+    except Exception:
+        logger.debug(
+            f"Could not fetch attachment metadata for {attachment_id}, using defaults"
         )
 
+    if get_transport_mode() == "stdio":
+        # Save attachment to local disk and return file path
+        try:
+            from core.attachment_storage import get_attachment_storage
+
+            storage = get_attachment_storage()
+            result = storage.save_attachment(
+                base64_data=base64_data, filename=filename, mime_type=mime_type
+            )
+
+            result_lines = [
+                "Attachment downloaded successfully!",
+                f"Message ID: {message_id}",
+                f"Filename: {filename or 'unknown'}",
+                f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
+                f"\n📎 Saved to: {result.path}",
+                "\nThe file has been saved to disk and can be accessed directly via the file path.",
+                "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
+            ]
+
+            logger.info(
+                f"[get_gmail_attachment_content] Successfully saved {size_kb:.1f} KB "
+                f"attachment to {result.path} (instance={instance})"
+            )
+            return "\n".join(result_lines)
+
+        except Exception as e:
+            logger.error(
+                f"[get_gmail_attachment_content] Failed to save attachment: {e}",
+                exc_info=True,
+            )
+            # Fallback to showing base64 preview
+            result_lines = [
+                "Attachment downloaded successfully!",
+                f"Message ID: {message_id}",
+                f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
+                "\n⚠️ Failed to save attachment file. Showing preview instead.",
+                "\nBase64-encoded content (first 100 characters shown):",
+                f"{base64_data[:100]}...",
+                f"\nError: {str(e)}",
+                "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
+            ]
+            return "\n".join(result_lines)
+
+    # HTTP mode: stateless delivery. /attachments/ URLs are instance-local
+    # and die on restart, so return content inline (small) or transfer the
+    # bytes to the user's own Drive (large).
+    from core.attachment_transfer import (
+        get_inline_max_bytes,
+        upload_attachment_to_drive,
+    )
+
+    file_bytes = base64.urlsafe_b64decode(base64_data)
+    resolved_mime = mime_type or "application/octet-stream"
+
+    if len(file_bytes) <= get_inline_max_bytes():
+        encoded = base64.b64encode(file_bytes).decode("ascii")
         result_lines = [
             "Attachment downloaded successfully!",
             f"Message ID: {message_id}",
             f"Filename: {filename or 'unknown'}",
-            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
+            f"MIME type: {resolved_mime}",
+            f"Size: {size_kb:.1f} KB ({len(file_bytes)} bytes)",
+            "",
+            "--- BEGIN BASE64 CONTENT ---",
+            encoded,
+            "--- END BASE64 CONTENT ---",
+            "",
+            "Note: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
         ]
-
-        if get_transport_mode() == "stdio":
-            result_lines.append(f"\n📎 Saved to: {result.path}")
-            result_lines.append(
-                "\nThe file has been saved to disk and can be accessed directly via the file path."
-            )
-        else:
-            download_url = get_attachment_url(result.file_id)
-            result_lines.append(f"\n📎 Download URL: {download_url}")
-            result_lines.append("\nThe file will expire after 1 hour.")
-
-        result_lines.append(
-            "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch."
-        )
-
         logger.info(
-            f"[get_gmail_attachment_content] Successfully saved {size_kb:.1f} KB attachment to {result.path}"
+            f"[get_gmail_attachment_content] Returned {size_kb:.1f} KB attachment "
+            f"inline (instance={instance})"
         )
         return "\n".join(result_lines)
 
-    except Exception as e:
-        logger.error(
-            f"[get_gmail_attachment_content] Failed to save attachment: {e}",
-            exc_info=True,
-        )
-        # Fallback to showing base64 preview
-        result_lines = [
-            "Attachment downloaded successfully!",
-            f"Message ID: {message_id}",
-            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
-            "\n⚠️ Failed to save attachment file. Showing preview instead.",
-            "\nBase64-encoded content (first 100 characters shown):",
-            f"{base64_data[:100]}...",
-            f"\nError: {str(e)}",
-            "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
-        ]
-        return "\n".join(result_lines)
+    transferred = await upload_attachment_to_drive(
+        drive_service,
+        file_bytes=file_bytes,
+        filename=filename or f"gmail-attachment-{attachment_id[:8]}",
+        mime_type=resolved_mime,
+    )
+    result_lines = [
+        "Attachment transferred to Google Drive (too large to return inline).",
+        f"Message ID: {message_id}",
+        f"Drive file ID: {transferred.file_id}",
+        f"Drive file name: {transferred.name}",
+        f"Web view link: {transferred.web_view_link}",
+        f"Drive folder: {transferred.folder_path}",
+        f"Size: {size_kb:.1f} KB ({len(file_bytes)} bytes)",
+        "",
+        "Use the Drive tools (e.g. get_drive_file_content or download_drive_file) to read it back.",
+        "Note: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
+    ]
+    logger.info(
+        f"[get_gmail_attachment_content] Transferred {size_kb:.1f} KB attachment "
+        f"to Drive file {transferred.file_id} (instance={instance})"
+    )
+    return "\n".join(result_lines)
 
 
 @server.tool()
