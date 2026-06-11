@@ -54,6 +54,11 @@ class SecureFastMCP(FastMCP):
         """
         app = super().http_app(**kwargs)
         app.add_event_handler("startup", _ensure_audit_started)
+        # Graceful-shutdown drain: Render sends SIGTERM on every redeploy;
+        # uvicorn translates that into Starlette's shutdown event. Without
+        # this hook, up to AUDIT_FLUSH_INTERVAL_S of queued audit rows plus
+        # any backlog were silently dropped on each deploy.
+        app.add_event_handler("shutdown", _ensure_audit_stopped)
         return app
 
 
@@ -78,6 +83,24 @@ async def _ensure_audit_started() -> None:
         logger.error(
             "Audit logger failed to start; continuing without audit: %s", e
         )
+
+
+async def _ensure_audit_stopped() -> None:
+    """Idempotent, fail-soft graceful shutdown of the audit flusher.
+
+    Cancels the background flusher task and runs one final bounded
+    drain+flush of everything queued (AuditLogger.stop). Rows that can't
+    be written in time are dumped to stdout as AUDIT_FALLBACK rather than
+    silently lost with the process.
+    """
+    global _audit_started
+    if not _audit_started:
+        return
+    _audit_started = False
+    try:
+        await audit_logger().stop()
+    except Exception as e:
+        logger.error("Audit logger shutdown drain failed (non-fatal): %s", e)
 
 
 server = SecureFastMCP(
