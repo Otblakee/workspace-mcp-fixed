@@ -121,7 +121,8 @@ class AttachmentStorage:
                 os.close(fd)
             logger.info(
                 f"Saved attachment file_id={file_id} filename={filename or save_name} "
-                f"({len(file_bytes)} bytes) to {file_path}"
+                f"({len(file_bytes)} bytes) to {file_path} "
+                f"(instance={os.getenv('RENDER_INSTANCE_ID', 'local')})"
             )
         except Exception as e:
             logger.error(

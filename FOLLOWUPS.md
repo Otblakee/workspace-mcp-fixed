@@ -63,3 +63,34 @@ here for completeness because the audit module ships in a separate PR.
 first tool invocation, which works under both HTTP and stdio. If we ever move
 to a transport without a per-tool entry point, the lazy-start trick won't
 fire — switch to a FastMCP `lifespan` hook at that point.
+
+## Migrate remaining attachment tools to the stateless pattern
+
+`get_gmail_attachment_content` now delivers statelessly (inline base64 under
+`ATTACHMENT_INLINE_MAX_BYTES`, Drive transfer folder above it) and no longer
+mints `/attachments/{file_id}` URLs. The other three tools that mint relay
+URLs should follow the same pattern:
+
+- `get_chat_attachment_content` (gchat/chat_tools.py)
+- `get_drive_file_download_url` (gdrive/drive_tools.py)
+- `download_drive_file` (gdrive/drive_tools.py)
+
+Until then they share the relay's fragilities: instance-local metadata,
+1-hour expiry, dead URLs after restart/redeploy.
+
+## Persist AttachmentStorage metadata if the relay stays
+
+`AttachmentStorage._metadata` is an in-process dict, so every stored
+attachment 404s after a restart even when the file is still on disk. If the
+relay isn't fully retired by the migration above, persist the metadata as a
+JSON sidecar (e.g. `<file_id>.meta.json` next to each file, or one index
+file) so a restarted instance can keep serving unexpired files.
+
+## Ops: WORKSPACE_ATTACHMENT_DIR not set on the live Render service
+
+The live Render service logs show attachments being written to
+`/home/app/.workspace-mcp/attachments` — the in-code default — which means
+the `WORKSPACE_ATTACHMENT_DIR=/data/attachments` value from `render.yaml` is
+not actually set in the Render dashboard. Set it (or sync the dashboard env
+group with `render.yaml`) so relay files land on the persistent disk rather
+than the ephemeral container filesystem.

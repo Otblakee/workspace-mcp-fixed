@@ -489,21 +489,45 @@ async def health_check(request: Request):
 
 
 @server.custom_route("/attachments/{file_id}", methods=["GET"])
-async def serve_attachment(file_id: str):
-    """Serve a stored attachment file."""
+async def serve_attachment(request: Request):
+    """Serve a stored attachment file.
+
+    FastMCP custom routes are plain Starlette routes: Starlette calls the
+    endpoint with the Request as the only argument, so path params must be
+    read from ``request.path_params``.
+    """
     from core.attachment_storage import get_attachment_storage
 
+    file_id = request.path_params["file_id"]
     storage = get_attachment_storage()
     metadata = storage.get_attachment_metadata(file_id)
 
+    instance = os.getenv("RENDER_INSTANCE_ID", "unknown")
+    hint = (
+        "Gmail attachments are now returned inline or via Drive transfer; "
+        "re-run get_gmail_attachment_content instead of using /attachments/ URLs."
+    )
+
     if not metadata:
         return JSONResponse(
-            {"error": "Attachment not found or expired"}, status_code=404
+            {
+                "error": "Attachment not found or expired",
+                "instance": instance,
+                "hint": hint,
+            },
+            status_code=404,
         )
 
     file_path = storage.get_attachment_path(file_id)
     if not file_path:
-        return JSONResponse({"error": "Attachment file not found"}, status_code=404)
+        return JSONResponse(
+            {
+                "error": "Attachment file not found",
+                "instance": instance,
+                "hint": hint,
+            },
+            status_code=404,
+        )
 
     return FileResponse(
         path=str(file_path),
