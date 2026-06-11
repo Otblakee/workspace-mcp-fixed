@@ -168,6 +168,11 @@ def _format_body_content(text_body: str, html_body: str) -> str:
             content = content[:HTML_BODY_TRUNCATE_LIMIT] + "\n\n[Content truncated...]"
         return content
     elif text_stripped:
+        # Plain-text bodies get the same cap as HTML ones — thread/batch
+        # tools multiply per-message bodies, so unbounded text is a memory
+        # and context-window hazard.
+        if len(text_body) > HTML_BODY_TRUNCATE_LIMIT:
+            return text_body[:HTML_BODY_TRUNCATE_LIMIT] + "\n\n[Content truncated...]"
         return text_body
     else:
         return "[No readable content found]"
@@ -988,8 +993,13 @@ async def get_gmail_attachment_content(
             from core.attachment_storage import get_attachment_storage
 
             storage = get_attachment_storage()
-            result = storage.save_attachment(
-                base64_data=base64_data, filename=filename, mime_type=mime_type
+            # save_attachment decodes and writes the whole payload
+            # synchronously — keep it off the event loop.
+            result = await asyncio.to_thread(
+                storage.save_attachment,
+                base64_data=base64_data,
+                filename=filename,
+                mime_type=mime_type,
             )
 
             result_lines = [
