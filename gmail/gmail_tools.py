@@ -278,12 +278,15 @@ def _prepare_gmail_message(
         message = MIMEMultipart()
         message.attach(MIMEText(body, normalized_format))
 
-        # Process attachments
+        # Process attachments. Failures are collected and raised after the
+        # loop so the message is never sent with attachments silently missing.
+        failed_attachments: List[str] = []
         for attachment in attachments:
             file_path = attachment.get("path")
             filename = attachment.get("filename")
             content_base64 = attachment.get("content")
             mime_type = attachment.get("mime_type")
+            label = filename or file_path or "<unnamed attachment>"
 
             try:
                 # If path is provided, read and encode the file
@@ -291,6 +294,7 @@ def _prepare_gmail_message(
                     path_obj = validate_file_path(file_path)
                     if not path_obj.exists():
                         logger.error(f"File not found: {file_path}")
+                        failed_attachments.append(f"'{label}' (file not found)")
                         continue
 
                     # Read file content
@@ -310,7 +314,7 @@ def _prepare_gmail_message(
                 # If content is provided (base64), decode it
                 elif content_base64:
                     if not filename:
-                        logger.warning("Skipping attachment: missing filename")
+                        failed_attachments.append(f"'{label}' (missing filename)")
                         continue
 
                     file_data = base64.b64decode(content_base64)
@@ -319,11 +323,16 @@ def _prepare_gmail_message(
                         mime_type = "application/octet-stream"
 
                 else:
-                    logger.warning("Skipping attachment: missing both path and content")
+                    failed_attachments.append(
+                        f"'{label}' (missing both path and content)"
+                    )
                     continue
 
-                # Create MIME attachment
-                main_type, sub_type = mime_type.split("/", 1)
+                # Create MIME attachment (tolerate a slashless mime_type)
+                if "/" in mime_type:
+                    main_type, sub_type = mime_type.split("/", 1)
+                else:
+                    main_type, sub_type = "application", "octet-stream"
                 part = MIMEBase(main_type, sub_type)
                 part.set_payload(file_data)
                 encoders.encode_base64(part)
@@ -347,8 +356,15 @@ def _prepare_gmail_message(
                 message.attach(part)
                 logger.info(f"Attached file: {filename} ({len(file_data)} bytes)")
             except Exception as e:
-                logger.error(f"Failed to attach {filename or file_path}: {e}")
-                continue
+                logger.error(f"Failed to attach {label}: {e}")
+                failed_attachments.append(f"'{label}' ({e})")
+
+        if failed_attachments:
+            raise ValueError(
+                f"Failed to prepare {len(failed_attachments)} of "
+                f"{len(attachments)} attachment(s): {'; '.join(failed_attachments)}. "
+                "Message was not sent."
+            )
     else:
         message = MIMEText(body, normalized_format)
 
@@ -1507,10 +1523,7 @@ def _format_thread_content(thread_data: dict, thread_id: str) -> str:
 
     # Extract thread subject from the first message
     first_message = messages[0]
-    first_headers = {
-        h["name"]: h["value"]
-        for h in first_message.get("payload", {}).get("headers", [])
-    }
+    first_headers = _extract_headers(first_message.get("payload", {}), ["Subject"])
     thread_subject = first_headers.get("Subject", "(no subject)")
 
     # Build the thread content
@@ -1523,10 +1536,11 @@ def _format_thread_content(thread_data: dict, thread_id: str) -> str:
 
     # Process each message in the thread
     for i, message in enumerate(messages, 1):
-        # Extract headers
-        headers = {
-            h["name"]: h["value"] for h in message.get("payload", {}).get("headers", [])
-        }
+        # Extract headers case-insensitively (Outlook sends "Message-Id" etc.)
+        headers = _extract_headers(
+            message.get("payload", {}),
+            ["From", "Date", "Subject", "Message-ID", "In-Reply-To", "References"],
+        )
 
         sender = headers.get("From", "(unknown sender)")
         date = headers.get("Date", "(unknown date)")
@@ -1769,8 +1783,8 @@ async def manage_gmail_label(
     action: Literal["create", "update", "delete"],
     name: Optional[str] = None,
     label_id: Optional[str] = None,
-    label_list_visibility: Literal["labelShow", "labelHide"] = "labelShow",
-    message_list_visibility: Literal["show", "hide"] = "show",
+    label_list_visibility: Optional[Literal["labelShow", "labelHide"]] = None,
+    message_list_visibility: Optional[Literal["show", "hide"]] = None,
 ) -> str:
     """
     Manages Gmail labels: create, update, or delete labels.
@@ -1780,8 +1794,8 @@ async def manage_gmail_label(
         action (Literal["create", "update", "delete"]): Action to perform on the label.
         name (Optional[str]): Label name. Required for create, optional for update.
         label_id (Optional[str]): Label ID. Required for update and delete operations.
-        label_list_visibility (Literal["labelShow", "labelHide"]): Whether the label is shown in the label list.
-        message_list_visibility (Literal["show", "hide"]): Whether the label is shown in the message list.
+        label_list_visibility (Optional[Literal["labelShow", "labelHide"]]): Whether the label is shown in the label list. Defaults to "labelShow" on create; on update, None preserves the label's current setting.
+        message_list_visibility (Optional[Literal["show", "hide"]]): Whether the label is shown in the message list. Defaults to "show" on create; on update, None preserves the label's current setting.
 
     Returns:
         str: Confirmation message of the label operation.
@@ -1799,8 +1813,8 @@ async def manage_gmail_label(
     if action == "create":
         label_object = {
             "name": name,
-            "labelListVisibility": label_list_visibility,
-            "messageListVisibility": message_list_visibility,
+            "labelListVisibility": label_list_visibility or "labelShow",
+            "messageListVisibility": message_list_visibility or "show",
         }
         created_label = await asyncio.to_thread(
             service.users().labels().create(userId="me", body=label_object).execute
@@ -1815,8 +1829,12 @@ async def manage_gmail_label(
         label_object = {
             "id": label_id,
             "name": name if name is not None else current_label["name"],
-            "labelListVisibility": label_list_visibility,
-            "messageListVisibility": message_list_visibility,
+            "labelListVisibility": label_list_visibility
+            if label_list_visibility is not None
+            else current_label.get("labelListVisibility", "labelShow"),
+            "messageListVisibility": message_list_visibility
+            if message_list_visibility is not None
+            else current_label.get("messageListVisibility", "show"),
         }
 
         updated_label = await asyncio.to_thread(

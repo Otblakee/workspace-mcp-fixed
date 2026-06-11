@@ -771,13 +771,10 @@ async def insert_doc_elements(
         if not text:
             text = "List item"
 
-        # Insert text first, then create list
-        requests.extend(
-            [
-                create_insert_text_request(index, text + "\n"),
-                create_bullet_list_request(index, index + len(text), list_type),
-            ]
-        )
+        # Insert text first, then create list. create_bullet_list_request
+        # returns a list of requests, so extend rather than nest it.
+        requests.append(create_insert_text_request(index, text + "\n"))
+        requests.extend(create_bullet_list_request(index, index + len(text), list_type))
         description = f"{list_type.lower()} list"
 
     elif element_type == "page_break":
