@@ -127,6 +127,45 @@ class TestShutdownDrain:
         assert logger._task is None
 
     @pytest.mark.asyncio
+    async def test_stop_lets_in_flight_flush_finish_without_duplicates(
+        self, audit_logger_factory, monkeypatch, caplog
+    ):
+        """stop() must signal the loop and WAIT for an in-flight flush, not
+        cancel it: cancelling the awaiter doesn't stop the underlying Sheets
+        thread, so a redeploy overlapping a flush could append the rows AND
+        fallback-dump them — duplicate audit records. (Codex P2 on PR #19.)"""
+        from core import audit
+
+        appended: list = []
+        flush_started = asyncio.Event()
+        release_flush = asyncio.Event()
+
+        async def slow_flush(self, batch):
+            flush_started.set()
+            await release_flush.wait()
+            appended.extend(batch)
+            return []
+
+        monkeypatch.setattr(audit.AuditLogger, "_flush", slow_flush)
+        monkeypatch.setattr(audit, "FLUSH_S", 0.01)
+
+        logger = audit_logger_factory()
+        await logger.start()
+        logger.submit({"user": "alice@otb.co.uk", "tool": "inflight"})
+        await asyncio.wait_for(flush_started.wait(), timeout=2)
+
+        with caplog.at_level("ERROR", logger="core.audit"):
+            stop_task = asyncio.create_task(logger.stop())
+            await asyncio.sleep(0.05)
+            # stop() is waiting on the in-flight flush, not cancelling it.
+            assert not stop_task.done()
+            release_flush.set()
+            await asyncio.wait_for(stop_task, timeout=2)
+
+        assert [e["tool"] for e in appended] == ["inflight"]
+        assert "AUDIT_FALLBACK" not in caplog.text
+
+    @pytest.mark.asyncio
     async def test_stop_is_idempotent_and_safe_without_start(
         self, audit_logger_factory
     ):

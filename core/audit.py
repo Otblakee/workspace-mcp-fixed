@@ -344,11 +344,13 @@ class AuditLogger:
         self._task = None
         self._current_tab = None
         self._tick = 0
+        self._stop_event = asyncio.Event()
 
     async def start(self):
         if not ENABLED:
             log.warning("Audit DISABLED — missing AUDIT_SHEET_ID")
             return
+        self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._loop())
         log.info("Audit started → sheet %s", AUDIT_SHEET_ID)
 
@@ -361,7 +363,7 @@ class AuditLogger:
             log.error("AUDIT_DROP %s", json.dumps(entry))
 
     async def stop(self):
-        """Graceful shutdown: cancel the flusher, then drain everything queued.
+        """Graceful shutdown: signal the flusher to exit, then drain the queue.
 
         Called from the Starlette shutdown event (Render SIGTERM → uvicorn
         graceful shutdown) and from CLI mode before the event loop exits.
@@ -373,19 +375,42 @@ class AuditLogger:
         unwritten when the budget expires is dumped to stdout as
         AUDIT_FALLBACK so rows are never silently lost. Idempotent and
         fail-soft."""
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
         task, self._task = self._task, None
         if task is not None:
-            task.cancel()
+            # Signal the loop to exit at its next safe point instead of
+            # cancelling outright: cancelling an await on
+            # asyncio.to_thread(...append().execute) does NOT stop the
+            # underlying Sheets request thread, so a blind cancel mid-flush
+            # could both write the rows AND fallback-dump them (duplicate
+            # audit records). Letting an in-flight flush finish keeps the
+            # record exactly-once in the common case.
+            self._stop_event.set()
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(task, timeout=SHUTDOWN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                # Sheets is wedged mid-flush; force-cancel. _drain's
+                # CancelledError path dumps the in-flight batch — possible
+                # duplicates, but rows-never-lost beats never-duplicated
+                # in this last-resort path.
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    log.debug(
+                        "Audit flusher task ended with error during stop: %s", e
+                    )
             except Exception as e:
                 log.debug("Audit flusher task ended with error during stop: %s", e)
         if self.q.empty():
             return
+        # Give the final drain whatever budget the task-wait left, with a
+        # small floor so it always gets one real attempt.
+        remaining = max(deadline - time.monotonic(), min(1.0, SHUTDOWN_TIMEOUT_S))
         try:
-            await asyncio.wait_for(self._drain(), timeout=SHUTDOWN_TIMEOUT_S)
+            await asyncio.wait_for(self._drain(), timeout=remaining)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             log.error(
                 "Audit shutdown drain exceeded %ss — dumping remaining rows to stdout",
@@ -401,7 +426,14 @@ class AuditLogger:
 
     async def _loop(self):
         while True:
-            await asyncio.sleep(FLUSH_S)
+            # Interruptible sleep: stop() sets the event so shutdown doesn't
+            # wait out the tick interval, and the loop exits at a safe point
+            # (never mid-flush) — stop() runs the final drain itself.
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=FLUSH_S)
+                return
+            except asyncio.TimeoutError:
+                pass
             self._tick += 1
             if self._tick % self._SWEEP_EVERY_N_TICKS == 0:
                 # The sweep does disk unlinks and takes the OAuth21 session
