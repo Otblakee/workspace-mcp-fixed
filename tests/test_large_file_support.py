@@ -280,7 +280,7 @@ class TestConfirmDriveUpload:
             service=service,
             user_google_email="u@example.com",
             file_id="drive-file-abc",
-            upload_uri="https://example.invalid/x",
+            upload_uri="https://www.googleapis.com/upload/drive/v3/files?upload_id=X",
         )
         assert "Upload status: incomplete" in result
         assert "bytes_received: 500" in result
@@ -303,7 +303,7 @@ class TestConfirmDriveUpload:
             service=service,
             user_google_email="u@example.com",
             file_id="drive-file-abc",
-            upload_uri="https://example.invalid/x",
+            upload_uri="https://www.googleapis.com/upload/drive/v3/files?upload_id=X",
         )
         assert "Upload status: incomplete" in result
         assert "bytes_received: 0" in result
@@ -327,7 +327,7 @@ class TestConfirmDriveUpload:
             service=service,
             user_google_email="u@example.com",
             file_id="drive-file-abc",
-            upload_uri="https://expired.invalid/x",
+            upload_uri="https://www.googleapis.com/upload/drive/v3/files?upload_id=EXPIRED",
         )
         assert "Upload status: failed" in result
         assert "expired or not found" in result
@@ -345,7 +345,7 @@ class TestConfirmDriveUpload:
                 service=service,
                 user_google_email="u@example.com",
                 file_id="",
-                upload_uri="https://example.invalid/x",
+                upload_uri="https://www.googleapis.com/upload/drive/v3/files?upload_id=X",
             )
         with pytest.raises(Exception, match="upload_uri is required"):
             await impl(

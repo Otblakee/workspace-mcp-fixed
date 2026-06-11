@@ -49,6 +49,15 @@ logger = logging.getLogger(__name__)
 
 configure_file_logging()
 
+# Modules excluded from the "default-load all tools" behaviour. Operators
+# must opt in explicitly via the TOOLS env var (or --tools CLI arg).
+# - gadmin: requires OAuth consent screen entries and Workspace domain-wide
+#   delegation; see gadmin/admin_tools.py for prerequisites.
+# - appscript: per CLAUDE.md hard rule, must never be enabled until audit
+#   logging has been live and reviewed for 30 days. Keeping it out of the
+#   default load means a wiped TOOLS env var fails safe.
+OPT_IN_TOOLS = {"gadmin", "appscript"}
+
 
 # Set to True after argparse if running with --transport stdio. In stdio
 # mode, any byte on stderr risks corrupting clients that parse stdout JSON
@@ -306,12 +315,6 @@ def main():
         "appscript": "📜",
         "gadmin": "🛡️",
     }
-
-    # Modules excluded from the "default-load all tools" behaviour. Operators
-    # must opt in explicitly via the TOOLS env var (or --tools CLI arg) once
-    # the necessary OAuth consent screen entries and Workspace domain-wide
-    # delegation are in place. See gadmin/admin_tools.py for prerequisites.
-    OPT_IN_TOOLS = {"gadmin"}
 
     def _tools_in_services(services):
         """Return every tool name declared under the given services in

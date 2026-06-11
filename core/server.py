@@ -567,10 +567,13 @@ async def serve_attachment(request: Request):
             status_code=404,
         )
 
+    # Capability URL: possession of the UUID is the only access control,
+    # so make sure intermediaries never cache the response.
     return FileResponse(
         path=str(file_path),
         filename=metadata["filename"],
         media_type=metadata["mime_type"],
+        headers={"Cache-Control": "no-store"},
     )
 
 

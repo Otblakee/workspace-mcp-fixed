@@ -319,9 +319,15 @@ async def get_authenticated_google_service_oauth21(
         )
 
     if not credentials.scopes:
-        scopes_available = set(required_scopes)
-    else:
-        scopes_available = set(credentials.scopes)
+        # Unknown scopes can never satisfy the check. Substituting the
+        # required set here would disable the scope gate exactly when we
+        # know least about the token.
+        raise GoogleAuthenticationError(
+            f"OAuth 2.1 credentials for {user_google_email} have no recorded "
+            f"scopes, so required scopes {required_scopes} cannot be "
+            f"verified. Re-authenticate to refresh the session."
+        )
+    scopes_available = set(credentials.scopes)
 
     if not has_required_scopes(scopes_available, required_scopes):
         raise GoogleAuthenticationError(

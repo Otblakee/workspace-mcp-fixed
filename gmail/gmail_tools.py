@@ -234,6 +234,16 @@ def _extract_headers(payload: dict, header_names: List[str]) -> Dict[str, str]:
     return headers
 
 
+def _sanitize_header_value(value: Optional[str]) -> Optional[str]:
+    """Strip CR/LF/NUL so caller-supplied values cannot smuggle extra
+    headers. compat32 Message does not validate header values, so a
+    subject like 'Hi\\r\\nBcc: x@evil.com' would otherwise be serialized
+    verbatim and honoured by Gmail."""
+    if value is None:
+        return None
+    return value.replace("\r", "").replace("\n", "").replace("\x00", "")
+
+
 def _prepare_gmail_message(
     subject: str,
     body: str,
@@ -373,33 +383,31 @@ def _prepare_gmail_message(
     else:
         message = MIMEText(body, normalized_format)
 
-    message["Subject"] = reply_subject
+    message["Subject"] = _sanitize_header_value(reply_subject)
 
     # Add sender if provided
     if from_email:
         if from_name:
-            # Sanitize from_name to prevent header injection
-            safe_name = (
-                from_name.replace("\r", "").replace("\n", "").replace("\x00", "")
+            message["From"] = formataddr(
+                (_sanitize_header_value(from_name), _sanitize_header_value(from_email))
             )
-            message["From"] = formataddr((safe_name, from_email))
         else:
-            message["From"] = from_email
+            message["From"] = _sanitize_header_value(from_email)
 
     # Add recipients if provided
     if to:
-        message["To"] = to
+        message["To"] = _sanitize_header_value(to)
     if cc:
-        message["Cc"] = cc
+        message["Cc"] = _sanitize_header_value(cc)
     if bcc:
-        message["Bcc"] = bcc
+        message["Bcc"] = _sanitize_header_value(bcc)
 
     # Add reply headers for threading
     if in_reply_to:
-        message["In-Reply-To"] = in_reply_to
+        message["In-Reply-To"] = _sanitize_header_value(in_reply_to)
 
     if references:
-        message["References"] = references
+        message["References"] = _sanitize_header_value(references)
 
     # Encode message
     raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
@@ -1089,6 +1097,7 @@ async def get_gmail_attachment_content(
         file_bytes=file_bytes,
         filename=filename or f"gmail-attachment-{attachment_id[:8]}",
         mime_type=resolved_mime,
+        user_email=user_google_email,
     )
     result_lines = [
         "Attachment transferred to Google Drive (too large to return inline).",

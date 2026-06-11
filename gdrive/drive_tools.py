@@ -1368,6 +1368,21 @@ async def import_to_google_doc(
 
     # Handle file_path (local file)
     elif file_path is not None:
+        # Same gate as create_drive_file's file:// branch: in streamable-http
+        # mode "local" means the *server's* filesystem, which must not be
+        # readable by remote MCP clients (it holds OAuth credential caches).
+        if get_transport_mode() == "streamable-http":
+            logger.warning(
+                "[import_to_google_doc] file_path rejected: server is in "
+                "streamable-http mode and cannot reach the caller's filesystem."
+            )
+            raise Exception(
+                "file_path / file:// URLs are not supported for remote MCP "
+                "clients. The MCP server cannot access files in your local "
+                "execution environment. Pass the file text via `content`, "
+                "fetch it from a URL via `file_url`, or upload it with "
+                "`create_drive_file` using `base64_content`."
+            )
         parsed_url = urlparse(file_path)
 
         # Handle file:// URL format
@@ -2904,6 +2919,20 @@ async def confirm_drive_upload(
         raise Exception("file_id is required.")
     if not upload_uri or not upload_uri.strip():
         raise Exception("upload_uri is required.")
+
+    # The user's OAuth token is attached to the request below, so the
+    # target must be a Google-issued upload endpoint — a caller-supplied
+    # URI pointing anywhere else would exfiltrate a live Drive token.
+    parsed_upload = urlparse(upload_uri.strip())
+    upload_host = (parsed_upload.hostname or "").lower()
+    if parsed_upload.scheme != "https" or not (
+        upload_host == "googleapis.com" or upload_host.endswith(".googleapis.com")
+    ):
+        raise Exception(
+            "upload_uri must be an https://*.googleapis.com URL issued by "
+            "create_drive_upload_session. Refusing to send credentials to "
+            "any other host."
+        )
 
     access_token = await _ensure_fresh_token(service)
     # Per the resumable-upload spec, a status query is a PUT with
