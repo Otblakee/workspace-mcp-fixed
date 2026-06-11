@@ -94,6 +94,15 @@ class OAuth21SessionStore:
                 state[:8] if len(state) > 8 else state,
             )
 
+    def cleanup_expired_state(self) -> None:
+        """Remove expired OAuth state entries.
+
+        Public, thread-safe wrapper around the locked cleanup helper for
+        external callers (e.g. the audit flusher's periodic memory sweep)
+        so they don't need to reach through the store's private lock."""
+        with self._lock:
+            self._cleanup_expired_oauth_states_locked()
+
     def store_oauth_state(
         self,
         state: str,

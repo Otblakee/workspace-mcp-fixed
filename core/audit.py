@@ -26,6 +26,11 @@ log = logging.getLogger(__name__)
 AUDIT_SHEET_ID = os.environ.get("AUDIT_SHEET_ID", "")
 FLUSH_S = int(os.environ.get("AUDIT_FLUSH_INTERVAL_S", "30"))
 BATCH = int(os.environ.get("AUDIT_BATCH_SIZE", "50"))
+# Upper bound on the final drain+flush performed at graceful shutdown
+# (Render SIGTERM → Starlette shutdown event). Rows that can't be written
+# within this budget are dumped to stdout as AUDIT_FALLBACK instead of
+# being silently dropped with the process.
+SHUTDOWN_TIMEOUT_S = float(os.environ.get("AUDIT_SHUTDOWN_FLUSH_TIMEOUT_S", "10"))
 DEFAULT_USER = os.environ.get("DEFAULT_USER", "oli")
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
@@ -50,6 +55,10 @@ SERVICE_MAP = {"drive": "drive", "gmail": "gmail", "calendar": "calendar",
 SENSITIVE = {"body", "text_content", "message_body", "html_body", "values",
              "data", "content", "notes", "description", "subject", "query",
              "base64_content", "fileUrl", "attachments",
+             # Gmail's native RFC822 send format ("raw" message bytes,
+             # base64url). String truncation alone would still leak the
+             # first ~150 bytes of headers (From/To/Subject).
+             "raw",
              # Resumable upload session URIs are short-lived bearer-equivalent
              # tokens — anyone with one can PUT bytes to the in-flight upload.
              "upload_uri"}
@@ -335,11 +344,13 @@ class AuditLogger:
         self._task = None
         self._current_tab = None
         self._tick = 0
+        self._stop_event = asyncio.Event()
 
     async def start(self):
         if not ENABLED:
             log.warning("Audit DISABLED — missing AUDIT_SHEET_ID")
             return
+        self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._loop())
         log.info("Audit started → sheet %s", AUDIT_SHEET_ID)
 
@@ -351,25 +362,138 @@ class AuditLogger:
         except asyncio.QueueFull:
             log.error("AUDIT_DROP %s", json.dumps(entry))
 
+    async def stop(self):
+        """Graceful shutdown: signal the flusher to exit, then drain the queue.
+
+        Called from the Starlette shutdown event (Render SIGTERM → uvicorn
+        graceful shutdown) and from CLI mode before the event loop exits.
+        Without this, up to FLUSH_S seconds of queued rows plus any backlog
+        were dropped on every redeploy without even the AUDIT_FALLBACK
+        stdout path firing.
+
+        The final drain is bounded by SHUTDOWN_TIMEOUT_S; anything still
+        unwritten when the budget expires is dumped to stdout as
+        AUDIT_FALLBACK so rows are never silently lost. Idempotent and
+        fail-soft."""
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
+        task, self._task = self._task, None
+        if task is not None:
+            # Signal the loop to exit at its next safe point instead of
+            # cancelling outright: cancelling an await on
+            # asyncio.to_thread(...append().execute) does NOT stop the
+            # underlying Sheets request thread, so a blind cancel mid-flush
+            # could both write the rows AND fallback-dump them (duplicate
+            # audit records). Letting an in-flight flush finish keeps the
+            # record exactly-once in the common case.
+            self._stop_event.set()
+            try:
+                await asyncio.wait_for(task, timeout=SHUTDOWN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                # Sheets is wedged mid-flush; force-cancel. _drain's
+                # CancelledError path dumps the in-flight batch — possible
+                # duplicates, but rows-never-lost beats never-duplicated
+                # in this last-resort path.
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    log.debug(
+                        "Audit flusher task ended with error during stop: %s", e
+                    )
+            except Exception as e:
+                log.debug("Audit flusher task ended with error during stop: %s", e)
+        if self.q.empty():
+            return
+        # Give the final drain whatever budget the task-wait left, with a
+        # small floor so it always gets one real attempt.
+        remaining = max(deadline - time.monotonic(), min(1.0, SHUTDOWN_TIMEOUT_S))
+        try:
+            await asyncio.wait_for(self._drain(), timeout=remaining)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            log.error(
+                "Audit shutdown drain exceeded %ss — dumping remaining rows to stdout",
+                SHUTDOWN_TIMEOUT_S,
+            )
+        except Exception as e:
+            log.error(
+                "Audit shutdown drain failed (%s) — dumping remaining rows to stdout", e
+            )
+        # Whatever the drain couldn't write (timeout, flush error, leftover
+        # backlog) goes to stdout so the rows survive in the Render logs.
+        self._fallback_dump_queue()
+
     async def _loop(self):
         while True:
-            await asyncio.sleep(FLUSH_S)
+            # Interruptible sleep: stop() sets the event so shutdown doesn't
+            # wait out the tick interval, and the loop exits at a safe point
+            # (never mid-flush) — stop() runs the final drain itself.
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=FLUSH_S)
+                return
+            except asyncio.TimeoutError:
+                pass
             self._tick += 1
             if self._tick % self._SWEEP_EVERY_N_TICKS == 0:
-                _run_periodic_memory_sweeps()
-            batch = []
-            while not self.q.empty() and len(batch) < BATCH:
-                batch.append(self.q.get_nowait())
-            if not batch:
-                continue
+                # The sweep does disk unlinks and takes the OAuth21 session
+                # store's *threading* lock — run it off the event loop so a
+                # contended lock or slow filesystem can't stall the server.
+                try:
+                    await asyncio.to_thread(_run_periodic_memory_sweeps)
+                except Exception as e:
+                    log.debug("Periodic memory sweep failed: %s", e)
+            await self._drain()
+
+    def _take_batch(self) -> list:
+        batch = []
+        while not self.q.empty() and len(batch) < BATCH:
+            batch.append(self.q.get_nowait())
+        return batch
+
+    def _fallback_dump_queue(self) -> None:
+        """Dump every still-queued entry to stdout as AUDIT_FALLBACK."""
+        while not self.q.empty():
             try:
-                await self._flush(batch)
+                log.error("AUDIT_FALLBACK %s", json.dumps(self.q.get_nowait()))
+            except asyncio.QueueEmpty:
+                break
+
+    async def _drain(self):
+        """Flush BATCH-sized chunks until the queue is empty or a flush raises.
+
+        Previously each tick wrote at most one batch (~100 rows/min at the
+        defaults), so a burst backlogged the 5000-slot queue for up to 50
+        minutes, during which ``submit`` dropped rows with AUDIT_DROP.
+
+        Rows that ``_flush`` could not write (no usable creds, append
+        failure) are fallback-logged to stdout — and ONLY those rows, so
+        successfully written rows never appear twice. If ``_flush`` itself
+        raises, the in-flight batch is fallback-logged and draining stops;
+        anything still queued waits for the next tick (or the shutdown
+        dump)."""
+        while True:
+            batch = self._take_batch()
+            if not batch:
+                return
+            try:
+                unwritten = await self._flush(batch)
+            except asyncio.CancelledError:
+                # Shutdown-timeout cancellation mid-flush: the in-flight
+                # batch is no longer in the queue, so dump it here before
+                # propagating — otherwise these rows would vanish.
+                for entry in batch:
+                    log.error("AUDIT_FALLBACK %s", json.dumps(entry))
+                raise
             except Exception as e:
                 log.error("Audit flush failed (%s) — falling back to stdout", e)
                 for entry in batch:
                     log.error("AUDIT_FALLBACK %s", json.dumps(entry))
+                return
+            for entry in unwritten:
+                log.error("AUDIT_FALLBACK %s", json.dumps(entry))
 
-    async def _flush(self, batch):
+    async def _flush(self, batch) -> list:
         # Group entries by attributed user. Each user's rows are written with
         # that user's own OAuth credentials so Sheets revision history matches
         # the actor recorded in the row, and so one teammate's audit data is
@@ -412,10 +536,18 @@ class AuditLogger:
                 await asyncio.to_thread(sheets.close)
                 gc.collect()
 
+        # Partial failure: return the unwritten entries instead of raising.
+        # Raising here used to make the caller stdout-dump the ENTIRE batch
+        # as AUDIT_FALLBACK even though other users' rows had already been
+        # appended to the Sheet — double-logging the written rows and making
+        # the error text contradict the dump. The caller now fallback-logs
+        # exactly what's returned.
         if unwritten:
-            raise RuntimeError(
-                f"audit flush: {len(unwritten)} of {len(batch)} rows had no usable user creds"
+            log.warning(
+                "audit flush: %d of %d rows had no usable user creds",
+                len(unwritten), len(batch),
             )
+        return unwritten
 
     def _build_sheets_for_user(self, email: str):
         """Fresh Sheets client built from the named user's OAuth credentials.
@@ -494,6 +626,10 @@ def _run_periodic_memory_sweeps() -> None:
     Collected here because the audit logger is the only always-on async task
     in the server. Each sweep is fail-soft so a broken one can't take down
     the loop.
+
+    Runs synchronously (file unlinks + the session store's threading RLock)
+    — the caller is expected to dispatch it via ``asyncio.to_thread`` so it
+    never blocks the event loop.
     """
     try:
         from core.attachment_storage import get_attachment_storage
@@ -505,9 +641,9 @@ def _run_periodic_memory_sweeps() -> None:
     try:
         from auth.oauth21_session_store import get_oauth21_session_store
         store = get_oauth21_session_store()
-        # Cleanup expired OAuth states (already locked-and-locked-down by store).
-        with store._lock:  # safe: same RLock used internally everywhere
-            store._cleanup_expired_oauth_states_locked()
+        # Cleanup expired OAuth states via the store's public API (takes its
+        # own lock internally — no private-member reach-through from here).
+        store.cleanup_expired_state()
         # Sweep orphaned MCP→user mappings whose backing session was deleted
         # elsewhere; bounded work.
         store.cleanup_orphaned_mappings()

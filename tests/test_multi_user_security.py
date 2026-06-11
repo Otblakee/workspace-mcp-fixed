@@ -367,15 +367,21 @@ class TestAuditPerUserAttribution:
             {"user": "bob@otb.co.uk", "tool": "y", "service": "gmail"},
             {"user": "alice@otb.co.uk", "tool": "z", "service": "drive"},
         ]
-        await logger._flush(batch)
+        unwritten = await logger._flush(batch)
+        assert unwritten == []  # everything written, nothing for fallback
 
         # Each distinct user got its own client; ordering doesn't matter.
         assert sorted(clients_built_for) == ["alice@otb.co.uk", "bob@otb.co.uk"]
 
     @pytest.mark.asyncio
-    async def test_flush_raises_when_some_users_have_no_creds(self, monkeypatch):
-        """Partial credential failures must surface — _loop's exception
-        handler falls those rows back to stdout."""
+    async def test_flush_returns_only_unwritten_rows_on_partial_creds(
+        self, monkeypatch
+    ):
+        """Partial credential failures must surface — _flush returns exactly
+        the rows it could not write so the caller fallback-logs ONLY those.
+        (It used to raise RuntimeError, which made _loop stdout-dump the
+        ENTIRE batch — double-logging the rows already appended to the
+        Sheet.)"""
         from core import audit
 
         monkeypatch.setattr(audit, "AUDIT_SHEET_ID", "sheet-test")
@@ -402,5 +408,5 @@ class TestAuditPerUserAttribution:
             {"user": "alice@otb.co.uk", "tool": "x"},
             {"user": "bob@otb.co.uk", "tool": "y"},
         ]
-        with pytest.raises(RuntimeError, match="no usable user creds"):
-            await logger._flush(batch)
+        unwritten = await logger._flush(batch)
+        assert unwritten == [{"user": "bob@otb.co.uk", "tool": "y"}]

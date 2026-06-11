@@ -408,3 +408,15 @@ async def handle_cli_mode(server, cli_args: List[str]) -> int:
         logger.error(f"[CLI] Unexpected error: {e}", exc_info=True)
         print(f"Error: {e}", file=sys.stderr)
         return 1
+    finally:
+        # CLI mode exits via asyncio.run() long before the audit flusher's
+        # first 30s tick, so without an explicit final drain no CLI tool
+        # invocation would ever reach the audit Sheet. Same graceful-stop
+        # routine the HTTP server runs on shutdown; fail-soft so audit
+        # problems never change the CLI exit code.
+        try:
+            from core.audit import logger as audit_logger
+
+            await audit_logger().stop()
+        except Exception as e:
+            logger.warning(f"[CLI] Audit shutdown drain failed (non-fatal): {e}")
