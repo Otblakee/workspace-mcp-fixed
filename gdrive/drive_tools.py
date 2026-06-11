@@ -55,6 +55,19 @@ MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB safety limit for URL downloa
 MAX_BASE64_INPUT_BYTES = 64 * 1024 * 1024
 # Decode base64 in 4 MB ASCII windows (each yields ~3 MB binary).
 _BASE64_DECODE_CHUNK = 4 * 1024 * 1024
+# get_drive_file_download_url buffers the whole file in memory (plus a
+# base64 round-trip), so it must refuse very large files up-front and
+# direct callers to the streaming download_drive_file tool instead.
+INLINE_DOWNLOAD_MAX_BYTES = int(
+    os.getenv("WORKSPACE_INLINE_DOWNLOAD_MAX_BYTES", str(50 * 1024 * 1024))
+)
+# get_drive_file_content buffers the whole file in memory to decode it as
+# text; binary content is discarded anyway, so cap it lower.
+CONTENT_MAX_BYTES = int(
+    os.getenv("WORKSPACE_CONTENT_MAX_BYTES", str(25 * 1024 * 1024))
+)
+# Cap for import_to_google_doc's file_url branch (spooled to temp file).
+MAX_IMPORT_URL_BYTES = 50 * 1024 * 1024
 
 
 @server.tool()
@@ -167,11 +180,31 @@ async def get_drive_file_content(
     resolved_file_id, file_metadata = await resolve_drive_item(
         service,
         file_id,
-        extra_fields="name, webViewLink",
+        extra_fields="name, webViewLink, size",
     )
     file_id = resolved_file_id
     mime_type = file_metadata.get("mimeType", "")
     file_name = file_metadata.get("name", "Unknown File")
+
+    # Memory guard: this tool buffers the whole file in RAM to decode it as
+    # text. Refuse very large files up-front (native Google files report no
+    # size and are exported as text, so they pass through).
+    size_value = file_metadata.get("size")
+    if size_value is not None:
+        try:
+            declared_size = int(size_value)
+        except (TypeError, ValueError):
+            declared_size = None
+        if declared_size is not None and declared_size > CONTENT_MAX_BYTES:
+            return (
+                f'File "{file_name}" (ID: {file_id}) is {declared_size} bytes, '
+                f"which exceeds the {CONTENT_MAX_BYTES} byte "
+                f"({CONTENT_MAX_BYTES // (1024 * 1024)} MB) limit for in-memory "
+                "content extraction. Files this large are almost always binary; "
+                "use `download_drive_file` to stream it to disk instead, or "
+                "raise the limit via the WORKSPACE_CONTENT_MAX_BYTES env var."
+            )
+
     export_mime_type = {
         "application/vnd.google-apps.document": "text/plain",
         "application/vnd.google-apps.spreadsheet": "text/csv",
@@ -186,7 +219,9 @@ async def get_drive_file_content(
         else service.files().get_media(fileId=file_id, supportsAllDrives=True)
     )
     fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request_obj)
+    # Explicit chunksize: MediaIoBaseDownload's default is 100 MB per chunk,
+    # which spikes memory; 4 MB (env-tunable) keeps peak RSS bounded.
+    downloader = MediaIoBaseDownload(fh, request_obj, chunksize=_DOWNLOAD_STREAM_CHUNK)
     loop = asyncio.get_event_loop()
     done = False
     while not done:
@@ -275,11 +310,32 @@ async def get_drive_file_download_url(
     resolved_file_id, file_metadata = await resolve_drive_item(
         service,
         file_id,
-        extra_fields="name, webViewLink, mimeType",
+        extra_fields="name, webViewLink, mimeType, size",
     )
     file_id = resolved_file_id
     mime_type = file_metadata.get("mimeType", "")
     file_name = file_metadata.get("name", "Unknown File")
+
+    # Memory guard: this tool buffers the whole file in memory and then
+    # base64-round-trips it (~4x peak). Refuse very large files up-front and
+    # point callers at the streaming download_drive_file tool. Native Google
+    # files report no size and export to modest formats, so they pass.
+    size_value = file_metadata.get("size")
+    if size_value is not None:
+        try:
+            declared_size = int(size_value)
+        except (TypeError, ValueError):
+            declared_size = None
+        if declared_size is not None and declared_size > INLINE_DOWNLOAD_MAX_BYTES:
+            return (
+                f'File "{file_name}" (ID: {file_id}) is {declared_size} bytes, '
+                f"which exceeds the {INLINE_DOWNLOAD_MAX_BYTES} byte "
+                f"({INLINE_DOWNLOAD_MAX_BYTES // (1024 * 1024)} MB) limit for "
+                "this in-memory download path. Use the `download_drive_file` "
+                "tool instead — it streams the file to disk in chunks and "
+                "handles any size. You can raise this limit via the "
+                "WORKSPACE_INLINE_DOWNLOAD_MAX_BYTES env var."
+            )
 
     # Determine export format for Google native files
     export_mime_type = None
@@ -345,7 +401,7 @@ async def get_drive_file_download_url(
     )
 
     fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request_obj)
+    downloader = MediaIoBaseDownload(fh, request_obj, chunksize=_DOWNLOAD_STREAM_CHUNK)
     loop = asyncio.get_event_loop()
     done = False
     while not done:
@@ -379,8 +435,10 @@ async def get_drive_file_download_url(
         # Encode bytes to base64 (as expected by AttachmentStorage)
         base64_data = base64.urlsafe_b64encode(file_content_bytes).decode("utf-8")
 
-        # Save attachment to local disk
-        result = storage.save_attachment(
+        # Save attachment to local disk. save_attachment decodes and writes
+        # the whole payload synchronously — keep it off the event loop.
+        result = await asyncio.to_thread(
+            storage.save_attachment,
             base64_data=base64_data,
             filename=output_filename,
             mime_type=output_mime_type,
@@ -1025,7 +1083,10 @@ async def _fetch_url_with_pinned_ip(url: str) -> httpx.Response:
     if not parsed_url.hostname:
         raise ValueError(f"Invalid URL: missing hostname ({url})")
 
-    resolved_ips = _validate_url_not_internal(url)
+    # DNS resolution (socket.getaddrinfo) is blocking — run it off the event
+    # loop. The validation itself (is_global checks, IP pinning inputs) is
+    # unchanged; only the thread it runs on differs.
+    resolved_ips = await asyncio.to_thread(_validate_url_not_internal, url)
     host_header = _format_host_header(
         parsed_url.hostname, parsed_url.scheme, parsed_url.port
     )
@@ -1129,7 +1190,9 @@ async def _ssrf_safe_stream(url: str) -> AsyncIterator[httpx.Response]:
         if not parsed.hostname:
             raise ValueError(f"Invalid URL: missing hostname ({current_url})")
 
-        resolved_ips = _validate_url_not_internal(current_url)
+        # Blocking DNS resolution runs off the event loop; SSRF semantics
+        # (per-hop validation, IP pinning) are unchanged.
+        resolved_ips = await asyncio.to_thread(_validate_url_not_internal, current_url)
         host_header = _format_host_header(parsed.hostname, parsed.scheme, parsed.port)
 
         last_error: Optional[Exception] = None
@@ -1292,7 +1355,11 @@ async def import_to_google_doc(
         "mimeType": GOOGLE_DOCS_MIME_TYPE,  # Target format = Google Docs
     }
 
-    file_data: bytes
+    file_data: Optional[bytes] = None
+    # File-like source for the upload. The file_url branch streams into a
+    # SpooledTemporaryFile (RAM up to 5 MB, disk beyond) instead of holding
+    # the body in memory; the other branches wrap their bytes in BytesIO.
+    source_stream = None
 
     # Handle content (string input for text formats)
     if content is not None:
@@ -1340,16 +1407,36 @@ async def import_to_google_doc(
         if parsed_url.scheme not in ("http", "https"):
             raise ValueError(f"file_url must be http:// or https://, got: {file_url}")
 
-        # SSRF protection: block internal/private network URLs and validate redirects
-        resp = await _ssrf_safe_fetch(file_url)
-        if resp.status_code != 200:
-            raise Exception(
-                f"Failed to fetch file from URL: {file_url} (status {resp.status_code})"
-            )
-        file_data = resp.content
+        # SSRF protection: block internal/private network URLs and validate
+        # redirects. Stream into a SpooledTemporaryFile with a hard byte cap
+        # instead of buffering the whole body in memory (same pattern as
+        # create_drive_file's URL branch).
+        spool = SpooledTemporaryFile(max_size=UPLOAD_CHUNK_SIZE_BYTES)
+        total_bytes = 0
+        try:
+            async with _ssrf_safe_stream(file_url) as resp:
+                if resp.status_code != 200:
+                    raise Exception(
+                        f"Failed to fetch file from URL: {file_url} "
+                        f"(status {resp.status_code})"
+                    )
+                async for chunk in resp.aiter_bytes(
+                    chunk_size=DOWNLOAD_CHUNK_SIZE_BYTES
+                ):
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_IMPORT_URL_BYTES:
+                        raise Exception(
+                            f"Download exceeded {MAX_IMPORT_URL_BYTES} byte limit"
+                        )
+                    await asyncio.to_thread(spool.write, chunk)
+            spool.seek(0)
+        except Exception:
+            spool.close()
+            raise
+        source_stream = spool
 
         logger.info(
-            f"[import_to_google_doc] Downloaded from URL: {len(file_data)} bytes"
+            f"[import_to_google_doc] Downloaded from URL: {total_bytes} bytes"
         )
 
         # Re-detect format from URL if not specified
@@ -1359,29 +1446,35 @@ async def import_to_google_doc(
                 f"[import_to_google_doc] Re-detected from URL: {source_mime_type}"
             )
 
-    # Upload with conversion
-    media = MediaIoBaseUpload(
-        io.BytesIO(file_data),
-        mimetype=source_mime_type,  # Source format
-        resumable=True,
-        chunksize=UPLOAD_CHUNK_SIZE_BYTES,
-    )
+    if source_stream is None:
+        source_stream = io.BytesIO(file_data)
 
-    logger.info(
-        f"[import_to_google_doc] Uploading to Google Drive with conversion: "
-        f"{source_mime_type} → {GOOGLE_DOCS_MIME_TYPE}"
-    )
-
-    created_file = await asyncio.to_thread(
-        service.files()
-        .create(
-            body=file_metadata,
-            media_body=media,
-            fields="id, name, webViewLink, mimeType",
-            supportsAllDrives=True,
+    try:
+        # Upload with conversion
+        media = MediaIoBaseUpload(
+            source_stream,
+            mimetype=source_mime_type,  # Source format
+            resumable=True,
+            chunksize=UPLOAD_CHUNK_SIZE_BYTES,
         )
-        .execute
-    )
+
+        logger.info(
+            f"[import_to_google_doc] Uploading to Google Drive with conversion: "
+            f"{source_mime_type} → {GOOGLE_DOCS_MIME_TYPE}"
+        )
+
+        created_file = await asyncio.to_thread(
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, name, webViewLink, mimeType",
+                supportsAllDrives=True,
+            )
+            .execute
+        )
+    finally:
+        source_stream.close()
 
     result_mime = created_file.get("mimeType", "unknown")
     if result_mime != GOOGLE_DOCS_MIME_TYPE:

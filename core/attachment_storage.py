@@ -8,6 +8,7 @@ Files are automatically cleaned up after expiration (default 1 hour).
 import base64
 import logging
 import os
+import threading
 import uuid
 from pathlib import Path
 from typing import NamedTuple, Optional, Dict
@@ -44,6 +45,11 @@ class AttachmentStorage:
     def __init__(self, expiration_seconds: int = DEFAULT_EXPIRATION_SECONDS):
         self.expiration_seconds = expiration_seconds
         self._metadata: Dict[str, Dict] = {}
+        # Tool code runs save/register off the event loop (asyncio.to_thread)
+        # while the /attachments route reads metadata on the loop thread —
+        # guard all _metadata access. RLock because cleanup paths re-enter
+        # (_cleanup_file is called from locked readers).
+        self._lock = threading.RLock()
 
     def save_attachment(
         self,
@@ -133,14 +139,15 @@ class AttachmentStorage:
 
         # Store metadata
         expires_at = datetime.now() + timedelta(seconds=self.expiration_seconds)
-        self._metadata[file_id] = {
-            "file_path": str(file_path),
-            "filename": filename or f"attachment{extension}",
-            "mime_type": mime_type or "application/octet-stream",
-            "size": len(file_bytes),
-            "created_at": datetime.now(),
-            "expires_at": expires_at,
-        }
+        with self._lock:
+            self._metadata[file_id] = {
+                "file_path": str(file_path),
+                "filename": filename or f"attachment{extension}",
+                "mime_type": mime_type or "application/octet-stream",
+                "size": len(file_bytes),
+                "created_at": datetime.now(),
+                "expires_at": expires_at,
+            }
 
         return SavedAttachment(file_id=file_id, path=str(file_path))
 
@@ -190,14 +197,15 @@ class AttachmentStorage:
         if size is None:
             size = path.stat().st_size if path.exists() else 0
         expires_at = datetime.now() + timedelta(seconds=self.expiration_seconds)
-        self._metadata[file_id] = {
-            "file_path": str(path),
-            "filename": filename or path.name,
-            "mime_type": mime_type or "application/octet-stream",
-            "size": size,
-            "created_at": datetime.now(),
-            "expires_at": expires_at,
-        }
+        with self._lock:
+            self._metadata[file_id] = {
+                "file_path": str(path),
+                "filename": filename or path.name,
+                "mime_type": mime_type or "application/octet-stream",
+                "size": size,
+                "created_at": datetime.now(),
+                "expires_at": expires_at,
+            }
         return SavedAttachment(file_id=file_id, path=str(path))
 
     def get_attachment_path(self, file_id: str) -> Optional[Path]:
@@ -210,26 +218,27 @@ class AttachmentStorage:
         Returns:
             Path object if file exists and not expired, None otherwise
         """
-        if file_id not in self._metadata:
-            logger.warning(f"Attachment {file_id} not found in metadata")
-            return None
+        with self._lock:
+            if file_id not in self._metadata:
+                logger.warning(f"Attachment {file_id} not found in metadata")
+                return None
 
-        metadata = self._metadata[file_id]
-        file_path = Path(metadata["file_path"])
+            metadata = self._metadata[file_id]
+            file_path = Path(metadata["file_path"])
 
-        # Check if expired
-        if datetime.now() > metadata["expires_at"]:
-            logger.info(f"Attachment {file_id} has expired, cleaning up")
-            self._cleanup_file(file_id)
-            return None
+            # Check if expired
+            if datetime.now() > metadata["expires_at"]:
+                logger.info(f"Attachment {file_id} has expired, cleaning up")
+                self._cleanup_file(file_id)
+                return None
 
-        # Check if file exists
-        if not file_path.exists():
-            logger.warning(f"Attachment file {file_path} does not exist")
-            del self._metadata[file_id]
-            return None
+            # Check if file exists
+            if not file_path.exists():
+                logger.warning(f"Attachment file {file_path} does not exist")
+                del self._metadata[file_id]
+                return None
 
-        return file_path
+            return file_path
 
     def get_attachment_metadata(self, file_id: str) -> Optional[Dict]:
         """
@@ -241,29 +250,33 @@ class AttachmentStorage:
         Returns:
             Metadata dict if exists and not expired, None otherwise
         """
-        if file_id not in self._metadata:
-            return None
+        with self._lock:
+            if file_id not in self._metadata:
+                return None
 
-        metadata = self._metadata[file_id].copy()
+            metadata = self._metadata[file_id].copy()
 
-        # Check if expired
-        if datetime.now() > metadata["expires_at"]:
-            self._cleanup_file(file_id)
-            return None
+            # Check if expired
+            if datetime.now() > metadata["expires_at"]:
+                self._cleanup_file(file_id)
+                return None
 
-        return metadata
+            return metadata
 
     def _cleanup_file(self, file_id: str) -> None:
         """Remove file and metadata."""
-        if file_id in self._metadata:
-            file_path = Path(self._metadata[file_id]["file_path"])
-            try:
-                if file_path.exists():
-                    file_path.unlink()
-                    logger.debug(f"Deleted expired attachment file: {file_path}")
-            except Exception as e:
-                logger.warning(f"Failed to delete attachment file {file_path}: {e}")
-            del self._metadata[file_id]
+        with self._lock:
+            if file_id in self._metadata:
+                file_path = Path(self._metadata[file_id]["file_path"])
+                try:
+                    if file_path.exists():
+                        file_path.unlink()
+                        logger.debug(f"Deleted expired attachment file: {file_path}")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to delete attachment file {file_path}: {e}"
+                    )
+                del self._metadata[file_id]
 
     def cleanup_expired(self) -> int:
         """
@@ -273,14 +286,15 @@ class AttachmentStorage:
             Number of files cleaned up
         """
         now = datetime.now()
-        expired_ids = [
-            file_id
-            for file_id, metadata in self._metadata.items()
-            if now > metadata["expires_at"]
-        ]
+        with self._lock:
+            expired_ids = [
+                file_id
+                for file_id, metadata in self._metadata.items()
+                if now > metadata["expires_at"]
+            ]
 
-        for file_id in expired_ids:
-            self._cleanup_file(file_id)
+            for file_id in expired_ids:
+                self._cleanup_file(file_id)
 
         return len(expired_ids)
 

@@ -7,6 +7,7 @@ This module provides MCP tools for interacting with Google Chat API.
 import base64
 import logging
 import asyncio
+import os
 from typing import Dict, List, Optional
 
 import httpx
@@ -18,6 +19,26 @@ from core.server import server
 from core.utils import handle_http_errors
 
 logger = logging.getLogger(__name__)
+
+# Streaming chunk size for attachment downloads. Chat attachments can be up
+# to 200 MB — only one chunk is ever held in memory at a time.
+_CHAT_STREAM_CHUNK = 256 * 1024  # 256 KB
+
+
+async def _ensure_fresh_chat_token(service) -> str:
+    """Return a non-expired access token for the underlying Chat service.
+
+    Services are cached by the auth layer for ~30 minutes while Google
+    access tokens last ~60, so a token grabbed straight off the cached
+    service can be expired. Mirrors ``gdrive.drive_tools._ensure_fresh_token``
+    (kept local — service packages don't import across each other).
+    """
+    creds = service._http.credentials
+    if creds.expired and getattr(creds, "refresh_token", None):
+        from google.auth.transport.requests import Request as _GoogleAuthRequest
+
+        await asyncio.to_thread(creds.refresh, _GoogleAuthRequest())
+    return creds.token
 
 # In-memory cache for user ID → display name (bounded to avoid unbounded growth)
 _SENDER_CACHE_MAX_SIZE = 256
@@ -516,31 +537,41 @@ async def download_chat_attachment(
     resource_name = media_resource or att_name
     download_url = f"https://chat.googleapis.com/v1/media/{resource_name}?alt=media"
 
-    try:
-        access_token = service._http.credentials.token
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.get(
-                download_url,
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-            if resp.status_code != 200:
-                body = resp.text[:500]
-                return (
-                    f"Failed to download attachment '{filename}': "
-                    f"HTTP {resp.status_code} from {download_url}\n{body}"
-                )
-            file_bytes = resp.content
-    except Exception as e:
-        return f"Failed to download attachment '{filename}': {e}"
-
-    size_bytes = len(file_bytes)
-    size_kb = size_bytes / 1024
-
     # Check if we're in stateless mode (can't save files)
     from auth.oauth_config import is_stateless_mode
 
     if is_stateless_mode():
-        b64_preview = base64.urlsafe_b64encode(file_bytes).decode("utf-8")[:100]
+        # Stream and count bytes without ever buffering the payload. Keep
+        # only the first 75 bytes (-> exactly 100 base64 chars) for the
+        # preview the stateless response has always shown.
+        head = b""
+        size_bytes = 0
+        try:
+            access_token = await _ensure_fresh_chat_token(service)
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                async with client.stream(
+                    "GET",
+                    download_url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = (await resp.aread()).decode("utf-8", errors="replace")[
+                            :500
+                        ]
+                        raise Exception(
+                            f"HTTP {resp.status_code} from {download_url}\n{body}"
+                        )
+                    async for chunk in resp.aiter_bytes(
+                        chunk_size=_CHAT_STREAM_CHUNK
+                    ):
+                        if len(head) < 75:
+                            head += chunk[: 75 - len(head)]
+                        size_bytes += len(chunk)
+        except Exception as e:
+            return f"Failed to download attachment '{filename}': {e}"
+
+        size_kb = size_bytes / 1024
+        b64_preview = base64.urlsafe_b64encode(head).decode("utf-8")[:100]
         return "\n".join(
             [
                 f"Attachment downloaded: {filename} ({content_type})",
@@ -551,14 +582,61 @@ async def download_chat_attachment(
             ]
         )
 
-    # Save to local disk
+    # Stream straight to local disk — no whole-payload buffer, no base64
+    # round-trip. Chat attachments can be up to 200 MB; only one chunk is
+    # in memory at a time.
     from core.attachment_storage import get_attachment_storage, get_attachment_url
     from core.config import get_transport_mode
 
     storage = get_attachment_storage()
-    b64_data = base64.urlsafe_b64encode(file_bytes).decode("utf-8")
-    result = storage.save_attachment(
-        base64_data=b64_data, filename=filename, mime_type=content_type
+    saved_file_id, target_path = storage.reserve_path(filename)
+
+    size_bytes = 0
+    try:
+        access_token = await _ensure_fresh_chat_token(service)
+        fd = os.open(
+            target_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(fd, "wb", closefd=True) as fh:
+                async with httpx.AsyncClient(follow_redirects=True) as client:
+                    async with client.stream(
+                        "GET",
+                        download_url,
+                        headers={"Authorization": f"Bearer {access_token}"},
+                    ) as resp:
+                        if resp.status_code != 200:
+                            body = (
+                                await resp.aread()
+                            ).decode("utf-8", errors="replace")[:500]
+                            raise Exception(
+                                f"HTTP {resp.status_code} from {download_url}\n{body}"
+                            )
+                        async for chunk in resp.aiter_bytes(
+                            chunk_size=_CHAT_STREAM_CHUNK
+                        ):
+                            size_bytes += len(chunk)
+                            await asyncio.to_thread(fh.write, chunk)
+        except Exception:
+            # Best-effort cleanup of the partial file.
+            try:
+                os.unlink(target_path)
+            except OSError:  # pragma: no cover - best effort
+                pass
+            raise
+    except Exception as e:
+        return f"Failed to download attachment '{filename}': {e}"
+
+    size_kb = size_bytes / 1024
+    result = await asyncio.to_thread(
+        storage.register_existing_file,
+        file_id=saved_file_id,
+        file_path=target_path,
+        filename=filename,
+        mime_type=content_type,
+        size=size_bytes,
     )
 
     result_lines = [
