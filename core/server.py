@@ -463,13 +463,42 @@ def configure_server_for_http():
                     "Protected resource metadata points to Google's authorization server"
                 )
             else:
-                # Standard OAuth 2.1 mode: use FastMCP's GoogleProvider
+                # Standard OAuth 2.1 mode: use FastMCP's GoogleProvider.
+                #
+                # The protocol-level auth gate (`required_scopes`) is
+                # deliberately narrowed to identity scopes only. FastMCP's
+                # verifier rejects any token whose granted scopes are not a
+                # *superset* of `required_scopes`
+                # (GoogleTokenVerifier.verify_token / JWTVerifier do
+                # `required_scopes.issubset(token_scopes)` and return None →
+                # 401 invalid_token otherwise). Passing the full multi-service
+                # scope list here rejected every least-privilege client — e.g.
+                # a front-end that only requests `drive.file` — at /mcp, even
+                # though its token was freshly and correctly issued.
+                #
+                # `valid_scopes` keeps the *full* enabled-service scope set
+                # advertised through the well-known endpoints and used as the
+                # DCR/registration default, so broad-consent clients are
+                # unchanged and any client may still request any service scope.
+                # The specific Google API scope each tool needs is still
+                # enforced per-call by @require_google_service
+                # (auth/service_decorator.py) — this relaxes only the coarse
+                # front-door gate, not real authorization.
+                #
+                # The identity floor is BASE_SCOPES (openid + email + profile)
+                # because the server attributes every request to a user by
+                # email (audit log + per-user credential store); a token
+                # without it can't be mapped to a user regardless of the gate.
+                from auth.scopes import BASE_SCOPES
+
+                identity_gate_scopes = sorted(set(BASE_SCOPES))
                 provider = GoogleProvider(
                     client_id=config.client_id,
                     client_secret=config.client_secret,
                     base_url=config.get_oauth_base_url(),
                     redirect_path=config.redirect_path,
-                    required_scopes=required_scopes,
+                    required_scopes=identity_gate_scopes,
+                    valid_scopes=required_scopes,
                     client_storage=client_storage,
                     jwt_signing_key=jwt_signing_key,
                 )
@@ -477,6 +506,11 @@ def configure_server_for_http():
                 server.auth = provider
                 logger.info(
                     "OAuth 2.1 enabled using FastMCP GoogleProvider with protocol-level auth"
+                )
+                logger.info(
+                    "OAuth 2.1 gate: required_scopes=%s; advertised valid_scopes=%d",
+                    identity_gate_scopes,
+                    len(required_scopes),
                 )
 
                 # Explicitly mount well-known routes from the OAuth provider
