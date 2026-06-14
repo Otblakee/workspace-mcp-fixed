@@ -13,7 +13,6 @@ from __future__ import annotations
 import base64
 import inspect
 import os
-import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -38,6 +37,7 @@ def _unwrap(fn):
 # ---------------------------------------------------------------------------
 # Issue 3 — create_spreadsheet locale
 # ---------------------------------------------------------------------------
+
 
 class TestCreateSpreadsheetLocale:
     def test_signature_has_locale_default_en_gb(self):
@@ -64,6 +64,7 @@ class TestCreateSpreadsheetLocale:
 # ---------------------------------------------------------------------------
 # Issue 1 — create_drive_file base64_content
 # ---------------------------------------------------------------------------
+
 
 class TestCreateDriveFileBase64:
     def test_signature_has_base64_content(self):
@@ -147,6 +148,7 @@ class TestCreateDriveFileBase64:
 # Phase 2.5 Fix C — file:// rejected up-front in streamable-http mode
 # ---------------------------------------------------------------------------
 
+
 class TestCreateDriveFileFileUrlRemoteRejection:
     @pytest.mark.asyncio
     async def test_streamable_http_rejects_file_url_with_actionable_message(
@@ -191,7 +193,9 @@ class TestCreateDriveFileFileUrlRemoteRejection:
         service.files.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_stdio_mode_still_attempts_local_file_read(self, monkeypatch, tmp_path):
+    async def test_stdio_mode_still_attempts_local_file_read(
+        self, monkeypatch, tmp_path
+    ):
         """Local stdio dev workflow must keep working: file:// URLs to files
         actually on the server's disk should be read and uploaded. We don't
         run a real upload here — just confirm the streamable-http guard
@@ -231,6 +235,7 @@ class TestCreateDriveFileFileUrlRemoteRejection:
 # Phase 2.5 Fix D — create_drive_file docstring warning
 # ---------------------------------------------------------------------------
 
+
 class TestCreateDriveFileDocstringWarning:
     def test_docstring_warns_against_file_url_from_remote_clients(self):
         """Defence in depth for Fix C: the docstring (which calling LLMs
@@ -248,6 +253,7 @@ class TestCreateDriveFileDocstringWarning:
 # ---------------------------------------------------------------------------
 # Issue 4 — delete_gmail_draft
 # ---------------------------------------------------------------------------
+
 
 class TestDeleteGmailDraft:
     def test_tool_exists_and_signature_is_clean(self):
@@ -292,6 +298,7 @@ class TestDeleteGmailDraft:
 # Issue 5 — create_doc content_format=markdown
 # ---------------------------------------------------------------------------
 
+
 class TestCreateDocMarkdown:
     def test_signature_has_content_format(self):
         from gdocs.docs_tools import create_doc
@@ -308,8 +315,7 @@ class TestCreateDocMarkdown:
         tokens."""
         src = (REPO_ROOT / "gdocs" / "docs_tools.py").read_text()
         assert (
-            '@require_google_service("docs", "docs_write")\n'
-            "async def create_doc("
+            '@require_google_service("docs", "docs_write")\nasync def create_doc('
         ) in src
         # The Drive service is fetched lazily by a separate helper.
         assert (
@@ -351,9 +357,7 @@ class TestCreateDocMarkdown:
         async def fake_drive_helper(user_google_email):
             return drive_service
 
-        monkeypatch.setattr(
-            docs_tools, "_create_doc_drive_service", fake_drive_helper
-        )
+        monkeypatch.setattr(docs_tools, "_create_doc_drive_service", fake_drive_helper)
 
         await impl(
             service=docs_service,
@@ -417,9 +421,7 @@ class TestCreateDocMarkdown:
         }
 
         async def boom(user_google_email):  # pragma: no cover
-            raise AssertionError(
-                "Empty markdown must not acquire Drive scope"
-            )
+            raise AssertionError("Empty markdown must not acquire Drive scope")
 
         monkeypatch.setattr(docs_tools, "_create_doc_drive_service", boom)
 
@@ -452,9 +454,7 @@ class TestCreateDocMarkdown:
         async def fake_drive_helper(user_google_email):
             return drive_service
 
-        monkeypatch.setattr(
-            docs_tools, "_create_doc_drive_service", fake_drive_helper
-        )
+        monkeypatch.setattr(docs_tools, "_create_doc_drive_service", fake_drive_helper)
 
         await impl(
             service=MagicMock(),
@@ -480,6 +480,7 @@ class TestCreateDocMarkdown:
 # Issue 2 — supportsAllDrives audit
 # ---------------------------------------------------------------------------
 
+
 class TestSupportsAllDrivesAudit:
     """Static checks to keep the patched call sites from regressing.
     A future PR removing the flags would silently route writes back to My
@@ -493,15 +494,15 @@ class TestSupportsAllDrivesAudit:
 
     def test_apps_script_delete_carries_flag(self):
         src = (REPO_ROOT / "gappsscript" / "apps_script_tools.py").read_text()
-        assert (
-            "service.files().delete(fileId=script_id, supportsAllDrives=True)"
-            in src
-        )
+        assert "service.files().delete(fileId=script_id, supportsAllDrives=True)" in src
 
     def test_drive_get_media_carries_flag(self):
         """get_drive_file_content + get_drive_file_download_url both need
         supportsAllDrives on get_media for shared-drive content."""
         src = (REPO_ROOT / "gdrive" / "drive_tools.py").read_text()
-        assert src.count(
-            "service.files().get_media(fileId=file_id, supportsAllDrives=True)"
-        ) >= 2
+        assert (
+            src.count(
+                "service.files().get_media(fileId=file_id, supportsAllDrives=True)"
+            )
+            >= 2
+        )

@@ -63,9 +63,7 @@ INLINE_DOWNLOAD_MAX_BYTES = int(
 )
 # get_drive_file_content buffers the whole file in memory to decode it as
 # text; binary content is discarded anyway, so cap it lower.
-CONTENT_MAX_BYTES = int(
-    os.getenv("WORKSPACE_CONTENT_MAX_BYTES", str(25 * 1024 * 1024))
-)
+CONTENT_MAX_BYTES = int(os.getenv("WORKSPACE_CONTENT_MAX_BYTES", str(25 * 1024 * 1024)))
 # Cap for import_to_google_doc's file_url branch (spooled to temp file).
 MAX_IMPORT_URL_BYTES = 50 * 1024 * 1024
 
@@ -212,9 +210,7 @@ async def get_drive_file_content(
     }.get(mime_type)
 
     request_obj = (
-        service.files().export_media(
-            fileId=file_id, mimeType=export_mime_type
-        )
+        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
         if export_mime_type
         else service.files().get_media(fileId=file_id, supportsAllDrives=True)
     )
@@ -393,9 +389,7 @@ async def get_drive_file_download_url(
 
     # Download the file
     request_obj = (
-        service.files().export_media(
-            fileId=file_id, mimeType=export_mime_type
-        )
+        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
         if export_mime_type
         else service.files().get_media(fileId=file_id, supportsAllDrives=True)
     )
@@ -1450,9 +1444,7 @@ async def import_to_google_doc(
             raise
         source_stream = spool
 
-        logger.info(
-            f"[import_to_google_doc] Downloaded from URL: {total_bytes} bytes"
-        )
+        logger.info(f"[import_to_google_doc] Downloaded from URL: {total_bytes} bytes")
 
         # Re-detect format from URL if not specified
         if not source_format:
@@ -2072,7 +2064,10 @@ async def restore_drive_file(
     Returns:
         str: Confirmation message.
     """
-    resolved_holding_id = await resolve_folder_id(service, _get_holding_folder_id())
+    # Require the holding folder to be configured so restore is only available
+    # in deployments where soft-delete is set up, even though restore moves the
+    # file out rather than in.
+    _get_holding_folder_id()
 
     resolved_file_id, current = await resolve_drive_item(
         service,
@@ -3304,9 +3299,7 @@ async def download_drive_file(
     if get_transport_mode() == "stdio":
         access_line = f"path: {target_path}"
     else:
-        access_line = (
-            f"url: {get_attachment_url(saved_file_id)} (expires in 1 hour)"
-        )
+        access_line = f"url: {get_attachment_url(saved_file_id)} (expires in 1 hour)"
 
     note = (
         f"\nNote: Google native file exported to {output_mime_type}."

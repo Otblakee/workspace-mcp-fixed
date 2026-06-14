@@ -99,9 +99,7 @@ async def _ensure_audit_started() -> None:
     try:
         await audit_logger().start()
     except Exception as e:
-        logger.error(
-            "Audit logger failed to start; continuing without audit: %s", e
-        )
+        logger.error("Audit logger failed to start; continuing without audit: %s", e)
 
 
 async def _ensure_audit_stopped() -> None:

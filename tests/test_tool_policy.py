@@ -83,8 +83,7 @@ class TestTierSync:
 
         leaked = set(BLOCKED_TOOLS) & _all_tier_tool_names()
         assert not leaked, (
-            "blocked tools must not appear in tool_tiers.yaml; "
-            f"found: {sorted(leaked)}"
+            f"blocked tools must not appear in tool_tiers.yaml; found: {sorted(leaked)}"
         )
 
     def test_soft_delete_tools_are_in_a_tier(self):
