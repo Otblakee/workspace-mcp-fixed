@@ -341,3 +341,93 @@ non-streaming Drive download tool) keep working.
 - Resumable upload session URIs are valid for 7 days regardless of
   this server's lifecycle. A redeploy mid-upload doesn't invalidate
   the upload — just the audit-row correlation, which is acceptable.
+
+## Destructive-tool trim (claude/inspiring-pascal-d9twsj)
+
+Gates destructive Google Workspace operations at the MCP source so no
+connected client (Claude chat, Cowork, Code, the OTB AI Cockpit) can call
+them. The MCP is the one shared control point we own; trimming it protects
+every surface at once. This is a companion to the Cockpit's own Drive
+allowlist work.
+
+**Important nuance (do not lose it):** gating tools does NOT reduce the OAuth
+token's scope. Full Drive scope is intentionally kept (full open spec). A
+leaked full-scope token can still delete directly via Google, bypassing this
+denylist. Token security (encryption at rest, short-lived access, rotating
+refresh, fast revoke, no token in logs) and Google-side controls (Vault
+retention, Drive sharing restrictions) remain real controls. The gating is
+not, on its own, the whole story.
+
+### Mechanism — hard denylist at the registration chokepoint
+
+`core/tool_policy.py` holds `BLOCKED_TOOLS`, the single source of truth.
+Enforcement is in `core/server.py` `_audited_tool`: a blocked tool's
+`@server.tool()` decorator becomes a no-op, so the tool is never registered,
+never appears in `list_tools`, and can never be called. Fail-closed and
+independent of `--tools`, `--tool-tier`, `--read-only`, `tool_tiers.yaml`, or
+any env var. The blocked names are also removed from `core/tool_tiers.yaml`
+(defense in depth); `tests/test_tool_policy.py` asserts the two stay in sync.
+
+Note: YAML pruning alone is NOT sufficient. The `elif args.tools is not None:`
+branch in `main.py` calls `set_enabled_tools(None)`, which disables per-tool
+filtering, so without the code denylist every decorated tool in the loaded
+services would register. The denylist is the control; the YAML prune is tidy.
+
+### Blocked tools (removed from every surface)
+
+- Drive ownership / access loss: `transfer_drive_ownership`,
+  `remove_drive_permission`
+- Drive over-share / exfiltration: `share_drive_file`,
+  `batch_share_drive_file`, `set_drive_file_permissions`,
+  `update_drive_permission` (a public link is a permanent leak, worse than a
+  recoverable trash; remove from `BLOCKED_TOOLS` and gate to internal-only if
+  the AI must share)
+- Calendar: `delete_event`
+- Contacts: `delete_contact`, `batch_delete_contacts`, `delete_contact_group`
+- Gmail: `delete_gmail_draft`, `delete_gmail_filter`,
+  `batch_modify_gmail_message_labels` (bulk trash via the TRASH label)
+
+Deliberately NOT blocked (judgement calls, harden later if needed): the
+single-message `modify_gmail_message_labels` (normal archive/label path, can
+still apply TRASH to one message), `manage_gmail_label` (can delete labels),
+`share_calendar`, `send_gmail_message`, `create_gmail_filter`,
+`delete_conditional_formatting`. The content-overwrite tools
+(`modify_doc_text`, `find_and_replace_doc`, `batch_update_doc`,
+`modify_sheet_values`, `modify_event`, `update_contact`) are kept by design;
+Drive/Docs/Sheets version history is the recovery backstop, which is strong
+for Docs/Sheets and weaker for Calendar/Contacts.
+
+### Soft-delete replaces trash/delete for Drive
+
+`update_drive_file` no longer accepts a `trashed` parameter (the trash path is
+removed). Two new tools replace it:
+
+- `soft_delete_drive_file(file_id, reason=None)` — moves the file into a
+  private holding folder (`DRIVE_HOLDING_FOLDER_ID`) and records the original
+  parents in `appProperties` (`mcp_orig_parents`, `mcp_deleted_at`,
+  `mcp_deleted_by`, `mcp_reason`). Never trashes, never hard-deletes. Fails
+  closed if `DRIVE_HOLDING_FOLDER_ID` is unset. Flags files the caller does
+  not own (Drive may restrict the move).
+- `restore_drive_file(file_id, target_folder_id=None)` — moves the file back
+  to its recorded original parents (or `target_folder_id`) and clears the
+  soft-delete markers.
+
+Caveat: soft-delete is organizational, not a security boundary. The file
+stays fully live and editable; the kept content-overwrite tools can still
+blank it in place. Soft-delete only replaces delete/trash.
+
+### New Render env var
+
+- `DRIVE_HOLDING_FOLDER_ID` — Drive folder ID of a private holding folder you
+  own and empty manually. Required for `soft_delete_drive_file` /
+  `restore_drive_file`; those tools fail closed if it is unset.
+
+### Workspace-side controls (companion, not in this repo)
+
+There is no Workspace toggle that disables delete for a full-scope token. The
+levers that actually help: Google Vault retention on Drive (the only control
+that survives a token leak; needs Business Plus / Enterprise / Vault add-on);
+the 25-day admin restore window for emptied trash; Drive sharing settings to
+cap exfiltration; API controls / app access control + an Internal OAuth
+client to limit who can use the token; Context-Aware Access to pin source IP
+(needs static egress + Enterprise tier).

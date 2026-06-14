@@ -63,9 +63,7 @@ INLINE_DOWNLOAD_MAX_BYTES = int(
 )
 # get_drive_file_content buffers the whole file in memory to decode it as
 # text; binary content is discarded anyway, so cap it lower.
-CONTENT_MAX_BYTES = int(
-    os.getenv("WORKSPACE_CONTENT_MAX_BYTES", str(25 * 1024 * 1024))
-)
+CONTENT_MAX_BYTES = int(os.getenv("WORKSPACE_CONTENT_MAX_BYTES", str(25 * 1024 * 1024)))
 # Cap for import_to_google_doc's file_url branch (spooled to temp file).
 MAX_IMPORT_URL_BYTES = 50 * 1024 * 1024
 
@@ -212,9 +210,7 @@ async def get_drive_file_content(
     }.get(mime_type)
 
     request_obj = (
-        service.files().export_media(
-            fileId=file_id, mimeType=export_mime_type
-        )
+        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
         if export_mime_type
         else service.files().get_media(fileId=file_id, supportsAllDrives=True)
     )
@@ -393,9 +389,7 @@ async def get_drive_file_download_url(
 
     # Download the file
     request_obj = (
-        service.files().export_media(
-            fileId=file_id, mimeType=export_mime_type
-        )
+        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
         if export_mime_type
         else service.files().get_media(fileId=file_id, supportsAllDrives=True)
     )
@@ -1450,9 +1444,7 @@ async def import_to_google_doc(
             raise
         source_stream = spool
 
-        logger.info(
-            f"[import_to_google_doc] Downloaded from URL: {total_bytes} bytes"
-        )
+        logger.info(f"[import_to_google_doc] Downloaded from URL: {total_bytes} bytes")
 
         # Re-detect format from URL if not specified
         if not source_format:
@@ -1777,7 +1769,6 @@ async def update_drive_file(
     remove_parents: Optional[str] = None,  # Comma-separated folder IDs to remove
     # File status
     starred: Optional[bool] = None,
-    trashed: Optional[bool] = None,
     # Sharing and permissions
     writers_can_share: Optional[bool] = None,
     copy_requires_writer_permission: Optional[bool] = None,
@@ -1796,18 +1787,23 @@ async def update_drive_file(
         add_parents (Optional[str]): Comma-separated folder IDs to add as parents.
         remove_parents (Optional[str]): Comma-separated folder IDs to remove from parents.
         starred (Optional[bool]): Whether to star/unstar the file.
-        trashed (Optional[bool]): Whether to move file to/from trash.
         writers_can_share (Optional[bool]): Whether editors can share the file.
         copy_requires_writer_permission (Optional[bool]): Whether copying requires writer permission.
         properties (Optional[dict]): Custom key-value properties for the file.
 
     Returns:
         str: Confirmation message with details of the updates applied.
+
+    Note:
+        Trashing is intentionally not supported by this tool. To remove a file
+        from active use, call soft_delete_drive_file (moves it to a private
+        holding folder, reversible via restore_drive_file). This server never
+        trashes or hard-deletes Drive files.
     """
     logger.info(f"[update_drive_file] Updating file {file_id} for {user_google_email}")
 
     current_file_fields = (
-        "name, description, mimeType, parents, starred, trashed, webViewLink, "
+        "name, description, mimeType, parents, starred, webViewLink, "
         "writersCanShare, copyRequiresWriterPermission, properties"
     )
     resolved_file_id, current_file = await resolve_drive_item(
@@ -1827,8 +1823,6 @@ async def update_drive_file(
         update_body["mimeType"] = mime_type
     if starred is not None:
         update_body["starred"] = starred
-    if trashed is not None:
-        update_body["trashed"] = trashed
     if writers_can_share is not None:
         update_body["writersCanShare"] = writers_can_share
     if copy_requires_writer_permission is not None:
@@ -1856,7 +1850,7 @@ async def update_drive_file(
     query_params = {
         "fileId": file_id,
         "supportsAllDrives": True,
-        "fields": "id, name, description, mimeType, parents, starred, trashed, webViewLink, writersCanShare, copyRequiresWriterPermission, properties",
+        "fields": "id, name, description, mimeType, parents, starred, webViewLink, writersCanShare, copyRequiresWriterPermission, properties",
     }
 
     if resolved_add_parents:
@@ -1903,10 +1897,6 @@ async def update_drive_file(
     if starred is not None and starred != current_starred:
         star_status = "starred" if starred else "unstarred"
         changes.append(f"   • File {star_status}")
-    current_trashed = current_file.get("trashed")
-    if trashed is not None and trashed != current_trashed:
-        trash_status = "moved to trash" if trashed else "restored from trash"
-        changes.append(f"   • File {trash_status}")
     current_writers_can_share = current_file.get("writersCanShare")
     if writers_can_share is not None and writers_can_share != current_writers_can_share:
         share_status = "can" if writers_can_share else "cannot"
@@ -1936,6 +1926,216 @@ async def update_drive_file(
     output_parts.append(f"View file: {updated_file.get('webViewLink', '#')}")
 
     return "\n".join(output_parts)
+
+
+def _get_holding_folder_id() -> str:
+    """Resolve the soft-delete holding folder ID from the environment.
+
+    Read lazily (not at import) so the value can be set per-deploy and so
+    tests can patch it. Raises if unset: soft-delete fails closed rather than
+    silently doing nothing.
+    """
+    folder_id = os.getenv("DRIVE_HOLDING_FOLDER_ID", "").strip()
+    if not folder_id:
+        raise Exception(
+            "DRIVE_HOLDING_FOLDER_ID is not set. Refusing to soft-delete: set it "
+            "to the ID of a private holding folder you own and empty manually."
+        )
+    return folder_id
+
+
+@server.tool()
+@handle_http_errors("soft_delete_drive_file", is_read_only=False, service_type="drive")
+@require_google_service("drive", "drive_file")
+async def soft_delete_drive_file(
+    service,
+    user_google_email: str,
+    file_id: str,
+    reason: Optional[str] = None,
+) -> str:
+    """
+    Soft-delete a Drive file by moving it into the OTB holding folder.
+
+    This NEVER trashes and NEVER hard-deletes. The file is relocated to a
+    single private holding folder (set via the DRIVE_HOLDING_FOLDER_ID env
+    var) that the operator empties manually, so the app can never destroy
+    anything. The file's original parent folder IDs are saved to
+    appProperties so the move is reversible via restore_drive_file.
+
+    Use this instead of trashing or deleting a Drive file.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The ID of the file to soft-delete. Required.
+        reason (Optional[str]): Short free-text note stored on the file
+            (truncated to 120 chars).
+
+    Returns:
+        str: Confirmation message.
+    """
+    resolved_holding_id = await resolve_folder_id(service, _get_holding_folder_id())
+
+    resolved_file_id, current = await resolve_drive_item(
+        service,
+        file_id,
+        extra_fields="name, parents, owners, appProperties",
+    )
+    current_parents = current.get("parents", []) or []
+
+    if current_parents == [resolved_holding_id]:
+        return (
+            f"ℹ️ '{current.get('name')}' is already in the holding folder; "
+            "nothing to do."
+        )
+
+    owners = current.get("owners") or []
+    is_owner = any(
+        (o.get("emailAddress") or "").lower() == user_google_email.lower()
+        for o in owners
+    )
+
+    app_properties = {
+        "mcp_softdeleted": "true",
+        "mcp_orig_parents": ",".join(current_parents),
+        "mcp_deleted_at": datetime.now(timezone.utc).isoformat(),
+        "mcp_deleted_by": user_google_email,
+    }
+    if reason:
+        app_properties["mcp_reason"] = reason[:120]
+
+    query_params = {
+        "fileId": resolved_file_id,
+        "addParents": resolved_holding_id,
+        "supportsAllDrives": True,
+        "fields": "id, name, parents",
+        "body": {"appProperties": app_properties},
+    }
+    remove_parents = ",".join(p for p in current_parents if p != resolved_holding_id)
+    if remove_parents:
+        query_params["removeParents"] = remove_parents
+
+    await asyncio.to_thread(service.files().update(**query_params).execute)
+
+    logger.info(
+        "[soft_delete_drive_file] moved %s to holding folder %s for %s",
+        resolved_file_id,
+        resolved_holding_id,
+        user_google_email,
+    )
+
+    warning = (
+        ""
+        if is_owner
+        else (
+            "\n⚠️ You are not the owner of this file; Drive may restrict the "
+            "move and the file may remain accessible to others."
+        )
+    )
+    return (
+        f"🗑️ Soft-deleted '{current.get('name')}' (ID: {resolved_file_id}).\n"
+        f"   Moved to holding folder {resolved_holding_id}. Nothing was trashed "
+        "or destroyed.\n"
+        f"   Restore with restore_drive_file.{warning}"
+    )
+
+
+@server.tool()
+@handle_http_errors("restore_drive_file", is_read_only=False, service_type="drive")
+@require_google_service("drive", "drive_file")
+async def restore_drive_file(
+    service,
+    user_google_email: str,
+    file_id: str,
+    target_folder_id: Optional[str] = None,
+) -> str:
+    """
+    Restore a soft-deleted Drive file out of the holding folder.
+
+    Moves the file back to its original parent folders (recorded in
+    appProperties by soft_delete_drive_file) or to target_folder_id when
+    provided, and clears the soft-delete markers.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The ID of the file to restore. Required.
+        target_folder_id (Optional[str]): Folder to restore into. Defaults to
+            the original parents saved at soft-delete time.
+
+    Returns:
+        str: Confirmation message.
+    """
+    resolved_holding_id = await resolve_folder_id(service, _get_holding_folder_id())
+
+    resolved_file_id, current = await resolve_drive_item(
+        service,
+        file_id,
+        extra_fields="name, parents, appProperties",
+    )
+    current_parents = current.get("parents", []) or []
+    app_props = current.get("appProperties") or {}
+
+    # Restore only ever reverses a soft-delete. Refuse to touch an active file,
+    # otherwise (with target_folder_id) this would become an arbitrary move tool
+    # that yanks a live file out of its real folders. A file is considered
+    # soft-deleted if it carries our marker or currently sits in the holding
+    # folder.
+    is_soft_deleted = (
+        app_props.get("mcp_softdeleted") == "true"
+        or resolved_holding_id in current_parents
+    )
+    if not is_soft_deleted:
+        raise Exception(
+            f"'{current.get('name')}' is not soft-deleted (no mcp_softdeleted "
+            "marker and not in the holding folder); refusing to restore. Use "
+            "update_drive_file to move an active file."
+        )
+
+    if target_folder_id:
+        destinations = [await resolve_folder_id(service, target_folder_id)]
+    else:
+        orig = (app_props.get("mcp_orig_parents") or "").strip()
+        destinations = [p for p in orig.split(",") if p]
+        if not destinations:
+            raise Exception(
+                "No original parents recorded for this file and no "
+                "target_folder_id supplied; cannot determine where to restore it. "
+                "Pass target_folder_id explicitly."
+            )
+
+    add_parents = ",".join(destinations)
+    remove_parents = ",".join(current_parents)
+
+    # Setting an appProperties value to None removes the key from the file.
+    cleared_props = {
+        "mcp_softdeleted": None,
+        "mcp_orig_parents": None,
+        "mcp_deleted_at": None,
+        "mcp_deleted_by": None,
+        "mcp_reason": None,
+    }
+
+    query_params = {
+        "fileId": resolved_file_id,
+        "addParents": add_parents,
+        "supportsAllDrives": True,
+        "fields": "id, name, parents",
+        "body": {"appProperties": cleared_props},
+    }
+    if remove_parents:
+        query_params["removeParents"] = remove_parents
+
+    await asyncio.to_thread(service.files().update(**query_params).execute)
+
+    logger.info(
+        "[restore_drive_file] restored %s to %s for %s",
+        resolved_file_id,
+        add_parents,
+        user_google_email,
+    )
+    return (
+        f"♻️ Restored '{current.get('name')}' (ID: {resolved_file_id}) to "
+        f"folder(s): {add_parents}."
+    )
 
 
 @server.tool()
@@ -3112,9 +3312,7 @@ async def download_drive_file(
     if get_transport_mode() == "stdio":
         access_line = f"path: {target_path}"
     else:
-        access_line = (
-            f"url: {get_attachment_url(saved_file_id)} (expires in 1 hour)"
-        )
+        access_line = f"url: {get_attachment_url(saved_file_id)} (expires in 1 hour)"
 
     note = (
         f"\nNote: Google native file exported to {output_mime_type}."
