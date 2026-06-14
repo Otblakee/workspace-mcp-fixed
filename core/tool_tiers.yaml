@@ -12,14 +12,11 @@ gmail:
     - list_gmail_labels
     - manage_gmail_label
     - draft_gmail_message
-    - delete_gmail_draft
     - list_gmail_filters
     - create_gmail_filter
-    - delete_gmail_filter
 
   complete:
     - get_gmail_threads_content_batch
-    - batch_modify_gmail_message_labels
     - start_google_auth
 
 drive:
@@ -30,17 +27,13 @@ drive:
     - create_drive_file
     - create_drive_folder
     - import_to_google_doc
-    - share_drive_file
     - get_drive_shareable_link
   extended:
     - list_drive_items
     - copy_drive_file
     - update_drive_file
-    - update_drive_permission
-    - remove_drive_permission
-    - transfer_drive_ownership
-    - batch_share_drive_file
-    - set_drive_file_permissions
+    - soft_delete_drive_file
+    - restore_drive_file
     - create_drive_upload_session
     - confirm_drive_upload
     - download_drive_file
@@ -57,7 +50,6 @@ calendar:
     - create_calendar
     - share_calendar
   extended:
-    - delete_event
     - query_freebusy
   complete: []
 
@@ -163,16 +155,13 @@ contacts:
     - create_contact
   extended:
     - update_contact
-    - delete_contact
     - list_contact_groups
     - get_contact_group
   complete:
     - batch_create_contacts
     - batch_update_contacts
-    - batch_delete_contacts
     - create_contact_group
     - update_contact_group
-    - delete_contact_group
     - modify_contact_group_members
 
 search:

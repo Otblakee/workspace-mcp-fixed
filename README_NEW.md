@@ -74,7 +74,9 @@ export OAUTHLIB_INSECURE_TRANSPORT=1  # Development only
 | `create_drive_file` | Core | Create files from content or URL (supports file://, http://, https://) |
 | `create_drive_folder` | Core | Create empty folders in Drive or shared drives |
 | `list_drive_items` | Extended | List folder contents with shared drive support |
-| `update_drive_file` | Extended | Update metadata, move between folders, star, trash |
+| `update_drive_file` | Extended | Update metadata, move between folders, star (no trash; use `soft_delete_drive_file`) |
+| `soft_delete_drive_file` | Extended | Move a file to the holding folder instead of trashing/deleting (reversible) |
+| `restore_drive_file` | Extended | Move a soft-deleted file back out of the holding folder |
 | `get_drive_file_permissions` | Complete | Check sharing status and permissions |
 | `check_drive_file_public_access` | Complete | Verify public link sharing for Docs image insertion |
 

@@ -258,13 +258,18 @@ class TestDeleteGmailDraft:
         # exposes user_google_email + draft_id.
         assert "draft_id" in sig.parameters
 
-    def test_registered_in_extended_tier(self):
+    def test_blocked_and_removed_from_tiers(self):
+        """Policy change (destructive-tool trim): delete_gmail_draft is now on
+        the hard denylist (core/tool_policy.py) and removed from every tier in
+        core/tool_tiers.yaml. The source function stays in place (gated, not
+        deleted); it just must never be registered or wired into a tier."""
+        from core.tool_policy import BLOCKED_TOOLS
+
+        assert "delete_gmail_draft" in BLOCKED_TOOLS
+
         with open(REPO_ROOT / "core" / "tool_tiers.yaml") as f:
             tiers = yaml.safe_load(f)
-        assert "delete_gmail_draft" in tiers["gmail"]["extended"], (
-            "delete_gmail_draft must be wired into core/tool_tiers.yaml under "
-            "gmail.extended so deployments enabling that tier pick it up."
-        )
+        assert "delete_gmail_draft" not in tiers["gmail"]["extended"]
 
     def test_uses_compose_scope(self):
         """Match draft_gmail_message — both should require GMAIL_COMPOSE_SCOPE.
