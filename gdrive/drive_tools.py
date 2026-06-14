@@ -2064,10 +2064,7 @@ async def restore_drive_file(
     Returns:
         str: Confirmation message.
     """
-    # Require the holding folder to be configured so restore is only available
-    # in deployments where soft-delete is set up, even though restore moves the
-    # file out rather than in.
-    _get_holding_folder_id()
+    resolved_holding_id = await resolve_folder_id(service, _get_holding_folder_id())
 
     resolved_file_id, current = await resolve_drive_item(
         service,
@@ -2076,6 +2073,22 @@ async def restore_drive_file(
     )
     current_parents = current.get("parents", []) or []
     app_props = current.get("appProperties") or {}
+
+    # Restore only ever reverses a soft-delete. Refuse to touch an active file,
+    # otherwise (with target_folder_id) this would become an arbitrary move tool
+    # that yanks a live file out of its real folders. A file is considered
+    # soft-deleted if it carries our marker or currently sits in the holding
+    # folder.
+    is_soft_deleted = (
+        app_props.get("mcp_softdeleted") == "true"
+        or resolved_holding_id in current_parents
+    )
+    if not is_soft_deleted:
+        raise Exception(
+            f"'{current.get('name')}' is not soft-deleted (no mcp_softdeleted "
+            "marker and not in the holding folder); refusing to restore. Use "
+            "update_drive_file to move an active file."
+        )
 
     if target_folder_id:
         destinations = [await resolve_folder_id(service, target_folder_id)]

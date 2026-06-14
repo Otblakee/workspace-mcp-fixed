@@ -53,6 +53,12 @@ BLOCKED_TOOLS = frozenset(
         #   it at scale. The single-message variant is left enabled (it is the
         #   normal archive/label path); harden it separately if needed.
         "batch_modify_gmail_message_labels",
+        # --- Apps Script: Drive hard-delete bypass ------------------------
+        #   delete_script_project deletes the Drive-backed script file via
+        #   Drive files().delete (gappsscript/apps_script_tools.py), which
+        #   would bypass the Drive soft-delete replacement if appscript is ever
+        #   opted in. Blocked here so the gate holds regardless of --tools.
+        "delete_script_project",
     }
 )
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
@@ -25,6 +26,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TIERS_PATH = REPO_ROOT / "core" / "tool_tiers.yaml"
+
+
+def _unwrap(fn):
+    """Peel functools.wraps layers down to the original implementation."""
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    return fn
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +53,7 @@ EXPECTED_BLOCKED = {
     "delete_gmail_draft",
     "delete_gmail_filter",
     "batch_modify_gmail_message_labels",
+    "delete_script_project",
 }
 
 
@@ -147,3 +156,46 @@ class TestRegistrationSkip:
             "update_drive_file must not expose a trashed parameter; trashing is "
             "replaced by soft_delete_drive_file"
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. restore_drive_file only reverses a soft-delete
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreRefusesActiveFiles:
+    @pytest.mark.asyncio
+    async def test_restore_refuses_non_soft_deleted_file(self, monkeypatch):
+        """With target_folder_id, restore must not move an active file out of
+        its real folders; it only reverses a soft-delete."""
+        import gdrive.drive_tools as mod
+
+        monkeypatch.setenv("DRIVE_HOLDING_FOLDER_ID", "holding123")
+        monkeypatch.setattr(
+            mod, "resolve_folder_id", AsyncMock(return_value="holding123")
+        )
+        # Active file: no marker and not in the holding folder.
+        monkeypatch.setattr(
+            mod,
+            "resolve_drive_item",
+            AsyncMock(
+                return_value=(
+                    "file1",
+                    {
+                        "name": "Live.doc",
+                        "parents": ["realfolder"],
+                        "appProperties": {},
+                    },
+                )
+            ),
+        )
+        service = MagicMock()
+        impl = _unwrap(mod.restore_drive_file)
+        with pytest.raises(Exception, match="not soft-deleted"):
+            await impl(
+                service=service,
+                user_google_email="oliver@otbgroup.co.uk",
+                file_id="file1",
+                target_folder_id="somewhere",
+            )
+        service.files.return_value.update.assert_not_called()

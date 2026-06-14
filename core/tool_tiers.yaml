@@ -186,7 +186,6 @@ appscript:
     - list_deployments
     - update_deployment
     - delete_deployment
-    - delete_script_project
     - list_versions
     - create_version
     - get_version
