@@ -28,6 +28,7 @@ from core.config import (
     get_oauth_redirect_uri as get_oauth_redirect_uri_for_current_mode,
 )
 from core.audit import audit_log, logger as audit_logger
+from core.tool_policy import BLOCKED_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +99,7 @@ async def _ensure_audit_started() -> None:
     try:
         await audit_logger().start()
     except Exception as e:
-        logger.error(
-            "Audit logger failed to start; continuing without audit: %s", e
-        )
+        logger.error("Audit logger failed to start; continuing without audit: %s", e)
 
 
 async def _ensure_audit_stopped() -> None:
@@ -136,6 +135,17 @@ def _audited_tool(*args, **kwargs):
     register = _original_server_tool(*args, **kwargs)
 
     def apply(fn):
+        # Hard denylist, enforced at the single registration chokepoint every
+        # tool passes through (both entrypoints import tool modules after this
+        # patch is installed). A blocked tool's decorator becomes a no-op: it
+        # is never registered, never listed, never callable. Fail-closed and
+        # independent of tier / --tools / --read-only / env.
+        if fn.__name__ in BLOCKED_TOOLS:
+            logger.warning(
+                "tool_policy: refusing to register blocked tool '%s'", fn.__name__
+            )
+            return fn
+
         audited = audit_log()(fn)
 
         @functools.wraps(audited)
