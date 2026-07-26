@@ -391,6 +391,32 @@ security boundary — it belongs in version control and in change review.
 
 ### Phase 2 — Per-user RBAC (the main build)
 
+**Decision: build the RBAC layer.** A simpler option was considered and
+rejected — see §5.2 for what it was and why. The short version is that RBAC
+was chosen deliberately for future-proofing: it puts permissions in the Admin
+console rather than in deploy configuration, and it extends to per-tool,
+per-person rules without re-architecting. §5.2 also records the interim posture
+to run *while* this is being built, so onboarding is not blocked on it.
+
+Three layers already do useful work before any of this exists, and the design
+depends on understanding what each does:
+
+| Layer | Answers | Already enforced? |
+|---|---|---|
+| Google's own permissions | "May this *person* do this in Google at all?" | **Yes — free.** The MCP acts as the user with the user's token, so admin APIs and other people's data already 403. |
+| Workspace App access control | "May this person connect to the MCP at all?" | Available, unused. Admin-console only, no code. |
+| **This phase** | "Should the *agent* do this on the user's behalf?" | No — the gap being closed. |
+
+That third row is the whole justification. Google will happily let someone
+delete their own Drive file or send their own mail, because they genuinely hold
+that permission. What Google cannot distinguish is *the person deciding* from
+*an agent deciding for them* — which matters because prompt injection can make
+an agent act on content it merely read. OWASP's LLM Top 10 treats this as its
+own risk class (*Excessive Agency*): an agent should be limited to what it
+needs, not everything its identity could do. Capping destructive tools here is
+a blast-radius limit for the injection case, not a restatement of Google's
+permissions.
+
 The enforcement point must move from **boot time** to **call time**. Three
 new pieces:
 
@@ -409,18 +435,68 @@ absent from every role is callable by nobody. That inverts the current
 fail-open denylist posture (#13) without removing `BLOCKED_TOOLS`, which
 stays as the absolute floor.
 
-**Role source: Google Groups.** You have already modelled the org in groups —
-`otb-exec@`, `otb-it-admins@`, `jit-ops@`, `jit-finance@`, `bir-hs@`,
-`vale-workshop@` and ~46 more. Map groups → roles in config, cache with a
-short TTL. This means **permissions are administered in the Google Admin
-console, not in code** — no redeploy to change someone's access, and it stays
-correct when staff move between entities.
+**Role source: Google Groups — verified feasible against the live tenant.**
 
-The lookup **must not** go through the existing `list_user_groups` tool or any
-other `@require_google_service` path: those run on the caller's credentials
-and require the caller to be an admin (§5.1). Group resolution needs its own
-dedicated server-side credential — the service account — and belongs in
-`core/authz.py`, not in the tool layer.
+Two facts checked directly rather than assumed:
+
+- `peter.wilce@jit-logistics.com` resolves to **6 groups** (`jit-all@`,
+  `jit-ops@`, `jit-compliance@`, `jit-asset-cust@`,
+  `jit-externalshare-publishers@`, `ops@`). Cross-domain resolution works; a
+  secondary-domain user's groups come back correctly.
+- **The groups are flat.** Every member sampled across `otb-all@`,
+  `otb-fin-lead@` and `otb-asset-portfolio@` is `type=USER` — no
+  group-within-group nesting anywhere. This matters a great deal: transitive
+  (nested) group resolution is the Enterprise-gated, 403-prone part of the
+  Google APIs. OTB does not use nesting, so **only direct membership is needed
+  and the edition gate never applies.**
+
+Map groups → roles in a new `core/group_roles.yaml`. A user in several groups
+receives the **union** of their roles, most-permissive-wins. Starting point
+using the real groups:
+
+| Group | Role |
+|---|---|
+| `otb-it-admins@otbgroup.co.uk` | `admin` |
+| `otb-exec@otbgroup.co.uk` | `publisher` |
+| `otb-externalshare-publishers@otbgroup.co.uk` | `publisher` |
+| `jit-externalshare-publishers@jit-logistics.com` | `publisher` |
+| `otb-fin-lead@`, `otb-hr-lead@`, `otb-governance@` | `contributor` |
+| `jit-ops@`, `jit-compliance@`, `jit-finance@` | `contributor` |
+| `otb-all@`, `jit-all@`, `vale-all@`, `bir-all@` | `reader` |
+| *(no matching group)* | none — denied |
+
+Note how well the existing structure already fits: the
+`*-externalshare-publishers@` groups literally encode "allowed to share
+outward", which is exactly the capability worth gating. Peter lands on
+`publisher` via the union of `jit-all` → reader, `jit-ops` → contributor,
+`jit-externalshare-publishers` → publisher.
+
+The payoff is operational: **permissions are administered in the Admin
+console.** Move someone into `jit-ops@` and their MCP access changes at the
+next cache expiry. No redeploy, no code change, and it stays correct when staff
+move between entities.
+
+**The lookup must not run on the caller's credentials.** Not via the existing
+`list_user_groups` tool, nor any other `@require_google_service` path — those
+require the caller to be a Workspace admin and would 403 for every ordinary
+teammate (§5.1). Group resolution belongs in `core/authz.py` using the service
+account's own credential. The API call itself is unchanged
+(`groups().list(userKey=…)`); only the credential differs.
+
+**Failure mode — decide this deliberately.** What happens when the group lookup
+fails (API blip, expired key, revoked role)? Neither obvious answer is
+acceptable: hard fail-closed turns one Google hiccup into a total outage, and
+fail-open removes the authorization layer exactly when something is wrong. So:
+
+- cache resolved roles with a short TTL (~5–10 min);
+- **serve stale on lookup failure** up to a bounded staleness (~1 hour);
+- only then fail closed;
+- keep a small **break-glass static allowlist** in env granting `admin` to one
+  or two named addresses, so a bad service-account key cannot lock you out of
+  your own tooling.
+
+The break-glass list is not optional. Without it, the credential that gates
+everything is also the credential that, when broken, prevents you fixing it.
 
 **A second, free lever worth taking.** Workspace's own *App access control*
 (Admin console → Security → Access and data control → API controls → Manage
@@ -443,6 +519,45 @@ Both hooks are needed: filtering `list_tools` alone is cosmetic, and gating
 **Audit integration.** Add `role` and `decision` (allow/deny) columns so
 denied attempts are recorded. Denials are the highest-signal rows in the
 whole log.
+
+### 5.2 The simpler option, and the interim posture
+
+**What was considered.** Run one deployment per tier — a `standard` instance
+with read plus safe writes, and an `admin` instance with the full toolset
+including `gadmin` — each with its tool set fixed at boot via the existing
+`--tools` / `--tool-tier` / `--read-only` machinery, and gate *who reaches
+which* with Workspace App access control scoped to org units. No new
+authorization code at all.
+
+**Why it was rejected.** It only works while the requirement stays at two or
+three coarse tiers. The moment a rule cuts across them — "ops can soft-delete
+but not send as the group inbox", "this contractor gets Drive read only" — the
+answer becomes another deployment, and the number of instances grows with the
+number of distinct permission sets. Permissions also live in deploy
+configuration rather than the Admin console, so every change is a redeploy.
+RBAC was chosen for exactly this reason: one deployment, policy in config,
+identity resolved per call, extensible to per-person rules.
+
+**Keep the IdP gate anyway — the two are not alternatives.** App access control
+costs nothing to enable and answers a different question ("may this person
+connect at all?"). Use it to scope the OAuth client to the org units that
+should have the MCP, and let RBAC decide what they can do once connected. It
+also gives the only control that survives an app-layer misconfiguration.
+
+**Interim posture — do not block onboarding on the RBAC build.** The tier-trim
+above is a perfectly good stepping stone and requires no code:
+
+1. Complete Phase 0 (the hard blockers).
+2. Deploy with a **conservative fixed tool set** — no `gadmin`, no destructive
+   tools — and onboard staff onto that.
+3. Keep the full toolset to your own account, via a second instance or the
+   existing deployment.
+4. Ship RBAC, then collapse back to one deployment with policy doing the work.
+
+This gets the team productive on a safe surface within days rather than waiting
+weeks for the authorization layer. It also derisks the RBAC rollout: by the time
+policy is enforcing, real usage patterns will have shown which tools each group
+actually needs, so the role table is grounded in evidence rather than guesswork.
 
 ### Phase 3 — Audit integrity
 
@@ -479,6 +594,20 @@ Phases 3 and 4 can run in parallel with the rollout.
 
 The two migrations in §7 should come **first**, before Phase 0, because both
 get materially more expensive once there is more than one user.
+
+**Onboarding is not gated on Phase 2.** RBAC is the destination, but the interim
+posture in §5.2 lets the team start on a conservative fixed tool set as soon as
+Phase 0 lands. Practical order:
+
+| When | What | Team can use the MCP? |
+|---|---|---|
+| Week 1 | §7 migrations, then Phase 0 blockers | not yet |
+| Week 1–2 | Deploy conservative tool set + App access control | **yes, safe subset** |
+| Week 2 | Phase 1 SSO hardening, service account (§5.1) | yes |
+| Weeks 3–4 | Phase 2 RBAC, informed by real usage | yes, then full policy |
+
+Building RBAC *after* people are using a safe subset is strictly better than
+before: the role table gets written from observed need rather than guesswork.
 
 ### Two cheap checks to run before writing any code
 
