@@ -42,6 +42,22 @@ service: the deployment is running `gadmin` (Admin Directory tools + admin
 scopes) even though `render.yaml` excludes it and `main.py` marks it
 opt-in-only.
 
+**Two traps sit in the currently-documented plan, both of which would fire on
+the day the second user is added and neither of which the current user can
+trigger.** They are the most actionable findings here:
+
+- The `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk` value that `CLAUDE.md`
+  tells you to set before onboarding **locks out every account on a secondary
+  domain** — confirmed against the live tenant, where
+  `peter.wilce@jit-logistics.com` already exists (§4).
+- The group lookup the authorization design depends on runs on the *caller's*
+  credentials and requires the caller to be a Workspace admin. The first
+  non-admin teammate would fail that lookup and, under deny-by-default, be
+  locked out of every tool (§5.1).
+
+Both are invisible today because the sole user is a super admin on the primary
+domain. That is exactly why they would ship.
+
 ---
 
 ## 2. Findings
@@ -159,13 +175,44 @@ Plus `/99 _SYSTEM` (admin / breakglass) and `/Workspace Guests`.
 **Two consequences.**
 
 First, `CLAUDE.md` instructs setting `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk`
-before adding a second user. **That value would lock out every JIT user
-today.** Because `_claims_pass_domain_policy` prefers Google's `hd` claim,
-and `hd` returns the user's own domain rather than the customer's primary
-domain, a JIT user presents `hd=jit-logistics.com`, misses the allowlist and
-is rejected. The correct value now is
-`otbgroup.co.uk,jit-logistics.com`, and it must be updated again at each
-domain cutover.
+before adding a second user. **That value is a production lockout, not a
+hardening measure**, and it would bite real people.
+
+In a multi-domain customer, `hd` carries the *user's own* hosted domain, not
+the customer's primary domain. Google's own auth library documents the claim
+as "the hosted G Suite domain of **the user**", and each account is associated
+with either the primary or one secondary domain. So a JIT user presents
+`hd=jit-logistics.com`, misses a single-domain allowlist, and is rejected at
+`auth_info_middleware.py:65` — or at line 72 via the email-domain fallback if
+`hd` is absent.
+
+This is not hypothetical. A read-only Directory query against the live tenant
+found **`peter.wilce@jit-logistics.com`** (OU `/02 JIT/Compliance`) — a real
+staff account whose primary email is on the secondary domain. Meanwhile the
+current sole user signs in as `oliver@otbgroup.co.uk` and would *never* trip
+the bug, which is precisely why it would ship undetected and surface only when
+the second user is added. The rejection reason is logged and never returned to
+the client, so it presents as an unexplained auth failure affecting JIT staff
+only — about the hardest class of bug to diagnose remotely.
+
+The same query surfaced a **third domain**: `oliver@otbgroup.co.uk` carries
+aliases `otb@otbgroup.co.uk`, `oliver.blake@jit-logistics.com` and
+**`oliver@blakefamily.uk`**. Whether `blakefamily.uk` is a secondary domain
+(hosts its own sign-in accounts) or merely an alias domain (extra addresses
+only, cannot be used to sign in) is unresolved. **Enumerate the domain list
+from Admin console → Account → Domains, or `directory.domains.list`; do not
+guess it.** On current evidence the minimum correct value is
+`otbgroup.co.uk,jit-logistics.com`, plus `blakefamily.uk` if it is a sign-in
+domain — and it must be updated at every domain cutover and every domain
+addition.
+
+One inference worth converting to fact first: Google has never published a
+sentence stating outright that a secondary-domain user's `hd` is the secondary
+domain. The conclusion follows from Google's library wording, the
+primary/secondary account model, and universal operator experience — but before
+this becomes the basis of a production allowlist, have Peter complete the OAuth
+flow against a staging client and log the decoded `hd` and `email`. Five
+minutes, and it removes the only unverified link in this chain.
 
 Second — and this is the good news — **you do not need multi-tenancy.**
 Because the MCP always acts *as the calling user with that user's own OAuth
@@ -174,6 +221,26 @@ boundary. A JIT user physically cannot read a BIR Shared Drive through this
 MCP unless Google already grants it. So the RBAC layer's job is
 **capability control** (may this person delete? send mail? share
 externally?) — *not* data isolation, which is already solved.
+
+### 4.1 Personal accounts are out of scope (decided)
+
+An earlier draft of this plan weighed letting the owner's personal
+`@gmail.com` account onto this deployment. That would have forced the GCP
+OAuth client to stay **External**, because an Internal client cannot
+authorise a consumer account — Google rejects it at the IdP. The app-layer
+allowlist would then have become the only ring of defence rather than the
+second.
+
+That requirement has been removed. Personal Gmail now lives in a separate
+project — `Otblakee/personal-gmail-mcp`, a single-user server running locally
+over stdio, holding no organisational credentials and granting no
+organisational access.
+
+**Consequence for this deployment: it can and should go Internal.** Nothing
+here needs to admit an account outside the Workspace customer, so the
+strongest available control is now free to take. No capability is lost —
+consumer accounts could never use Groups, `gadmin` or domain-wide delegation
+anyway.
 
 ---
 
@@ -189,23 +256,124 @@ externally?) — *not* data isolation, which is already solved.
    -derivation chain.
 2. **Stop writing `client_secret` into per-user token files** (#16). Inject
    it from config at load time instead.
-3. **Set `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk,jit-logistics.com`** in
-   the Render dashboard and in `render.yaml` (#2). Correct the wrong value
-   documented in `CLAUDE.md`.
-4. **Add a customer-ID check** as the durable control: resolve the caller via
-   Admin Directory `users.get` and verify `customerId` matches OTB's. This
-   survives every domain cutover without a config edit, and is strictly
-   stronger than a domain string. Keep the domain allowlist as the cheap
-   outer ring.
-5. **Set the GCP OAuth client to Internal** if the project sits inside the
-   Workspace org. This is the IdP-side control and the only one that holds
-   if the app-layer check is ever misconfigured.
-6. **Reconcile the Render `TOOLS` value with `render.yaml`** (#3.2) — decide
-   deliberately whether `gadmin` should be live. If yes, put it in
-   `render.yaml`; if no, remove it from the dashboard.
+3. **Set the GCP OAuth client's audience to Internal.** This is now the
+   *primary* control, not an outer ring — see item 5 for why. Google enforces
+   customer membership at the authorization endpoint: a non-member is bounced
+   with `403 org_internal` before any code, token or callback exists. It
+   covers every domain in the tenant automatically, survives domain additions
+   with no config change, and rejects an unmanaged consumer account holding
+   one of your domain names — which no domain allowlist can do. Requires the
+   GCP project to sit inside the Workspace organisation resource, so do it in
+   the new project (§7.1).
+4. **Set `OAUTH_ALLOWED_EMAIL_DOMAINS` to the fully enumerated domain list**
+   (#2) — read from Admin console → Account → Domains, not assumed. See §4.
+   Add it to the redeploy checklist as *"must be updated whenever a Workspace
+   domain is added"*, and make a domain-policy rejection log loudly with the
+   rejected domain, so the next lockout is diagnosed in seconds.
+5. **Do not build the customer-ID check.** An earlier draft proposed resolving
+   the caller via Admin Directory `users.get` and comparing `customerId`.
+   That is not viable: no OIDC claim carries a customer ID (Google's discovery
+   document lists neither it nor even `hd` in `claims_supported`), and
+   `users.get` requires `admin.directory.user[.readonly]` — so every ordinary
+   user would have to consent to admin-directory scopes and would still 403 on
+   most calls. Internal (item 3) already enforces exactly this boundary, at
+   the IdP, for free.
+
+   Note the honest framing: **Internal and the domain allowlist are not
+   concentric rings.** Internal admits the whole customer, which is correct;
+   a domain list admits an enumerated subset, which is narrower and
+   hand-maintained. Once the list is complete it is a redundant restatement of
+   Internal that can only drift. Keep it as belt-and-braces, but do not
+   describe it as the thing protecting the deployment.
+6. **Reconcile the Render `TOOLS` value with `render.yaml`** (#3.2).
+   **Decided: keep `gadmin`.** It is load-bearing for the authorization layer
+   (§5 Phase 2) and worth building on. So add it to `render.yaml` rather than
+   removing it from the dashboard — but move its scopes off individual users
+   and onto the service account (§5.1), so ordinary staff never see an admin
+   consent prompt.
 7. **`os.makedirs(self.base_dir, mode=0o700)`** (#15) — one line.
 8. **Fix the audit `error` column** to run through `_redact` (#10) — small
    and stops a live PII leak into the sheet.
+
+### 5.1 The service account is the keystone
+
+One component unlocks three otherwise-awkward problems, and it should be built
+early rather than treated as a Phase 3 nicety: **a dedicated service account**,
+created in the new GCP project (§7.1).
+
+It solves:
+
+1. **Role resolution for ordinary staff.** See the outage below — this is not
+   an optimisation, it is the difference between the authorization layer
+   working and locking everyone out.
+2. **Admin scopes come off the user consent screen entirely.** `gadmin` is
+   staying (Phase 0 item 6), but staff should consent to Gmail, Drive and
+   Calendar only. The Admin SDK scopes — including
+   `admin.directory.user.security`, which the source itself notes also
+   authorises `tokens.delete` — then live solely with the service account.
+3. **Audit-log integrity.** The service account becomes the audit writer, so
+   users no longer need Editor on the sheet. That closes finding #5 and the
+   cross-user read of other people's `params_summary` in one move, which is
+   why Phase 3 item 13 should be pulled forward to here.
+
+#### The outage this prevents
+
+`list_user_groups` (`gadmin/admin_tools.py:339`) is decorated
+`@require_google_service("admin_directory", …)`, so it calls
+`groups().list(userKey=…)` **with the calling user's own credentials**. Its
+docstring already concedes the constraint: *"must be a Workspace admin."*
+
+The Admin SDK has no self-lookup exception — a non-admin gets `403 Not
+Authorized` even holding the scope. (Google documents non-admin paths where
+they exist: `users.get` has `viewType=domain_public`. Nothing equivalent
+exists for groups.) Today this is invisible because the only user is a super
+admin. **The moment a non-admin teammate is added, every authorization
+decision for that user 403s — and under a deny-by-default policy that locks
+them out of every tool.** The authz layer would fail closed on its own
+identity lookup: a self-inflicted outage, not a security boundary.
+
+#### Use direct role assignment, not domain-wide delegation
+
+There are two ways to give the service account group-read access. They are not
+equally safe:
+
+- **Cloud Identity + direct role assignment (recommended).** Enable
+  `cloudidentity.googleapis.com` and assign the **Group Administrator** role
+  directly to the service account via the Admin SDK `roleAssignments` API
+  (`assignedTo` = the SA's unique ID, `scopeType: CUSTOMER`). The SA then
+  calls with its own credentials in admin authorization mode. **No
+  impersonation, no delegation.**
+- **Admin SDK + domain-wide delegation (avoid if possible).** Requires a
+  `subject` — the SA must impersonate a real admin user. That grants the SA
+  the ability to act *as* a user, which is a far larger blast radius than
+  reading groups.
+
+Prefer the first. Domain-wide delegation is the single most dangerous
+credential in a Workspace tenant, and nothing here needs it.
+
+#### Why not resolve groups with the user's own token
+
+The Cloud Identity Groups API does have a documented non-admin mode
+(`searchDirectGroups` with `cloud-identity.groups.readonly`), so this looks
+tempting. It is a trap for an authorization layer:
+
+- **It silently under-reports.** Per the API description, groups the caller
+  lacks permission to view are *"silently filtered out"* — no error, no
+  indicator. Role sets would be quietly incomplete, producing denials that
+  depend on per-group visibility settings any group owner can change.
+- **Nested groups are Enterprise-gated.** `searchTransitiveGroups` and friends
+  return 403 below Enterprise Standard / Cloud Identity Premium. If OTB is on
+  Business Standard/Plus — likely, unconfirmed — there is no token-based
+  nested-group resolution at all.
+- **It widens every user token** with another scope, cutting against the
+  token-security posture already written into `CLAUDE.md`.
+
+Non-deterministic authorization is worse than none, because it is
+unfalsifiable in review. Resolve groups server-side.
+
+Keep the service account's scope list minimal and read-only: group reads for
+role resolution, plus Sheets write for the audit log. That list *is* the
+security boundary — it belongs in version control and in change review.
 
 ### Phase 1 — SSO hardening
 
@@ -243,12 +411,24 @@ stays as the absolute floor.
 
 **Role source: Google Groups.** You have already modelled the org in groups —
 `otb-exec@`, `otb-it-admins@`, `jit-ops@`, `jit-finance@`, `bir-hs@`,
-`vale-workshop@` and ~46 more. Resolve caller → groups via Admin Directory
-`list_user_groups`, map groups → roles in config, cache with a short TTL.
-This means **permissions are administered in the Google Admin console, not
-in code** — no redeploy to change someone's access, and it stays correct when
-staff move between entities. (This is the one legitimate reason to keep
-`gadmin` scopes enabled; decide #3.2 with that in mind.)
+`vale-workshop@` and ~46 more. Map groups → roles in config, cache with a
+short TTL. This means **permissions are administered in the Google Admin
+console, not in code** — no redeploy to change someone's access, and it stays
+correct when staff move between entities.
+
+The lookup **must not** go through the existing `list_user_groups` tool or any
+other `@require_google_service` path: those run on the caller's credentials
+and require the caller to be an admin (§5.1). Group resolution needs its own
+dedicated server-side credential — the service account — and belongs in
+`core/authz.py`, not in the tool layer.
+
+**A second, free lever worth taking.** Workspace's own *App access control*
+(Admin console → Security → Access and data control → API controls → Manage
+Third-Party App Access) can pin the MCP's OAuth client to Trusted/Limited and
+scope it to specific org units. That is Google-enforced, identity-based, and
+delivers a coarse per-user ACL — the thing `CLAUDE.md` parks as out of scope —
+without writing any code. Use it to gate *who can connect at all*, and the
+role layer to gate *what they can do*.
 
 **`core/authz_middleware.py` — enforcement.** A FastMCP middleware alongside
 `AuthInfoMiddleware`:
@@ -266,10 +446,11 @@ whole log.
 
 ### Phase 3 — Audit integrity
 
-13. Move audit writes to a **service account** (or Workload Identity
-    Federation) so users no longer need Editor on the sheet (#5, #9). This
-    removes the cross-user read of other people's `params_summary` at the
-    same time.
+13. Move audit writes to the **service account** so users no longer need
+    Editor on the sheet (#5). This removes the cross-user read of other
+    people's `params_summary` at the same time. **Pulled forward into §5.1** —
+    once the service account exists for role resolution, this is nearly free,
+    and it should not wait behind Phase 2.
 14. Mirror to **Render Postgres** with append-only grants, keeping Sheets as
     the human-readable view.
 15. Convert redaction to an **allowlist** — log only params explicitly marked
@@ -295,3 +476,95 @@ users who already have unrestricted access is a much harder conversation
 than granting them correctly the first time.
 
 Phases 3 and 4 can run in parallel with the rollout.
+
+The two migrations in §7 should come **first**, before Phase 0, because both
+get materially more expensive once there is more than one user.
+
+### Two cheap checks to run before writing any code
+
+Both are minutes of work and both de-risk decisions the rest of the plan
+rests on:
+
+1. **Enumerate the domains.** Admin console → Account → Domains (or
+   `directory.domains.list`). Record which are secondary (host their own
+   sign-in accounts) versus alias (extra addresses only). `blakefamily.uk` is
+   currently unclassified. Copy the customer ID while you are there for the
+   record, even though the app cannot read it at runtime.
+2. **Confirm the `hd` behaviour empirically.** Have
+   `peter.wilce@jit-logistics.com` complete the OAuth flow against a staging
+   client and log the decoded `hd` and `email`. Expected `hd=jit-logistics.com`.
+   This is the one link in the domain analysis that rests on inference rather
+   than a quotable line from Google, and it gates a production allowlist.
+
+Worth logging the claims dict once in staging too: access-token introspection
+generally returns no `hd` at all, so the email-domain fallback branch
+(`auth_info_middleware.py:72`) is probably the one actually running — which
+means the code comment claiming `hd` is preferred "because it's IdP-attested"
+overstates what is really being enforced.
+
+---
+
+## 7. Housing: new GCP project, new repository
+
+### 7.1 New Google Cloud project — and do it now
+
+Not the Workspace tenant, which stays exactly as it is (same four OUs, same
+groups, same users). Only the API project and its credentials change.
+
+Reasons:
+
+- The current project (`849437400675`) carries **six OAuth clients all named
+  "OTB Workspace MCP"** with wildly different scope sets (§3.3). One holds
+  full `drive` + `spreadsheets`; another ~30 scopes. A fresh project gives one
+  clean client, one clean consent screen, and a correctly-scoped service
+  account for delegation.
+- The old clients can then be revoked wholesale without touching the new one.
+- The Internal setting (§4.1) is cleanest applied to a project created for it.
+
+**The timing argument is the strong one, and it expires.** Migrating means
+every user re-consents. Today that is one person. After onboarding it is
+twenty. This is the cheapest it will ever be.
+
+### 7.2 New repository — rename and re-home, do not rewrite
+
+Move to a **private** `Otblakee/otb-workspace-mcp` (or preferred name), seeded
+by pushing the existing history to the new remote so blame survives. Do not
+start over: the ~30k lines of tool implementations are the asset.
+
+- Keep upstream (`taylorwilsdon/google_workspace_mcp`) as a named remote for
+  cherry-picking, but **stop treating it as a merge source.** Because
+  `BLOCKED_TOOLS` is a denylist (#13), a routine `git pull` from upstream can
+  silently register new destructive tools. Every upstream change needs
+  deliberate review. The deny-by-default policy in Phase 2 fixes this
+  properly.
+- **Delete the distribution artifacts**: `publish-mcp-registry.yml`,
+  `smithery.yaml`, `glama.json`, the DXT packaging. That workflow publishes to
+  PyPI and the MCP Registry — on a repository that will hold this
+  organisation's security configuration, that is a footgun with no upside.
+  It is dormant today (no Actions run has ever executed in the fork), but
+  dormant is not the same as removed.
+- The current name `workspace-mcp-fixed` describes a fork of a fork. The
+  divergence — audit logging, tool policy, soft delete, large-file support,
+  multi-user security, and now authorization — has made it a different
+  product.
+
+### 7.3 Render sizing
+
+**Standard (2 GB / 1 CPU) is right, and will carry well past 20 users.**
+Session state is a few KB per user. Calls are I/O-bound waiting on Google,
+which async handles well on a single core.
+
+The real ceiling is architectural, not the plan tier: the streamable-HTTP
+transport is session-stateful and `OAuth21SessionStore` is in-memory, so the
+service is pinned to one worker and every session dies on redeploy. Scaling
+horizontally requires moving that store to shared storage first — the OAuth
+*proxy* storage already supports Valkey; the session store does not yet.
+
+Memory is worth watching only if several users run large uploads or downloads
+concurrently; the `gc.collect()` after every tool call exists because
+googleapiclient leaks, which is a real signal. If OOM appears, Pro (4 GB) is
+the next step — but the single-worker limit will bite before RAM does.
+
+Also unset in production: `WORKSPACE_ATTACHMENT_DIR`, so attachments are
+currently written to ephemeral container storage rather than the persistent
+disk (`FOLLOWUPS.md` records this).
