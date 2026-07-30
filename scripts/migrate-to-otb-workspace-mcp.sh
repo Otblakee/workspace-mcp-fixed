@@ -46,14 +46,30 @@ if [[ -n "$(git status --porcelain)" ]]; then
     exit 1
 fi
 
-say "Checking the destination is empty"
-if git ls-remote --heads "$NEW_REMOTE_URL" 2>/dev/null | grep -q .; then
-    echo "ERROR: $NEW_REMOTE_URL already has branches." >&2
+say "Checking the destination is reachable and empty"
+# Distinguish "unreachable" from "empty" explicitly. Piping straight to grep
+# would treat a 403/404/typo as an empty repo and happily proceed, which is
+# exactly the wrong call — an auth failure must stop the run, not look like
+# a green light.
+if ! remote_heads="$(git ls-remote --heads "$NEW_REMOTE_URL" 2>&1)"; then
+    echo "ERROR: cannot reach $NEW_REMOTE_URL" >&2
+    echo "" >&2
+    echo "$remote_heads" >&2
+    echo "" >&2
+    echo "Check the URL, that the repo exists, and that you are authenticated" >&2
+    echo "(gh auth status). NOT proceeding — an unreachable remote is not an" >&2
+    echo "empty one." >&2
+    exit 1
+fi
+if [[ -n "$remote_heads" ]]; then
+    echo "ERROR: $NEW_REMOTE_URL already has branches:" >&2
+    echo "$remote_heads" >&2
+    echo "" >&2
     echo "This script is for the initial migration only. If you initialised the" >&2
     echo "repo with a README/licence, delete and recreate it empty." >&2
     exit 1
 fi
-echo "   destination is empty — good"
+echo "   reachable, and empty — good"
 
 # --- step 1: move the history --------------------------------------------
 
