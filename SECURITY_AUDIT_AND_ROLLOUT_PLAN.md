@@ -195,16 +195,48 @@ the second user is added. The rejection reason is logged and never returned to
 the client, so it presents as an unexplained auth failure affecting JIT staff
 only — about the hardest class of bug to diagnose remotely.
 
-The same query surfaced a **third domain**: `oliver@otbgroup.co.uk` carries
-aliases `otb@otbgroup.co.uk`, `oliver.blake@jit-logistics.com` and
-**`oliver@blakefamily.uk`**. Whether `blakefamily.uk` is a secondary domain
-(hosts its own sign-in accounts) or merely an alias domain (extra addresses
-only, cannot be used to sign in) is unresolved. **Enumerate the domain list
-from Admin console → Account → Domains, or `directory.domains.list`; do not
-guess it.** On current evidence the minimum correct value is
-`otbgroup.co.uk,jit-logistics.com`, plus `blakefamily.uk` if it is a sign-in
-domain — and it must be updated at every domain cutover and every domain
-addition.
+**The domain list has now been enumerated, and guessing would have been wrong
+twice.** Listing every user in the customer and reading their primary
+(sign-in) email gives 13 users across **three** sign-in domains:
+
+| Sign-in domain | Users | In allowlist? |
+|---|---|---|
+| `otbgroup.co.uk` | 11 | **yes** |
+| `jit-logistics.com` | 1 (`peter.wilce@`) | **yes** |
+| `arthistorywithemily.co.uk` | 1 (`emily@`, OU `/99 _SYSTEM/Personal`) | **decide — see below** |
+| `blakefamily.uk` | 0 | **no** — alias domain only |
+
+Two corrections to earlier assumptions:
+
+- **`blakefamily.uk` is an alias domain, not a secondary domain.** No account
+  has a primary email there, so nobody signs in with it and it must *not* go in
+  the allowlist. Alias-domain users authenticate as their primary address and
+  present the primary domain's `hd`.
+- **A fourth domain existed that nothing had surfaced**:
+  `arthistorywithemily.co.uk`, which does host a real sign-in account. Had the
+  allowlist been assembled from the aliases visible on the owner's account, this
+  one would have been missed entirely and that user silently locked out.
+
+So the value is:
+
+```
+OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk,jit-logistics.com
+```
+
+…plus `arthistorywithemily.co.uk` **only if** that account should have MCP
+access. It sits in `/99 _SYSTEM/Personal`, which suggests a personal account
+that happens to live in the tenant rather than OTB staff. Excluding it is
+probably right — and it is a good argument for gating connection by org unit
+via App access control (§5.2), which expresses "not this OU" far more directly
+than a domain list can.
+
+**Org unit does not track domain.** `jburton@otbgroup.co.uk` sits in `/02
+JIT/OPS`, and both the BIR and VALE staff (`evan.larke.bir@`,
+`sean.wallace.vale@`) are on `otbgroup.co.uk` pending their cutovers. Never
+infer someone's entity from their email domain, or vice versa — use the OU or
+their groups.
+
+Re-enumerate at every domain cutover and every domain addition.
 
 One inference worth converting to fact first: Google has never published a
 sentence stating outright that a secondary-domain user's `hd` is the secondary
@@ -265,11 +297,13 @@ anyway.
    one of your domain names — which no domain allowlist can do. Requires the
    GCP project to sit inside the Workspace organisation resource, so do it in
    the new project (§7.1).
-4. **Set `OAUTH_ALLOWED_EMAIL_DOMAINS` to the fully enumerated domain list**
-   (#2) — read from Admin console → Account → Domains, not assumed. See §4.
-   Add it to the redeploy checklist as *"must be updated whenever a Workspace
-   domain is added"*, and make a domain-policy rejection log loudly with the
-   rejected domain, so the next lockout is diagnosed in seconds.
+4. **Set `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk,jit-logistics.com`** (#2).
+   Enumerated from the live directory, not assumed — see §4 for the full
+   working, including why `blakefamily.uk` is excluded and whether
+   `arthistorywithemily.co.uk` should be added. Put it on the redeploy
+   checklist as *"must be updated whenever a Workspace domain is added"*, and
+   make a domain-policy rejection log loudly with the rejected domain, so the
+   next lockout is diagnosed in seconds rather than hours.
 5. **Do not build the customer-ID check.** An earlier draft proposed resolving
    the caller via Admin Directory `users.get` and comparing `customerId`.
    That is not viable: no OIDC claim carries a customer ID (Google's discovery
@@ -611,19 +645,16 @@ before: the role table gets written from observed need rather than guesswork.
 
 ### Two cheap checks to run before writing any code
 
-Both are minutes of work and both de-risk decisions the rest of the plan
-rests on:
-
-1. **Enumerate the domains.** Admin console → Account → Domains (or
-   `directory.domains.list`). Record which are secondary (host their own
-   sign-in accounts) versus alias (extra addresses only). `blakefamily.uk` is
-   currently unclassified. Copy the customer ID while you are there for the
-   record, even though the app cannot read it at runtime.
-2. **Confirm the `hd` behaviour empirically.** Have
+1. ~~**Enumerate the domains.**~~ **Done** — see §4. Three sign-in domains
+   (`otbgroup.co.uk`, `jit-logistics.com`, `arthistorywithemily.co.uk`);
+   `blakefamily.uk` is alias-only and excluded. Worth repeating at each domain
+   cutover.
+2. **Confirm the `hd` behaviour empirically.** *Still outstanding.* Have
    `peter.wilce@jit-logistics.com` complete the OAuth flow against a staging
    client and log the decoded `hd` and `email`. Expected `hd=jit-logistics.com`.
    This is the one link in the domain analysis that rests on inference rather
-   than a quotable line from Google, and it gates a production allowlist.
+   than a quotable line from Google, and it gates a production allowlist. It
+   cannot be done by API — it needs a real sign-in.
 
 Worth logging the claims dict once in staging too: access-token introspection
 generally returns no `hd` at all, so the email-domain fallback branch
@@ -654,6 +685,39 @@ Reasons:
 every user re-consents. Today that is one person. After onboarding it is
 twenty. This is the cheapest it will ever be.
 
+### 7.1a GCP project runbook
+
+Console work; none of it can be scripted from here.
+
+1. **Create the project.** Must be created *inside the Workspace organisation
+   resource* — otherwise the Internal audience option is silently unavailable.
+   Suggested id: `otb-workspace-mcp`.
+2. **Enable APIs:** Gmail, Drive, Calendar, Docs, Sheets, People,
+   Admin SDK (`admin.googleapis.com`), Cloud Identity
+   (`cloudidentity.googleapis.com`).
+3. **OAuth consent screen → audience: Internal.** If Internal is greyed out,
+   the project is not in the org — fix that before continuing, it is the whole
+   point of the migration.
+4. **Create one OAuth client** (Web application) with the Render redirect URI.
+   One client, not six.
+5. **Create the service account** (§5.1). No key needed yet if you defer role
+   resolution; otherwise generate a JSON key and store it as a Render secret.
+6. **Assign the service account the Groups Reader admin role** —
+   Admin console → Account → Admin roles, assign to the service account's
+   unique ID. Try Groups Reader first; Google's own Cloud Identity setup docs
+   name Groups Admin, so escalate only if group reads 403.
+7. **App access control** — Admin console → Security → Access and data control
+   → API controls → Manage Third-Party App Access. Add the new client ID, mark
+   Trusted, and scope it to the org units that should have the MCP. Consider
+   excluding `/99 _SYSTEM/Personal` (see §4).
+8. **Swap the Render env vars** to the new client id/secret, redeploy,
+   re-consent once as yourself, and confirm tools still work.
+9. **Only then** revoke the six old clients (§3.3) and the stale third-party
+   grants (§3.4).
+
+Step 9 last, deliberately: keep the old path working until the new one is
+proven, or a failed cutover locks you out of your own tooling.
+
 ### 7.2 New repository — rename and re-home, do not rewrite
 
 Move to a **private** `Otblakee/otb-workspace-mcp` (or preferred name), seeded
@@ -676,6 +740,28 @@ start over: the ~30k lines of tool implementations are the asset.
   divergence — audit logging, tool policy, soft delete, large-file support,
   multi-user security, and now authorization — has made it a different
   product.
+
+**Decided name: `Otblakee/otb-workspace-mcp`, private.**
+
+Migration steps:
+
+1. Create the empty repo — **no** README, .gitignore or licence, or the
+   auto-generated commit conflicts with the pushed history.
+2. `git remote add otb https://github.com/Otblakee/otb-workspace-mcp`
+   then `git push otb --all && git push otb --tags` to carry full history.
+3. Rename the upstream remote to `upstream` and leave it fetch-only.
+4. **Cleanup commit in the new repo** — delete `publish-mcp-registry.yml`,
+   `smithery.yaml`, `glama.json`, `manifest.json`, `google_workspace_mcp.dxt`
+   (1.4 MB of build artifact), and `README_NEW.md`. Retarget
+   `docker-publish.yml` at a private registry or delete it. Update
+   `pyproject.toml` name and the README.
+5. Check `tests/test_deploy_config.py` — it asserts against deployment
+   metadata and may reference the removed files.
+6. Archive `workspace-mcp-fixed` once the new repo is proven.
+
+The cleanup belongs in the new repo *after* the history push, not as a commit
+on the old one — that way the migration is a pure move and the cleanup is a
+reviewable diff on top.
 
 ### 7.3 Render sizing
 
