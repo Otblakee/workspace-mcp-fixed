@@ -94,3 +94,33 @@ the `WORKSPACE_ATTACHMENT_DIR=/data/attachments` value from `render.yaml` is
 not actually set in the Render dashboard. Set it (or sync the dashboard env
 group with `render.yaml`) so relay files land on the persistent disk rather
 than the ephemeral container filesystem.
+
+## `hd` claim semantics in a multi-domain Workspace (verified)
+
+In a Workspace customer with secondary domains, the OAuth `hd` claim carries
+**the user's own hosted domain**, not the customer's primary domain. A user
+whose primary email is on a secondary domain presents that secondary domain.
+
+Consequence: any allowlist built on `hd` (or on the email-domain fallback)
+must enumerate **every** domain in the customer. A single-domain value silently
+rejects real staff, and `auth_info_middleware.py` logs the reason without
+returning it to the client, so it presents as an unexplained auth failure for
+one entity's users only.
+
+Verified against the live tenant: `peter.wilce@jit-logistics.com` exists in OU
+`/02 JIT/Compliance`, so `jit-logistics.com` is a secondary domain hosting real
+sign-in accounts. A third domain, `blakefamily.uk`, appears as an alias on
+`oliver@otbgroup.co.uk` and is **not yet classified** as secondary vs alias —
+enumerate via `directory.domains.list` before setting any allowlist.
+
+Caveat on the evidence: Google has never published this rule verbatim. It
+follows from their auth-library wording ("the hosted G Suite domain of *the
+user*"), the primary/secondary account model, and consistent operator
+experience. Confirm empirically with one staging sign-in before relying on it.
+
+Related: alias domains are *not* secondary domains — an alias-domain address
+cannot be used to sign in, so those users still present the primary domain.
+
+Note also that access-token introspection generally returns no `hd`, so the
+email-domain fallback branch is likely the one actually executing. Log the
+claims dict once in staging to confirm which branch fires.
