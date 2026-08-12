@@ -37,6 +37,7 @@ from gdrive.drive_helpers import (
     check_public_link_permission,
     format_permission_info,
     get_drive_image_url,
+    get_holding_folder_id,
     resolve_drive_item,
     resolve_folder_id,
     validate_expiration_time,
@@ -1931,17 +1932,12 @@ async def update_drive_file(
 def _get_holding_folder_id() -> str:
     """Resolve the soft-delete holding folder ID from the environment.
 
-    Read lazily (not at import) so the value can be set per-deploy and so
-    tests can patch it. Raises if unset: soft-delete fails closed rather than
-    silently doing nothing.
+    Thin alias kept for the call sites below; the implementation lives in
+    ``gdrive.drive_helpers`` so the hub-shortcut soft-delete in
+    ``gdrive.drive_migration_tools`` shares exactly one definition of where
+    soft-deleted items go.
     """
-    folder_id = os.getenv("DRIVE_HOLDING_FOLDER_ID", "").strip()
-    if not folder_id:
-        raise Exception(
-            "DRIVE_HOLDING_FOLDER_ID is not set. Refusing to soft-delete: set it "
-            "to the ID of a private holding folder you own and empty manually."
-        )
-    return folder_id
+    return get_holding_folder_id()
 
 
 @server.tool()

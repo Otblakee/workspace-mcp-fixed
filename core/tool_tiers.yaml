@@ -37,6 +37,22 @@ drive:
     - create_drive_upload_session
     - confirm_drive_upload
     - download_drive_file
+    # Architecture build (P1): shared drives, guarded permissions, shortcuts.
+    # Kept at "extended" so the live Render deploy (TOOL_TIER=extended) picks
+    # them up without another tier change.
+    - create_shared_drive
+    - update_shared_drive
+    - list_shared_drives
+    - set_drive_permission
+    - revoke_drive_permission
+    - create_shortcut
+    # Migration engine (P2) + batch helpers (P3).
+    - walk_drive
+    - get_drive_file_metadata
+    - create_folder_tree
+    - batch_copy_from_manifest
+    - reconcile_folders
+    - rebuild_hub
   complete:
     - get_drive_file_permissions
     - check_drive_file_public_access
@@ -218,4 +234,24 @@ gadmin:
     - query_token_audit_log
     - query_drive_audit_log
     - query_usage_report
+  complete: []
+
+# Admin SDK Directory WRITE — groups and group membership only.
+#
+# Separate service from `gadmin` on purpose: `gadmin` is read-only by a
+# source-enforced contract and requests readonly scopes only. This section is
+# the one place Admin SDK writes exist, it is limited to groups.insert /
+# members.insert / members.update / members.delete, and the service is opt-in
+# (OPT_IN_TOOLS in main.py) so a wiped TOOLS env var never enables it.
+#
+# Before enabling on Render, add
+# https://www.googleapis.com/auth/admin.directory.group to the OAuth consent
+# screen (and to domain-wide delegation, if used), and confirm the calling
+# identity holds a Workspace admin role with Groups privileges.
+gadmin_write:
+  core:
+    - create_group
+    - add_group_member
+    - remove_group_member
+  extended: []
   complete: []

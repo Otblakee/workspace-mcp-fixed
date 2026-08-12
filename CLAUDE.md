@@ -431,3 +431,161 @@ the 25-day admin restore window for emptied trash; Drive sharing settings to
 cap exfiltration; API controls / app access control + an Internal OAuth
 client to limit who can use the token; Context-Aware Access to pin source IP
 (needs static egress + Enterprise tier).
+
+## Drive architecture + migration tools (claude/otb-drive-mcp-gaps-t5hb6x)
+
+Implements the gap analysis in OTB_IT_DriveMcpToolGaps_2026-08-12_v1, which
+in turn implements OTB_IT_TargetDriveArchitecture_2026-07-31_v1.xlsx. Fifteen
+new tools across three new modules, plus shared plumbing.
+
+**New files**
+- `gdrive/drive_batch.py` — retry/backoff, pagination, the groups-only
+  permission guardrail, manifest parsing, JSONL report writing. No tools; all
+  unit-testable without touching FastMCP.
+- `gdrive/shared_drive_tools.py` — P1 architecture-build tools.
+- `gdrive/drive_migration_tools.py` — P2 migration engine + P3 batch helpers.
+- `gadmin/admin_group_tools.py` — the opt-in Admin SDK group-write service.
+
+Tests: `tests/gdrive/test_drive_batch.py`,
+`tests/gdrive/test_shared_drive_tools.py`,
+`tests/gdrive/test_drive_migration_tools.py`,
+`tests/test_admin_group_write.py`.
+
+### P1 — architecture build
+
+| Tool | API | Notes |
+| --- | --- | --- |
+| `create_shared_drive` | `drives.create` | `requestId` (UUID) makes our own retries idempotent. OU placement stays an Admin console step — no reliable public API. |
+| `update_shared_drive` | `drives.update` | Rename + the four restriction flags (plus `sharingFoldersRequiresOrganizerPermission`). Re-reads `drives.get` after the update and flags a rename that didn't round-trip. |
+| `list_shared_drives` | `drives.list` | Optional `use_domain_admin_access`. Says so explicitly when `max_results` capped the result. |
+| `set_drive_permission` | `permissions.create` / `.update` | Groups-only guardrail. Idempotent. |
+| `revoke_drive_permission` | `permissions.delete` | Refuses self-lockout; refuses to remove the last organizer of a shared drive. |
+| `create_shortcut` | `files.create` (shortcut mime) | Idempotent per (target, parent). Refuses to chain shortcuts. |
+
+**Naming decision — `revoke_drive_permission`, not `remove_drive_permission`.**
+`remove_drive_permission` is in `BLOCKED_TOOLS`, and enforcement is by
+`fn.__name__` at the registration chokepoint: a new function under that name
+would be silently unregistered. Removing it from the denylist would re-expose
+the unguarded legacy implementation that still lives in `gdrive/drive_tools.py`.
+Renaming the new tool was the lower-risk option. The legacy sharing tools
+(`share_drive_file`, `batch_share_drive_file`, `set_drive_file_permissions`,
+`update_drive_permission`, `remove_drive_permission`, `transfer_drive_ownership`)
+all stay blocked — the guarded tools are additive, not a relaxation.
+
+**Groups-only guardrail** (`drive_batch.resolve_principal`). The declared
+permission `type` is what makes it fail closed: default `type=group` means
+Drive itself rejects a personal address, so an individual grant cannot happen
+by accident. `allow_individual=True` switches the type to `user` explicitly.
+`anyone` / `domain` principals are refused in-tool and have no escape hatch —
+no tool on this server can create a public link.
+
+### P2/P3 — migration engine
+
+| Tool | Notes |
+| --- | --- |
+| `walk_drive` | Two passes: BFS by parent, then (shared-drive roots) an independent `corpora=drive` sweep. Sweep-only items are added to the manifest tagged `discovered_by: "sweep"` and called out in the summary — that's the fix for the lossy crawl that missed six folders and a whole drive. Rows sorted by path so two walks of a static drive are byte-identical. |
+| `get_drive_file_metadata` | `files.get` with md5/sha1/sha256, `properties`, `appProperties`, `parents`, `driveId`. Says explicitly when the file is native Google and therefore checksumless. |
+| `create_folder_tree` | Accepts `paths=[...]` or the xlsx tab-02 manifest shape (`drive`, `folder_path`, `action`). Existing path = reuse. Returns path → ID for registry write-back. |
+| `batch_copy_from_manifest` | Idempotency key is the `mcp_source_file_id` **appProperty**, queried via `appProperties has { key=… and value=… }`. User-visible provenance goes in `properties` (`sourceFileId`, `sourceDrive`, `migrationBatch`). Rows run `batch_size` at a time; a failing row is recorded and the run continues. |
+| `reconcile_folders` | Path-keyed diff emitting `missing_in_dest`, `extra_in_dest`, `mime_mismatch`, `size_mismatch`, `checksum_mismatch`, `checksum_unavailable`, `unverifiable_native`. The last two are non-blocking; everything else blocks the go/no-go. |
+| `rebuild_hub` | Reads the registry's `hub_section` column, ensures a section folder per distinct value, diffs shortcuts by `targetId`. Orphan removal is opt-in (`remove_orphans=True`) and **soft-deletes** — see below. |
+
+**Orphan removal never hard-deletes.** A shortcut is a Drive file, so
+`rebuild_hub` moves orphans into `DRIVE_HOLDING_FOLDER_ID` with the same
+`mcp_softdeleted` / `mcp_orig_parents` markers `soft_delete_drive_file` writes,
+which means `restore_drive_file` reverses it. It fails closed if
+`DRIVE_HOLDING_FOLDER_ID` is unset. `tests/gdrive/test_drive_migration_tools.py`
+asserts the module contains no `.delete(` call at all.
+
+`_get_holding_folder_id` moved from `gdrive/drive_tools.py` to
+`gdrive.drive_helpers.get_holding_folder_id` so both soft-delete paths share
+one definition; `drive_tools._get_holding_folder_id` is now a thin alias.
+
+**Reports, not inline dumps.** `walk_drive`, `batch_copy_from_manifest` and
+`reconcile_folders` write JSONL into the attachment store (0600, 1-hour
+expiry) and return a summary plus the access line. A 40k-row inventory does
+not belong in an MCP tool result.
+
+### Admin SDK group writes — the one carve-out
+
+`gadmin` stays read-only. Group writes live in a **separate service**,
+`gadmin_write` (module `gadmin/admin_group_tools.py`), with its own scope list
+`ADMIN_WRITE_SCOPES` and its own `tool_tiers.yaml` section. It is in
+`OPT_IN_TOOLS`, so a wiped `TOOLS` env var never enables it.
+
+The write surface is deliberately three tools: `create_group`,
+`add_group_member`, `remove_group_member`. No user writes, no OU writes, no
+role assignment, no group deletion — those stay on GAM CLI / the Admin
+Console, and a parametrised source scan in `tests/test_admin_group_write.py`
+asserts none of them are reachable.
+
+`tests/test_admin_readonly.py` changed in exactly one place: the forbidden
+scope-literal list no longer includes `admin.directory.group`, and a new test
+pins that exception — the scope must be in `ADMIN_WRITE_SCOPES`, must not be in
+`ADMIN_SCOPES` or either `gadmin` map, and must not be granted under
+`--read-only`. Every other forbidden write scope (user, orgunit,
+rolemanagement, device.mobile) is still banned outright.
+
+### Scope wiring
+
+- New scope group `drive_full` → `https://www.googleapis.com/auth/drive`.
+  Required because `drive.file` cannot reach `drives.*` or permissions on
+  items this app did not create. `DRIVE_SCOPES` already contained
+  `DRIVE_SCOPE`, so the consent prompt is unchanged for the `drive` service.
+- New scope group `admin_directory_group_write` →
+  `https://www.googleapis.com/auth/admin.directory.group`. **This is a consent
+  screen change** — add it before enabling `gadmin_write` or every call 403s.
+
+### New env vars (both optional)
+
+- `DRIVE_PERMISSION_ALLOWED_DOMAINS` — comma-separated domain allowlist for
+  permission principals. Unset → no restriction. Set to `otbgroup.co.uk` to
+  refuse external grants at the tool boundary.
+- `DRIVE_HOLDING_FOLDER_ID` — already required for soft-delete; now also
+  required for `rebuild_hub(remove_orphans=True)`.
+
+### Render redeploy checklist
+
+1. `TOOLS` stays service names only (`gmail drive calendar docs sheets
+   contacts`). `TOOL_TIER=extended` already loads all twelve new Drive tools —
+   they are declared at the extended tier precisely so no tier change is
+   needed.
+2. To enable group writes: add `gadmin_write` to `TOOLS`, and first add
+   `https://www.googleapis.com/auth/admin.directory.group` to the OAuth
+   consent screen.
+3. Optional: set `DRIVE_PERMISSION_ALLOWED_DOMAINS=otbgroup.co.uk`.
+4. No new pip dependencies.
+
+### Rollback
+
+The change is additive. To roll back a single tool, remove its name from
+`core/tool_tiers.yaml` (it stops being registered under tier filtering) or add
+it to `BLOCKED_TOOLS` in `core/tool_policy.py` (fail-closed, independent of
+every other switch). To roll back the group-write service entirely, drop
+`gadmin_write` from `TOOLS` — no code change, and the scope stops being
+requested. To roll back the whole branch, revert the merge commit; the only
+edits to pre-existing behaviour are the `_get_holding_folder_id` move (pure
+refactor, same semantics) and the `tests/test_admin_readonly.py` carve-out.
+
+### Benchmark note (TBRDC)
+
+Measured against the mocked service doubles, not live Google — API latency
+dominates in reality. Structural throughput characteristics:
+
+- `walk_drive`: 1 `files.list` per folder (pageSize 1000, fully drained) plus
+  1 sweep pass per 1000 items. A 5k-item drive with 400 folders is ~405
+  requests. Expect roughly 1.5–3k items/min against live Drive, network-bound.
+- `batch_copy_from_manifest`: 3 requests per row (provenance check, source
+  `files.get`, `files.copy`), `batch_size` rows concurrently (default 10).
+  Live throughput is capped by Drive's per-user write quota well before this
+  server's; lower `batch_size` if 403 `userRateLimitExceeded` shows up in the
+  result log.
+- `reconcile_folders`: two full walks, so roughly 2× `walk_drive` cost.
+
+Record real numbers in `FOLLOWUPS.md` after the first live pilot.
+
+### Live verification still outstanding
+
+The suite is unit-scope with mocked Google services. Before the architecture
+build runs for real, execute the scratch-shared-drive checks listed in
+`FOLLOWUPS.md` under "Live scratch-drive verification".

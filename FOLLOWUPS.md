@@ -94,3 +94,70 @@ the `WORKSPACE_ATTACHMENT_DIR=/data/attachments` value from `render.yaml` is
 not actually set in the Render dashboard. Set it (or sync the dashboard env
 group with `render.yaml`) so relay files land on the persistent disk rather
 than the ephemeral container filesystem.
+
+## Live scratch-drive verification (Drive architecture + migration tools)
+
+`tests/gdrive/test_shared_drive_tools.py`,
+`tests/gdrive/test_drive_migration_tools.py` and
+`tests/test_admin_group_write.py` are unit-scope with mocked Google services.
+The following must be run once against a **scratch shared drive** before the
+real architecture build, and the results recorded here:
+
+1. `create_shared_drive` → confirm the drive appears in `list_shared_drives`
+   and in the Admin console.
+2. `update_shared_drive` rename → confirm the round-trip check passes (the
+   tool re-reads `drives.get`; a silent failure would surface as the "did not
+   round-trip" warning).
+3. `set_drive_permission` with a real group → confirm the role via
+   `get_drive_file_permissions`. Then repeat the same call and confirm it
+   reports "No change". Then call it with a personal address and **no**
+   `allow_individual` and confirm Google rejects it (this is the guardrail's
+   real enforcement point, and it is the one behaviour the mocks cannot prove).
+4. `revoke_drive_permission` against a second organizer; then attempt to
+   revoke the last organizer and confirm the refusal fires.
+5. `create_shortcut` twice with the same (target, parent) → confirm exactly
+   one shortcut exists.
+6. `walk_drive` twice against a static scratch drive → confirm identical row
+   counts and identical manifest bytes. Add a folder that the parent walk
+   cannot reach (e.g. a folder whose only parent link is broken) and confirm
+   it is reported as sweep-only.
+7. `batch_copy_from_manifest` 50-file pilot → confirm zero unstamped copies,
+   then re-run the identical manifest and confirm zero copies.
+8. `reconcile_folders` on the pilot → confirm 0 blocking discrepancies before
+   the full run is authorised.
+9. `rebuild_hub` with `dry_run=True` first; then `remove_orphans=True` and
+   confirm the orphan lands in `DRIVE_HOLDING_FOLDER_ID` (not trash) and that
+   `restore_drive_file` puts it back.
+
+Record measured items/min for `walk_drive` and rows/min for
+`batch_copy_from_manifest` here once available; the numbers in `CLAUDE.md` are
+structural estimates only.
+
+## Parked out of the Drive architecture branch
+
+- **Permission expiry on shared drives.** `set_drive_permission` accepts
+  `expiration_time` and validates its RFC 3339 shape, but Google only honours
+  expiries on reader/commenter/writer *file* permissions — shared-drive
+  memberships cannot expire. The tool passes the value through and lets Drive
+  reject it rather than maintaining a second copy of Google's matrix. If the
+  live run shows a confusing error, add an explicit pre-check.
+- **`walk_drive` on My Drive folders.** The drive-wide sweep needs a
+  `driveId` corpus, so a root that is a folder *inside* a drive gets the
+  parent walk only and a warning saying so. A `corpora=user` sweep filtered to
+  descendants would close this; it was not needed for the shared-drive
+  migration.
+- **Multi-parent items.** The inventory records an item once and warns on the
+  second visit. Correct for shared drives (single parent), lossy for legacy My
+  Drive content with multiple parents. Revisit only if a My Drive migration
+  lands.
+- **`create_folder_tree` concurrency.** Path segments are created
+  sequentially so a shared prefix is never created twice. Fine at ~60 folders
+  per template; if a template ever runs to thousands, batch the independent
+  leaves.
+- **Registry write-back.** `create_folder_tree` returns path → ID but does not
+  write those IDs back to the Folder Registry sheet. That is a deliberate
+  seam: the caller decides which registry column and row each ID belongs in.
+  A `write_folder_registry` tool could close the loop.
+- **OU placement of new shared drives** stays an Admin console step — there
+  is no reliable public API for moving shared drives between OUs. Verify the
+  API state before building anything here.

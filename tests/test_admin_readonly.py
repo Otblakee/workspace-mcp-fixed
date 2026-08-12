@@ -121,13 +121,19 @@ class TestScopesWired:
 
     def test_no_admin_write_scope_anywhere_in_scopes_module(self):
         """Defence in depth: no Admin SDK write scope URL appears anywhere
-        in ``auth.scopes`` source. If someone tries to add one, this trips."""
+        in ``auth.scopes`` source. If someone tries to add one, this trips.
+
+        One documented exception: ``admin.directory.group``. It is required by
+        ``groups.insert`` (no narrower scope authorises group creation) and is
+        used only by the opt-in ``gadmin_write`` service. The test below pins
+        that exception to ADMIN_WRITE_SCOPES so it cannot leak into
+        ADMIN_SCOPES or the read-only map.
+        """
         scopes_path = Path(__file__).resolve().parent.parent / "auth" / "scopes.py"
         src = scopes_path.read_text()
-        # The five canonical Admin SDK write scope suffixes.
+        # The canonical Admin SDK write scope suffixes that remain forbidden.
         forbidden = [
             "auth/admin.directory.user\"",  # bare (write) variant
-            "auth/admin.directory.group\"",
             "auth/admin.directory.orgunit\"",
             "auth/admin.directory.rolemanagement\"",
             "auth/admin.directory.device.mobile\"",
@@ -136,6 +142,34 @@ class TestScopesWired:
             assert needle not in src, (
                 f"Forbidden Admin SDK write scope referenced in auth/scopes.py: {needle}"
             )
+
+    def test_group_write_scope_is_isolated_to_the_opt_in_write_service(self):
+        """The single permitted Admin write scope must never reach the
+        read-only ``gadmin`` service, in either scope map."""
+        from auth.scopes import (
+            ADMIN_DIRECTORY_GROUP_SCOPE,
+            ADMIN_SCOPES,
+            ADMIN_WRITE_SCOPES,
+            TOOL_READONLY_SCOPES_MAP,
+            TOOL_SCOPES_MAP,
+        )
+
+        assert (
+            ADMIN_DIRECTORY_GROUP_SCOPE
+            == "https://www.googleapis.com/auth/admin.directory.group"
+        )
+        assert ADMIN_DIRECTORY_GROUP_SCOPE in ADMIN_WRITE_SCOPES
+        # Never in the read-only admin service.
+        assert ADMIN_DIRECTORY_GROUP_SCOPE not in ADMIN_SCOPES
+        assert ADMIN_DIRECTORY_GROUP_SCOPE not in TOOL_SCOPES_MAP["gadmin"]
+        assert ADMIN_DIRECTORY_GROUP_SCOPE not in TOOL_READONLY_SCOPES_MAP["gadmin"]
+        # And never granted when the server runs with --read-only.
+        assert (
+            ADMIN_DIRECTORY_GROUP_SCOPE
+            not in TOOL_READONLY_SCOPES_MAP["gadmin_write"]
+        )
+        # The write service does request it in normal mode.
+        assert ADMIN_DIRECTORY_GROUP_SCOPE in TOOL_SCOPES_MAP["gadmin_write"]
 
 
 class TestServiceDecoratorWired:
@@ -413,6 +447,9 @@ class TestMainOptIn:
         import main
 
         assert "gadmin" in main.OPT_IN_TOOLS
+        # The Admin write service must be opt-in for the same reason, and more
+        # strongly: a wiped TOOLS env var must never enable group writes.
+        assert "gadmin_write" in main.OPT_IN_TOOLS
         # And the default-tools branch must apply the OPT_IN_TOOLS filter.
         assert "if t not in OPT_IN_TOOLS" in src
 

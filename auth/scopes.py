@@ -113,6 +113,25 @@ ADMIN_DIRECTORY_USER_SECURITY_SCOPE = (
     "https://www.googleapis.com/auth/admin.directory.user.security"
 )
 
+# Admin SDK Directory WRITE scope — groups and group membership only.
+#
+# This is the single write scope in the repo and it exists solely for the
+# ``gadmin_write`` service (gadmin/admin_group_tools.py: create_group,
+# add_group_member, remove_group_member). The Drive architecture build has to
+# create the groups that every Drive_Permissions row grants to, and there is no
+# narrower Google scope that authorises ``groups.insert``
+# (``admin.directory.group.member`` covers membership but not group creation).
+#
+# It is deliberately NOT in ADMIN_SCOPES: the read-only ``gadmin`` service must
+# keep requesting readonly scopes only, so enabling the admin *read* tools can
+# never silently confer write access. It is requested only when ``gadmin_write``
+# is explicitly named in --tools / the TOOLS env var, which is an opt-in service
+# (see OPT_IN_TOOLS in main.py).
+#
+# The Admin SDK's user, orgunit and rolemanagement write scopes are still
+# forbidden anywhere in this file — see tests/test_admin_readonly.py.
+ADMIN_DIRECTORY_GROUP_SCOPE = "https://www.googleapis.com/auth/admin.directory.group"
+
 # Google Apps Script API scopes
 SCRIPT_PROJECTS_SCOPE = "https://www.googleapis.com/auth/script.projects"
 SCRIPT_PROJECTS_READONLY_SCOPE = (
@@ -237,6 +256,17 @@ ADMIN_SCOPES = [
     ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
 ]
 
+# Scopes for the opt-in ``gadmin_write`` service. Group writes need the group
+# scope; the group readonly scope is included so the idempotency pre-checks
+# (groups.get / members.get / members.list) work even if a deployment ever
+# narrows the write grant. Nothing else from the Directory write surface is
+# requested — no user, orgunit or role writes.
+ADMIN_WRITE_SCOPES = [
+    ADMIN_DIRECTORY_GROUP_SCOPE,
+    ADMIN_DIRECTORY_GROUP_READONLY_SCOPE,
+    ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE,
+]
+
 CUSTOM_SEARCH_SCOPES = [CUSTOM_SEARCH_SCOPE]
 
 SCRIPT_SCOPES = [
@@ -266,6 +296,9 @@ TOOL_SCOPES_MAP = {
     # Admin SDK is read-only by design; identical entry in TOOL_SCOPES_MAP
     # and TOOL_READONLY_SCOPES_MAP because there is no "write" variant.
     "gadmin": ADMIN_SCOPES,
+    # Opt-in group-write service. Separate from "gadmin" so enabling the
+    # read-only admin tools never requests a write scope.
+    "gadmin_write": ADMIN_WRITE_SCOPES,
 }
 
 # Tool-to-read-only-scopes mapping
@@ -281,6 +314,12 @@ TOOL_READONLY_SCOPES_MAP = {
     "tasks": [TASKS_READONLY_SCOPE],
     "contacts": [CONTACTS_READONLY_SCOPE],
     "gadmin": ADMIN_SCOPES,
+    # In --read-only mode the group-write tools cannot function, so the
+    # write scope is dropped and only the readonly group scopes remain.
+    "gadmin_write": [
+        ADMIN_DIRECTORY_GROUP_READONLY_SCOPE,
+        ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE,
+    ],
     "search": CUSTOM_SEARCH_SCOPES,
     "appscript": [
         SCRIPT_PROJECTS_READONLY_SCOPE,
