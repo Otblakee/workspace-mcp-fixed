@@ -104,7 +104,9 @@ class TestImportToGoogleDocRemoteGate:
 
         impl = _unwrap(drive_tools.import_to_google_doc)
         service = MagicMock()
-        monkeypatch.setattr(drive_tools, "get_transport_mode", lambda: "streamable-http")
+        monkeypatch.setattr(
+            drive_tools, "get_transport_mode", lambda: "streamable-http"
+        )
 
         async def fake_resolve(svc, fid):
             return "root"
@@ -133,7 +135,9 @@ class TestImportToGoogleDocRemoteGate:
                 "webViewLink": "https://docs.google.com/document/d/doc-1",
             }
         )
-        monkeypatch.setattr(drive_tools, "get_transport_mode", lambda: "streamable-http")
+        monkeypatch.setattr(
+            drive_tools, "get_transport_mode", lambda: "streamable-http"
+        )
 
         async def fake_resolve(svc, fid):
             return "root"
@@ -216,9 +220,7 @@ class TestOAuth21ScopeGate:
         )
 
         built = MagicMock()
-        monkeypatch.setattr(
-            service_decorator, "build", lambda *a, **kw: built
-        )
+        monkeypatch.setattr(service_decorator, "build", lambda *a, **kw: built)
 
         with pytest.raises(GoogleAuthenticationError, match="no recorded scopes"):
             await service_decorator.get_authenticated_google_service_oauth21(
@@ -248,7 +250,10 @@ class TestOAuth21ScopeGate:
         built = MagicMock()
         monkeypatch.setattr(service_decorator, "build", lambda *a, **kw: built)
 
-        service, email = await service_decorator.get_authenticated_google_service_oauth21(
+        (
+            service,
+            email,
+        ) = await service_decorator.get_authenticated_google_service_oauth21(
             service_name="drive",
             version="v3",
             tool_name="test_tool",
@@ -330,7 +335,7 @@ class TestOAuthCallbackEscaping:
     def test_success_response_escapes_user_id(self):
         from auth.oauth_responses import create_success_response
 
-        body = create_success_response('<img src=x onerror=alert(1)>').body.decode()
+        body = create_success_response("<img src=x onerror=alert(1)>").body.decode()
         assert "<img src=x" not in body
         assert "&lt;img" in body
 

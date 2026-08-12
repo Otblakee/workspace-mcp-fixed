@@ -98,11 +98,7 @@ class TestServeAttachmentRoute:
         )
 
         app = Starlette(
-            routes=[
-                Route(
-                    "/attachments/{file_id}", serve_attachment, methods=["GET"]
-                )
-            ]
+            routes=[Route("/attachments/{file_id}", serve_attachment, methods=["GET"])]
         )
         client = TestClient(app)
 
@@ -239,7 +235,9 @@ class TestResolveTransferFolder:
         )
 
         folder_id = await xfer.resolve_transfer_folder(
-            drive_service, "Claude Inbox/_attachment-transfer", user_email="a@example.com"
+            drive_service,
+            "Claude Inbox/_attachment-transfer",
+            user_email="a@example.com",
         )
         assert folder_id == "folder-b"
         assert files_api.create.call_count == 2
@@ -254,7 +252,9 @@ class TestResolveTransferFolder:
         # Second call for the same user hits the cache: no extra list calls.
         list_calls_before = files_api.list.call_count
         folder_id_again = await xfer.resolve_transfer_folder(
-            drive_service, "Claude Inbox/_attachment-transfer", user_email="a@example.com"
+            drive_service,
+            "Claude Inbox/_attachment-transfer",
+            user_email="a@example.com",
         )
         assert folder_id_again == "folder-b"
         assert files_api.list.call_count == list_calls_before

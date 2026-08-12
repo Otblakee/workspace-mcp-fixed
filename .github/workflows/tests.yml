@@ -1,0 +1,52 @@
+name: Tests
+
+# The repo has ~590 unit tests and, before this workflow, nothing ran them on a
+# pull request. The suite is fast (a few seconds) and needs no Google
+# credentials — every Google service is mocked — so there is no reason not to
+# gate merges on it.
+#
+# NOTE: this only takes effect once GitHub Actions is enabled for the
+# repository (Settings → Actions → General → "Allow all actions"). No workflow
+# in this repo has ever recorded a run.
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor is the project's requires-python; ceiling is what the Docker
+        # image and Render run. Both are tested so a syntax or typing feature
+        # that only exists on the newer one cannot slip through.
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run tests
+        run: uv run pytest -q

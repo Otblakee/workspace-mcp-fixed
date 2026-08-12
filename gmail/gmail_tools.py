@@ -1502,7 +1502,9 @@ async def draft_gmail_message(
 async def delete_gmail_draft(
     service,
     user_google_email: str,
-    draft_id: str = Field(..., description="ID of the draft to delete (e.g. 'r-4409920494913194848')."),
+    draft_id: str = Field(
+        ..., description="ID of the draft to delete (e.g. 'r-4409920494913194848')."
+    ),
 ) -> str:
     """
     Permanently deletes a Gmail draft by ID.

@@ -5,6 +5,7 @@ Shared utilities for Google Drive operations including permission checking.
 """
 
 import asyncio
+import os
 import re
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -269,6 +270,22 @@ async def resolve_drive_item(
                 f"Shortcut resolution exceeded {max_depth} hops starting from '{file_id}'."
             )
         current_id = target_id
+
+
+def get_holding_folder_id() -> str:
+    """Resolve the soft-delete holding folder ID from the environment.
+
+    Read lazily (not at import) so the value can be set per-deploy and so
+    tests can patch it. Raises if unset: soft-delete fails closed rather than
+    silently doing nothing.
+    """
+    folder_id = os.getenv("DRIVE_HOLDING_FOLDER_ID", "").strip()
+    if not folder_id:
+        raise Exception(
+            "DRIVE_HOLDING_FOLDER_ID is not set. Refusing to soft-delete: set it "
+            "to the ID of a private holding folder you own and empty manually."
+        )
+    return folder_id
 
 
 async def resolve_folder_id(

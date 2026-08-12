@@ -1231,7 +1231,9 @@ async def share_calendar(
     """
     valid_roles = {"freeBusyReader", "reader", "writer", "owner"}
     if role not in valid_roles:
-        return f"Invalid role '{role}'. Must be one of: {', '.join(sorted(valid_roles))}"
+        return (
+            f"Invalid role '{role}'. Must be one of: {', '.join(sorted(valid_roles))}"
+        )
 
     logger.info(
         f"[share_calendar] Sharing calendar '{calendar_id}' with {share_with_email} as {role}"

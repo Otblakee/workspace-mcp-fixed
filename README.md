@@ -1094,6 +1094,94 @@ export WORKSPACE_ATTACHMENT_DIR="/path/to/custom/dir"
 
 ---
 
+## OTB fork: shared drives, permissions, and the migration engine
+
+This fork adds a Drive architecture and migration toolset on top of upstream.
+All of it sits at the **Extended** tier so a `TOOL_TIER=extended` deployment
+picks it up. Note that several upstream sharing tools listed in the Drive table
+above (`share_drive_file`, `batch_share_drive_file`, `set_drive_file_permissions`,
+`update_drive_permission`, `remove_drive_permission`, `transfer_drive_ownership`)
+are **blocked at registration** on this fork by `core/tool_policy.py` and are
+never exposed; the guarded tools below replace them.
+
+### Shared drives, permissions, shortcuts <sub>[`shared_drive_tools.py`](gdrive/shared_drive_tools.py)</sub>
+
+| Tool | Description |
+|------|-------------|
+| `create_shared_drive` | Create a shared drive (`drives.create`), returns the drive ID |
+| `update_shared_drive` | Rename a shared drive / set restriction flags; the rename is verified by re-reading `drives.get` |
+| `list_shared_drives` | List shared drives (`drives.list`), optionally domain-wide |
+| `set_drive_permission` | Grant or update access. **Groups-only by default**; `allow_individual=True` is required for a personal grant, and `anyone`/`domain` principals are refused outright. Idempotent |
+| `revoke_drive_permission` | Remove a permission. Refuses self-lockout and refuses to remove the last organizer of a shared drive |
+| `create_shortcut` | Create a Drive shortcut. Idempotent — a duplicate (same target, same parent) is reported, not created |
+
+`revoke_drive_permission` is deliberately *not* named `remove_drive_permission`:
+that name is on the hard denylist, so a tool defined under it would be silently
+refused at the registration chokepoint, and un-blocking it would re-expose the
+unguarded upstream implementation.
+
+Optional guardrail: set `DRIVE_PERMISSION_ALLOWED_DOMAINS` (comma-separated,
+e.g. `otbgroup.co.uk`) to refuse permission grants to principals outside those
+domains. Unset means no domain restriction.
+
+### Migration engine <sub>[`drive_migration_tools.py`](gdrive/drive_migration_tools.py)</sub>
+
+| Tool | Description |
+|------|-------------|
+| `walk_drive` | Complete recursive inventory. Parent walk **plus** an independent drive-wide sweep, reconciled against each other; writes a deterministic JSONL manifest |
+| `get_drive_file_metadata` | `files.get` with selectable fields including `md5Checksum`/`sha1Checksum`/`sha256Checksum`, `properties`, `parents`, `driveId` |
+| `create_folder_tree` | Idempotent batch folder creation from a path manifest; returns folder IDs for registry write-back |
+| `batch_copy_from_manifest` | Manifest-driven `files.copy`. Idempotent on a provenance key, provenance-stamped, partial-failure tolerant, rate-limit aware; writes a per-row JSONL result log |
+| `reconcile_folders` | Source-vs-destination comparison (counts, sizes, checksums) emitting a discrepancy report |
+| `rebuild_hub` | Rebuilds the hub shortcut layer from the Folder Registry's `hub_section` column |
+
+Every bulk or mutating tool above accepts `dry_run=True`. Reports are written
+as JSONL into the attachment store (served at `/attachments/{id}` on HTTP
+transport, or a local path on stdio) rather than returned inline.
+
+**Checksums and native Google files:** Docs/Sheets/Slides expose no checksum
+and no size, so `reconcile_folders` reports them as `unverifiable_native`
+rather than counting them as verified matches. Verify those by exported
+byte-size or revision presence.
+
+**Cross-tenant constraint:** content cannot be *moved* into another
+organisation's shared drive. The migration engine copies — new IDs, no version
+history.
+
+### Admin SDK group writes <sub>[`admin_group_tools.py`](gadmin/admin_group_tools.py)</sub>
+
+| Tool | Description |
+|------|-------------|
+| `create_group` | `groups.insert`. Idempotent — an existing group is reported, not reconfigured |
+| `add_group_member` | `members.insert` / `members.update`. Idempotent on role |
+| `remove_group_member` | `members.delete`. Refuses to remove the group's last OWNER/MANAGER |
+
+**⚠️ OAuth scope change.** These three tools need a new scope:
+
+```
+https://www.googleapis.com/auth/admin.directory.group
+```
+
+Add it to the OAuth consent screen (and to the domain-wide delegation
+allowlist, if you use DWD) before enabling the service. The calling identity
+must also hold a Workspace admin role with Groups privileges — scope alone is
+not sufficient.
+
+The scope is **only** requested when the `gadmin_write` service is explicitly
+enabled:
+
+```bash
+uv run main.py --tools drive sheets gadmin_write --tool-tier extended
+# or via env: TOOLS="drive sheets gadmin_write"
+```
+
+`gadmin_write` is in `OPT_IN_TOOLS`, so a wiped `TOOLS` variable never enables
+it. The read-only `gadmin` service is unaffected and still requests readonly
+Directory scopes only — that separation is enforced by
+`tests/test_admin_readonly.py`.
+
+---
+
 ### Connect to Claude Desktop
 
 The server supports two transport modes:

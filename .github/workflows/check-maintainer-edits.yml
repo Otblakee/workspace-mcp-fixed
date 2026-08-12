@@ -7,7 +7,16 @@ on:
 jobs:
   check-maintainer-edits:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.head.repo.fork == true || github.event.pull_request.head.repo.full_name != github.repository
+    # "External contributor" means the PR's head branch lives in a DIFFERENT
+    # repository, which is exactly what the full_name comparison tests.
+    #
+    # Do NOT re-add `head.repo.fork == true` here. That flag describes whether
+    # the head repository is itself a fork of something else — and this
+    # repository is a fork of the upstream project, so it is permanently true.
+    # With that disjunct, every internal PR took the external path and failed:
+    # GitHub only sets `maintainer_can_modify` on cross-repository PRs, so the
+    # check could never pass on a branch pushed to this repo.
+    if: github.event.pull_request.head.repo.full_name != github.repository
 
     steps:
       - name: Check if maintainer edits are enabled
@@ -41,7 +50,8 @@ jobs:
 
   check-maintainer-edits-internal:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.head.repo.fork == false && github.event.pull_request.head.repo.full_name == github.repository
+    # Mirror of the condition above; same reason for not testing `fork`.
+    if: github.event.pull_request.head.repo.full_name == github.repository
 
     steps:
       - name: Skip check for internal PRs

@@ -51,7 +51,9 @@ def create_success_response(verified_user_id: Optional[str] = None) -> HTMLRespo
         HTMLResponse with success page
     """
     # Handle the case where no user ID is provided
-    user_display = html.escape(str(verified_user_id)) if verified_user_id else "Google User"
+    user_display = (
+        html.escape(str(verified_user_id)) if verified_user_id else "Google User"
+    )
 
     content = f"""<html>
 <head>

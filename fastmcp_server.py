@@ -141,6 +141,8 @@ set_transport_mode("streamable-http")
 # Import all tool modules to register their @server.tool() decorators
 import gmail.gmail_tools
 import gdrive.drive_tools
+import gdrive.shared_drive_tools
+import gdrive.drive_migration_tools
 import gcalendar.calendar_tools
 import gdocs.docs_tools
 import gsheets.sheets_tools

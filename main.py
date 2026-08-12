@@ -56,7 +56,7 @@ configure_file_logging()
 # - appscript: per CLAUDE.md hard rule, must never be enabled until audit
 #   logging has been live and reviewed for 30 days. Keeping it out of the
 #   default load means a wiped TOOLS env var fails safe.
-OPT_IN_TOOLS = {"gadmin", "appscript"}
+OPT_IN_TOOLS = {"gadmin", "gadmin_write", "appscript"}
 
 
 # Set to True after argparse if running with --transport stdio. In stdio
@@ -173,6 +173,7 @@ def main():
             "search",
             "appscript",
             "gadmin",
+            "gadmin_write",
         ],
         help="Specify which tools to register. If not provided, all tools are registered.",
     )
@@ -286,7 +287,17 @@ def main():
     # Import tool modules to register them with the MCP server via decorators
     tool_imports = {
         "gmail": lambda: import_module("gmail.gmail_tools"),
-        "drive": lambda: import_module("gdrive.drive_tools"),
+        # Drive spans several modules: the original tool set plus the
+        # shared-drive/permission/shortcut tools and the migration engine.
+        # All three must import for the "drive" service to be complete.
+        "drive": lambda: [
+            import_module(name)
+            for name in (
+                "gdrive.drive_tools",
+                "gdrive.shared_drive_tools",
+                "gdrive.drive_migration_tools",
+            )
+        ],
         "calendar": lambda: import_module("gcalendar.calendar_tools"),
         "docs": lambda: import_module("gdocs.docs_tools"),
         "sheets": lambda: import_module("gsheets.sheets_tools"),
@@ -298,6 +309,7 @@ def main():
         "search": lambda: import_module("gsearch.search_tools"),
         "appscript": lambda: import_module("gappsscript.apps_script_tools"),
         "gadmin": lambda: import_module("gadmin.admin_tools"),
+        "gadmin_write": lambda: import_module("gadmin.admin_group_tools"),
     }
 
     tool_icons = {
@@ -314,6 +326,7 @@ def main():
         "search": "🔍",
         "appscript": "📜",
         "gadmin": "🛡️",
+        "gadmin_write": "👥",
     }
 
     def _tools_in_services(services):
@@ -376,9 +389,7 @@ def main():
         # the OAuth consent screen / domain-wide delegation; loading them
         # silently on every fresh deploy would break the existing user's
         # consent flow.
-        tools_to_import = [
-            t for t in tool_imports.keys() if t not in OPT_IN_TOOLS
-        ]
+        tools_to_import = [t for t in tool_imports.keys() if t not in OPT_IN_TOOLS]
         # Don't filter individual tools when importing all
         set_enabled_tool_names(None)
 

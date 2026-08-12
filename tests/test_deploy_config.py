@@ -31,6 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Version lookup (main.py banner + /health endpoint)
 # ---------------------------------------------------------------------------
 
+
 class TestPackageVersionLookup:
     def _patch_metadata(self, monkeypatch, mapping):
         import core.server as server_mod
@@ -82,6 +83,7 @@ class TestPackageVersionLookup:
 # Empty --tools guard (Dockerfile ${TOOLS:+--tools $TOOLS} with blank TOOLS)
 # ---------------------------------------------------------------------------
 
+
 class TestEmptyToolsGuard:
     def test_empty_list_exits(self):
         from main import validate_tools_argument
@@ -105,6 +107,7 @@ class TestEmptyToolsGuard:
 # Direct dependencies declared in pyproject
 # ---------------------------------------------------------------------------
 
+
 class TestDeclaredDependencies:
     def test_direct_imports_are_declared(self):
         assert tomllib is not None, "Python >=3.11 expected in the dev venv"
@@ -112,14 +115,16 @@ class TestDeclaredDependencies:
         deps = pyproject["project"]["dependencies"]
         for package in ("uvicorn", "starlette", "pydantic"):
             assert any(
-                dep.split(">=")[0].split("==")[0].strip() == package
-                for dep in deps
-            ), f"{package} is imported directly but not declared in [project] dependencies"
+                dep.split(">=")[0].split("==")[0].strip() == package for dep in deps
+            ), (
+                f"{package} is imported directly but not declared in [project] dependencies"
+            )
 
 
 # ---------------------------------------------------------------------------
 # tests/gmail packaging
 # ---------------------------------------------------------------------------
+
 
 class TestGmailTestPackage:
     def test_init_exists(self):

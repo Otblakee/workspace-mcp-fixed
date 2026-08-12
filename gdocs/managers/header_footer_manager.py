@@ -156,7 +156,11 @@ class HeaderFooterManager:
         return None, None
 
     async def _replace_section_content(
-        self, document_id: str, section: dict[str, Any], section_id: str, new_content: str
+        self,
+        document_id: str,
+        section: dict[str, Any],
+        section_id: str,
+        new_content: str,
     ) -> bool:
         """
         Replace the content in a header or footer section.

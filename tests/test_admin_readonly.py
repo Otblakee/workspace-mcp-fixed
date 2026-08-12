@@ -22,7 +22,6 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -121,21 +120,54 @@ class TestScopesWired:
 
     def test_no_admin_write_scope_anywhere_in_scopes_module(self):
         """Defence in depth: no Admin SDK write scope URL appears anywhere
-        in ``auth.scopes`` source. If someone tries to add one, this trips."""
+        in ``auth.scopes`` source. If someone tries to add one, this trips.
+
+        One documented exception: ``admin.directory.group``. It is required by
+        ``groups.insert`` (no narrower scope authorises group creation) and is
+        used only by the opt-in ``gadmin_write`` service. The test below pins
+        that exception to ADMIN_WRITE_SCOPES so it cannot leak into
+        ADMIN_SCOPES or the read-only map.
+        """
         scopes_path = Path(__file__).resolve().parent.parent / "auth" / "scopes.py"
         src = scopes_path.read_text()
-        # The five canonical Admin SDK write scope suffixes.
+        # The canonical Admin SDK write scope suffixes that remain forbidden.
         forbidden = [
-            "auth/admin.directory.user\"",  # bare (write) variant
-            "auth/admin.directory.group\"",
-            "auth/admin.directory.orgunit\"",
-            "auth/admin.directory.rolemanagement\"",
-            "auth/admin.directory.device.mobile\"",
+            'auth/admin.directory.user"',  # bare (write) variant
+            'auth/admin.directory.orgunit"',
+            'auth/admin.directory.rolemanagement"',
+            'auth/admin.directory.device.mobile"',
         ]
         for needle in forbidden:
             assert needle not in src, (
                 f"Forbidden Admin SDK write scope referenced in auth/scopes.py: {needle}"
             )
+
+    def test_group_write_scope_is_isolated_to_the_opt_in_write_service(self):
+        """The single permitted Admin write scope must never reach the
+        read-only ``gadmin`` service, in either scope map."""
+        from auth.scopes import (
+            ADMIN_DIRECTORY_GROUP_SCOPE,
+            ADMIN_SCOPES,
+            ADMIN_WRITE_SCOPES,
+            TOOL_READONLY_SCOPES_MAP,
+            TOOL_SCOPES_MAP,
+        )
+
+        assert (
+            ADMIN_DIRECTORY_GROUP_SCOPE
+            == "https://www.googleapis.com/auth/admin.directory.group"
+        )
+        assert ADMIN_DIRECTORY_GROUP_SCOPE in ADMIN_WRITE_SCOPES
+        # Never in the read-only admin service.
+        assert ADMIN_DIRECTORY_GROUP_SCOPE not in ADMIN_SCOPES
+        assert ADMIN_DIRECTORY_GROUP_SCOPE not in TOOL_SCOPES_MAP["gadmin"]
+        assert ADMIN_DIRECTORY_GROUP_SCOPE not in TOOL_READONLY_SCOPES_MAP["gadmin"]
+        # And never granted when the server runs with --read-only.
+        assert (
+            ADMIN_DIRECTORY_GROUP_SCOPE not in TOOL_READONLY_SCOPES_MAP["gadmin_write"]
+        )
+        # The write service does request it in normal mode.
+        assert ADMIN_DIRECTORY_GROUP_SCOPE in TOOL_SCOPES_MAP["gadmin_write"]
 
 
 class TestServiceDecoratorWired:
@@ -278,14 +310,10 @@ class TestReadOnlyContract:
         # Strip block comment lines (``# …``) and triple-quoted docstrings
         # so the search runs against executable Python only.
         # 1. Drop lines that start with optional indent + '#'.
-        lines = [
-            ln for ln in src.splitlines() if not re.match(r"^\s*#", ln)
-        ]
+        lines = [ln for ln in src.splitlines() if not re.match(r"^\s*#", ln)]
         no_comments = "\n".join(lines)
         # 2. Drop triple-quoted strings (greedy across newlines).
-        no_docstrings = re.sub(
-            r'(?s)"""(.*?)"""', "", no_comments
-        )
+        no_docstrings = re.sub(r'(?s)"""(.*?)"""', "", no_comments)
         # The invocation must be followed by a paren immediately — the
         # canonical ``foo().method(`` shape. We look for the dotted call
         # form rather than the bare method name to be robust against an
@@ -333,9 +361,7 @@ class TestAuditServiceTagging:
         from core.audit import _service
 
         # gadmin module → always gadmin, regardless of tool name.
-        assert (
-            _service("query_drive_audit_log", "gadmin.admin_tools") == "gadmin"
-        )
+        assert _service("query_drive_audit_log", "gadmin.admin_tools") == "gadmin"
         assert _service("list_users", "gadmin.admin_tools") == "gadmin"
         assert _service("get_user", "gadmin.admin_tools") == "gadmin"
         # Non-admin tool name + non-admin module → existing heuristic still
@@ -355,8 +381,7 @@ class TestAuditServiceTagging:
         assert _service("update_paragraph_style", "gdocs.docs_tools") == "docs"
         assert _service("debug_table_structure", "gdocs.docs_tools") == "docs"
         assert (
-            _service("add_conditional_formatting", "gsheets.sheets_tools")
-            == "sheets"
+            _service("add_conditional_formatting", "gsheets.sheets_tools") == "sheets"
         )
         assert (
             _service("update_conditional_formatting", "gsheets.sheets_tools")
@@ -374,25 +399,23 @@ class TestAuditServiceTagging:
         map keeps it on ``drive`` where its API calls actually live."""
         from core.audit import _service
 
-        assert (
-            _service("import_to_google_doc", "gdrive.drive_tools") == "drive"
-        )
+        assert _service("import_to_google_doc", "gdrive.drive_tools") == "drive"
 
 
 class TestToolTierWiring:
     def test_gadmin_section_in_tool_tiers(self):
         import yaml
 
-        tiers_path = (
-            Path(__file__).resolve().parent.parent / "core" / "tool_tiers.yaml"
-        )
+        tiers_path = Path(__file__).resolve().parent.parent / "core" / "tool_tiers.yaml"
         data = yaml.safe_load(tiers_path.read_text())
         assert "gadmin" in data
         tier = data["gadmin"]
         # Every documented tool must appear in some tier.
-        listed = set(tier.get("core") or []) | set(
-            tier.get("extended") or []
-        ) | set(tier.get("complete") or [])
+        listed = (
+            set(tier.get("core") or [])
+            | set(tier.get("extended") or [])
+            | set(tier.get("complete") or [])
+        )
         assert listed == ALL_ADMIN_TOOLS, (
             f"tool_tiers gadmin section missing: {ALL_ADMIN_TOOLS - listed} "
             f"or unexpected: {listed - ALL_ADMIN_TOOLS}"
@@ -413,6 +436,9 @@ class TestMainOptIn:
         import main
 
         assert "gadmin" in main.OPT_IN_TOOLS
+        # The Admin write service must be opt-in for the same reason, and more
+        # strongly: a wiped TOOLS env var must never enable group writes.
+        assert "gadmin_write" in main.OPT_IN_TOOLS
         # And the default-tools branch must apply the OPT_IN_TOOLS filter.
         assert "if t not in OPT_IN_TOOLS" in src
 

@@ -2,7 +2,6 @@
 Unit tests for Google Chat MCP tools — attachment support
 """
 
-import base64
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
 import sys

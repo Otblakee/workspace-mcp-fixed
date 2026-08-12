@@ -18,7 +18,6 @@ from auth.oauth21_session_store import (
 )
 from auth.oauth_config import (
     is_oauth21_enabled,
-    get_oauth_config,
     is_external_oauth21_provider,
 )
 from core.context import set_fastmcp_session_id
@@ -29,6 +28,7 @@ from auth.scopes import (
     GMAIL_MODIFY_SCOPE,
     GMAIL_LABELS_SCOPE,
     GMAIL_SETTINGS_BASIC_SCOPE,
+    DRIVE_SCOPE,
     DRIVE_READONLY_SCOPE,
     DRIVE_FILE_SCOPE,
     DOCS_READONLY_SCOPE,
@@ -65,6 +65,7 @@ from auth.scopes import (
     ADMIN_REPORTS_AUDIT_READONLY_SCOPE,
     ADMIN_REPORTS_USAGE_READONLY_SCOPE,
     ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
+    ADMIN_DIRECTORY_GROUP_SCOPE,
     has_required_scopes,
 )
 
@@ -454,9 +455,13 @@ SCOPE_GROUPS = {
     "gmail_modify": GMAIL_MODIFY_SCOPE,
     "gmail_labels": GMAIL_LABELS_SCOPE,
     "gmail_settings_basic": GMAIL_SETTINGS_BASIC_SCOPE,
-    # Drive scopes
+    # Drive scopes. ``drive_full`` is required by the endpoints that
+    # drive.file cannot reach — drives.create/update/list, and permissions on
+    # items this app did not create (gdrive/shared_drive_tools.py,
+    # gdrive/drive_migration_tools.py).
     "drive_read": DRIVE_READONLY_SCOPE,
     "drive_file": DRIVE_FILE_SCOPE,
+    "drive_full": DRIVE_SCOPE,
     # Docs scopes
     "docs_read": DOCS_READONLY_SCOPE,
     "docs_write": DOCS_WRITE_SCOPE,
@@ -505,6 +510,10 @@ SCOPE_GROUPS = {
     # for the rationale (tokens.list is not authorised by any readonly
     # scope). Used only by list_oauth_tokens_for_user.
     "admin_directory_user_security": ADMIN_DIRECTORY_USER_SECURITY_SCOPE,
+    # The one Admin SDK write scope group. Used exclusively by the opt-in
+    # gadmin_write service (gadmin/admin_group_tools.py). See the constant's
+    # comment in auth/scopes.py for why it is kept out of ADMIN_SCOPES.
+    "admin_directory_group_write": ADMIN_DIRECTORY_GROUP_SCOPE,
 }
 
 

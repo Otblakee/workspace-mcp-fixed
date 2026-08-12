@@ -116,6 +116,9 @@ exclude = ["tests*", "docs*", "build", "dist"]
 # option") and tests/gappsscript/manual_test.py was collected, producing
 # 8 collection errors. --ignore-glob is the supported ini-level equivalent.
 [tool.pytest.ini_options]
+markers = [
+    "uses_directory: test exercises the Admin Directory membership guard",
+]
 addopts = "--ignore-glob=**/manual_test.py"
 
 [tool.setuptools.package-data]
