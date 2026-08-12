@@ -183,9 +183,7 @@ class TestCreateSharedDrive:
     @pytest.mark.asyncio
     async def test_dry_run_creates_nothing(self):
         service = FakeDrive()
-        result = await create_shared_drive(
-            service, USER, name="OTB-Hub", dry_run=True
-        )
+        result = await create_shared_drive(service, USER, name="OTB-Hub", dry_run=True)
         assert "DRY RUN" in result
         assert "drives.create" not in service.call_names()
 
@@ -337,9 +335,10 @@ class TestSetDrivePermission:
             "role": "writer",
             "emailAddress": "otb-premises@otbgroup.co.uk",
         }
-        assert service.kwargs_for("permissions.create")[0][
-            "sendNotificationEmail"
-        ] is False
+        assert (
+            service.kwargs_for("permissions.create")[0]["sendNotificationEmail"]
+            is False
+        )
         assert service.kwargs_for("permissions.create")[0]["supportsAllDrives"] is True
         assert "Granted" in result
 
@@ -674,9 +673,7 @@ class TestCreateShortcut:
             new_callable=AsyncMock,
             return_value="hub1",
         ):
-            result = await create_shortcut(
-                service, USER, "t1", "hub1", dry_run=True
-            )
+            result = await create_shortcut(service, USER, "t1", "hub1", dry_run=True)
 
         assert "DRY RUN" in result
         assert "files.create" not in service.call_names()

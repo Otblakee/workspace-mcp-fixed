@@ -184,7 +184,9 @@ async def _inventory_tree(
     return rows, counts, warnings, root
 
 
-def _inventory_row(item: Dict[str, Any], path: str, discovered_by: str) -> Dict[str, Any]:
+def _inventory_row(
+    item: Dict[str, Any], path: str, discovered_by: str
+) -> Dict[str, Any]:
     shortcut = item.get("shortcutDetails") or {}
     return {
         "id": item.get("id"),
@@ -316,7 +318,9 @@ async def walk_drive(
 
     # Deterministic ordering: the acceptance criterion is that two walks of a
     # static drive return identical rows, not merely identical counts.
-    rows.sort(key=lambda r: (r.get("path") or "", r.get("name") or "", r.get("id") or ""))
+    rows.sort(
+        key=lambda r: (r.get("path") or "", r.get("name") or "", r.get("id") or "")
+    )
 
     folders = sum(1 for r in rows if r.get("mimeType") == FOLDER_MIME_TYPE)
     counts.update(
@@ -328,9 +332,7 @@ async def walk_drive(
     )
 
     safe_name = (root_meta.get("name") or root_id).replace("/", "_")[:60]
-    _, path, access_line = write_jsonl_report(
-        rows, filename=f"walk_{safe_name}.jsonl"
-    )
+    _, path, access_line = write_jsonl_report(rows, filename=f"walk_{safe_name}.jsonl")
 
     lines = [
         f"Walk complete: '{root_meta.get('name', root_id)}' ({root_id})",
@@ -360,9 +362,7 @@ async def walk_drive(
 
 
 @server.tool()
-@handle_http_errors(
-    "get_drive_file_metadata", is_read_only=True, service_type="drive"
-)
+@handle_http_errors("get_drive_file_metadata", is_read_only=True, service_type="drive")
 @require_google_service("drive", "drive_read")
 async def get_drive_file_metadata(
     service,
@@ -497,9 +497,7 @@ async def create_folder_tree(
     if not root_id or not root_id.strip():
         raise UserInputError("root_id is required.")
     if paths and (manifest_json or manifest_path):
-        raise UserInputError(
-            "Pass paths or a manifest, not both."
-        )
+        raise UserInputError("Pass paths or a manifest, not both.")
 
     wanted = _manifest_paths(paths, manifest_json, manifest_path)
     if not wanted:
@@ -747,7 +745,10 @@ async def batch_copy_from_manifest(
         chunk = rows[start : start + batch_size]
         results.extend(
             await asyncio.gather(
-                *(_copy_one_row(service, row, migration_batch, dry_run) for row in chunk)
+                *(
+                    _copy_one_row(service, row, migration_batch, dry_run)
+                    for row in chunk
+                )
             )
         )
 
@@ -1010,9 +1011,7 @@ async def reconcile_folders(
     for warning in (source_warnings + dest_warnings)[:10]:
         lines.append(f"⚠️ {warning}")
     if source_counts.get("truncated") or dest_counts.get("truncated"):
-        lines.append(
-            "⚠️ At least one side hit max_items — this report is incomplete."
-        )
+        lines.append("⚠️ At least one side hit max_items — this report is incomplete.")
     lines.append(f"Discrepancy report (JSONL): {access_line}")
     return "\n".join(lines)
 
@@ -1035,9 +1034,11 @@ async def _read_registry_rows(
 ) -> List[Dict[str, str]]:
     """Read the Folder Registry into dicts keyed by its header row."""
     response = await execute_with_backoff(
-        lambda: sheets_service.spreadsheets()
-        .values()
-        .get(spreadsheetId=spreadsheet_id, range=sheet_range),
+        lambda: (
+            sheets_service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=sheet_range)
+        ),
         label="sheets.values.get",
     )
     values = response.get("values") or []
@@ -1048,7 +1049,9 @@ async def _read_registry_rows(
     header = [str(h).strip().lower().replace(" ", "_") for h in values[0]]
     rows: List[Dict[str, str]] = []
     for raw in values[1:]:
-        row = {header[i]: str(raw[i]).strip() for i in range(min(len(header), len(raw)))}
+        row = {
+            header[i]: str(raw[i]).strip() for i in range(min(len(header), len(raw)))
+        }
         rows.append(row)
     return rows
 
@@ -1088,7 +1091,9 @@ async def _soft_delete_shortcut(
     )
 
 
-def _registry_column(rows: List[Dict[str, str]], candidates: Sequence[str]) -> Optional[str]:
+def _registry_column(
+    rows: List[Dict[str, str]], candidates: Sequence[str]
+) -> Optional[str]:
     for candidate in candidates:
         if any(candidate in row for row in rows):
             return candidate
@@ -1146,7 +1151,9 @@ async def rebuild_hub(
 
     id_column = _registry_column(rows, ("folder_id", "id", "drive_folder_id"))
     section_column = _registry_column(rows, ("hub_section",))
-    name_column = _registry_column(rows, ("folder_name", "name", "folder_path", "title"))
+    name_column = _registry_column(
+        rows, ("folder_name", "name", "folder_path", "title")
+    )
     if not id_column or not section_column:
         raise UserInputError(
             "Registry must have a folder_id column and a hub_section column; "
@@ -1251,15 +1258,17 @@ async def rebuild_hub(
             )
             shortcut_name = label or target_meta.get("name") or target_id
             await execute_with_backoff(
-                lambda n=shortcut_name, sid=section_id, t=target_id: service.files().create(
-                    body={
-                        "name": n,
-                        "mimeType": SHORTCUT_MIME_TYPE,
-                        "parents": [sid],
-                        "shortcutDetails": {"targetId": t},
-                    },
-                    fields="id, name",
-                    supportsAllDrives=True,
+                lambda n=shortcut_name, sid=section_id, t=target_id: (
+                    service.files().create(
+                        body={
+                            "name": n,
+                            "mimeType": SHORTCUT_MIME_TYPE,
+                            "parents": [sid],
+                            "shortcutDetails": {"targetId": t},
+                        },
+                        fields="id, name",
+                        supportsAllDrives=True,
+                    )
                 ),
                 label="files.create(hub shortcut)",
             )

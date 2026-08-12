@@ -220,9 +220,7 @@ async def add_group_member(
         )
 
     if dry_run:
-        current = (
-            f" (currently {existing.get('role')})" if existing is not None else ""
-        )
+        current = f" (currently {existing.get('role')})" if existing is not None else ""
         verb = "update" if existing is not None else "add"
         return (
             "DRY RUN — no membership was changed.\n"
@@ -308,9 +306,7 @@ async def remove_group_member(
 
     existing = await _get_member(service, group_key, member_key)
     if existing is None:
-        return (
-            f"ℹ️ {member_key} is not a member of {group_key}; nothing to remove."
-        )
+        return f"ℹ️ {member_key} is not a member of {group_key}; nothing to remove."
 
     member_role = (existing.get("role") or "").upper()
     if member_role in {"OWNER", "MANAGER"}:

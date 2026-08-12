@@ -145,9 +145,7 @@ class TestCreateGroup:
 
     @pytest.mark.asyncio
     async def test_existing_group_is_a_no_op(self):
-        service = FakeDirectory(
-            group={"id": "g0", "email": "otb-media@otbgroup.co.uk"}
-        )
+        service = FakeDirectory(group={"id": "g0", "email": "otb-media@otbgroup.co.uk"})
         result = await create_group(service, USER, email="otb-media@otbgroup.co.uk")
 
         assert "already exists" in result

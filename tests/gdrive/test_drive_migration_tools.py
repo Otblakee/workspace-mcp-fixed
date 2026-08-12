@@ -649,10 +649,16 @@ class TestRebuildHub:
             ]
         )
 
-        with patch.object(
-            mig, "_hub_registry_service", new_callable=AsyncMock, return_value=sheets
-        ), patch.object(
-            mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(
+                mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+            ),
         ):
             result = await rebuild_hub(service, USER, "sheet1", "hub")
 
@@ -680,10 +686,16 @@ class TestRebuildHub:
             ]
         )
 
-        with patch.object(
-            mig, "_hub_registry_service", new_callable=AsyncMock, return_value=sheets
-        ), patch.object(
-            mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(
+                mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+            ),
         ):
             result = await rebuild_hub(service, USER, "sheet1", "hub")
 
@@ -707,10 +719,16 @@ class TestRebuildHub:
             [["folder_id", "folder_name", "hub_section"], ["t1", "A", "Premises"]]
         )
 
-        with patch.object(
-            mig, "_hub_registry_service", new_callable=AsyncMock, return_value=sheets
-        ), patch.object(
-            mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(
+                mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+            ),
         ):
             result = await rebuild_hub(service, USER, "sheet1", "hub")
 
@@ -739,9 +757,15 @@ class TestRebuildHub:
         async def fake_resolve(_service, folder_id, **_kwargs):
             return "holding" if folder_id == "holding" else "hub"
 
-        with patch.object(
-            mig, "_hub_registry_service", new_callable=AsyncMock, return_value=sheets
-        ), patch.object(mig, "resolve_folder_id", side_effect=fake_resolve):
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(mig, "resolve_folder_id", side_effect=fake_resolve),
+        ):
             result = await rebuild_hub(
                 service, USER, "sheet1", "hub", remove_orphans=True
             )
@@ -768,9 +792,7 @@ class TestRebuildHub:
             mig, "_hub_registry_service", new_callable=AsyncMock, return_value=sheets
         ):
             with pytest.raises(Exception, match="DRIVE_HOLDING_FOLDER_ID"):
-                await rebuild_hub(
-                    service, USER, "sheet1", "hub", remove_orphans=True
-                )
+                await rebuild_hub(service, USER, "sheet1", "hub", remove_orphans=True)
 
     @pytest.mark.asyncio
     async def test_dry_run_touches_nothing(self):
@@ -779,10 +801,16 @@ class TestRebuildHub:
             [["folder_id", "folder_name", "hub_section"], ["t1", "A", "Premises"]]
         )
 
-        with patch.object(
-            mig, "_hub_registry_service", new_callable=AsyncMock, return_value=sheets
-        ), patch.object(
-            mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(
+                mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+            ),
         ):
             result = await rebuild_hub(service, USER, "sheet1", "hub", dry_run=True)
 

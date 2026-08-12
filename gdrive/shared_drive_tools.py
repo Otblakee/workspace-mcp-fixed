@@ -314,9 +314,7 @@ async def update_shared_drive(
             f"   {key}: {before_restrictions.get(key)} → {after_restrictions.get(key)}"
         )
     if name is not None and after.get("name") != body.get("name"):
-        lines.append(
-            "   ⚠️ Rename did not round-trip via drives.get — verify manually."
-        )
+        lines.append("   ⚠️ Rename did not round-trip via drives.get — verify manually.")
     return "\n".join(lines)
 
 
@@ -379,9 +377,7 @@ async def list_shared_drives(
         active = [k for k, v in restrictions.items() if v]
         suffix = f" | restrictions: {', '.join(active)}" if active else ""
         hidden = " | hidden" if drive.get("hidden") else ""
-        lines.append(
-            f"- {drive.get('name')} (ID: {drive.get('id')}){hidden}{suffix}"
-        )
+        lines.append(f"- {drive.get('name')} (ID: {drive.get('id')}){hidden}{suffix}")
     if len(drives) == max_results:
         lines.append(
             f"⚠️ Result capped at max_results={max_results}; more drives may exist."
@@ -572,11 +568,7 @@ async def revoke_drive_permission(
     else:
         wanted = (principal or "").strip().lower()
         match = next(
-            (
-                p
-                for p in permissions
-                if (p.get("emailAddress") or "").lower() == wanted
-            ),
+            (p for p in permissions if (p.get("emailAddress") or "").lower() == wanted),
             None,
         )
 

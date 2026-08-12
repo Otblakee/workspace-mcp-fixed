@@ -222,9 +222,7 @@ class TestParseManifest:
         assert drive_batch.parse_manifest('{"source_id": "a"}') == [{"source_id": "a"}]
 
     def test_jsonl(self):
-        rows = drive_batch.parse_manifest(
-            '{"source_id": "a"}\n\n{"source_id": "b"}\n'
-        )
+        rows = drive_batch.parse_manifest('{"source_id": "a"}\n\n{"source_id": "b"}\n')
         assert [r["source_id"] for r in rows] == ["a", "b"]
 
     def test_required_keys_enforced(self):

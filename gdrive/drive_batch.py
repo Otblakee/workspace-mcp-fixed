@@ -284,11 +284,11 @@ def parse_manifest(
     non-retryable, human-readable failure.
     """
     if manifest_json and manifest_path:
-        raise UserInputError(
-            "Pass either manifest_json or manifest_path, not both."
-        )
+        raise UserInputError("Pass either manifest_json or manifest_path, not both.")
     if not manifest_json and not manifest_path:
-        raise UserInputError("A manifest is required: pass manifest_json or manifest_path.")
+        raise UserInputError(
+            "A manifest is required: pass manifest_json or manifest_path."
+        )
 
     if manifest_path:
         resolved = validate_file_path(manifest_path)
@@ -376,9 +376,7 @@ def write_jsonl_report(
     try:
         with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as handle:
             for row in rows:
-                handle.write(
-                    json.dumps(row, ensure_ascii=False, default=str) + "\n"
-                )
+                handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
                 written += 1
     except Exception:
         try:
