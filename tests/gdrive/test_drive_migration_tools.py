@@ -1564,6 +1564,147 @@ class TestHubLabelDrift:
         assert "shortcuts_already_correct: 1" in result
 
 
+class TestAuditVisibility:
+    """The audit wrapper decides success/error from the START of the returned
+    string, so a partially failed run must not open with a success line."""
+
+    @pytest.mark.asyncio
+    async def test_failed_copy_run_is_flagged_as_an_error_result(self):
+        from core.audit import _inspect_result_for_error
+
+        service = _copy_service()
+        real_files = service.files
+
+        def flaky_files():
+            handle = real_files()
+
+            def copy(**kwargs):
+                raise RuntimeError("boom")
+
+            handle.copy = copy
+            return handle
+
+        service.files = flaky_files
+
+        result = await batch_copy_from_manifest(
+            service, USER, manifest_json=MANIFEST, migration_batch="B"
+        )
+
+        is_error, _ = _inspect_result_for_error(result)
+        assert is_error, "a run where every row failed was audited as success"
+
+    @pytest.mark.asyncio
+    async def test_successful_copy_run_is_not_flagged(self):
+        from core.audit import _inspect_result_for_error
+
+        result = await batch_copy_from_manifest(
+            _copy_service(), USER, manifest_json=MANIFEST, migration_batch="B"
+        )
+        is_error, _ = _inspect_result_for_error(result)
+        assert not is_error
+
+    @pytest.mark.asyncio
+    async def test_failed_folder_tree_is_flagged_as_an_error_result(self):
+        from core.audit import _inspect_result_for_error
+
+        nodes = {"root": {"id": "root", "name": "Root", "mimeType": FOLDER}}
+        service = FakeTree(nodes, {"root": []})
+        real_files = service.files
+
+        def flaky_files():
+            handle = real_files()
+
+            def create(**kwargs):
+                raise RuntimeError("insufficientFilePermissions")
+
+            handle.create = create
+            return handle
+
+        service.files = flaky_files
+
+        with patch(
+            "gdrive.drive_migration_tools.resolve_folder_id",
+            new_callable=AsyncMock,
+            return_value="root",
+        ):
+            result = await create_folder_tree(service, USER, "root", paths=["01_A"])
+
+        is_error, _ = _inspect_result_for_error(result)
+        assert is_error
+
+    def test_new_drive_tool_targets_reach_the_audit_row(self):
+        """Permission grants and drive updates name their target with keys
+        _resource_id did not know, leaving audit rows with no resource_id."""
+        from core.audit import _resource_id
+
+        for key in (
+            "file_or_drive_id",
+            "drive_id",
+            "root_id",
+            "source_folder_id",
+            "hub_folder_id",
+            "target_id",
+            "group_email",
+        ):
+            assert _resource_id(None, {key: "the-target"}) == "the-target", key
+
+
+class TestChildListingIsBounded:
+    def _big_folder(self, child_count=50):
+        nodes = {"D": {"id": "D", "name": "Big", "mimeType": FOLDER}}
+        children = {"D": []}
+        for i in range(child_count):
+            nodes[f"f{i}"] = _file(f"f{i}", f"file{i}.pdf", md5=f"m{i}", parents=["D"])
+            children["D"].append(f"f{i}")
+        return FakeTree(nodes, children)
+
+    @pytest.mark.asyncio
+    async def test_child_listing_is_capped_at_the_remaining_allowance(self, tmp_path):
+        """A folder with far more children than max_items used to be fully
+        paginated and materialised before the cap was applied."""
+        service = self._big_folder()
+        seen_limits = []
+        real = mig._list_children
+
+        async def spy(svc, folder_id, **kwargs):
+            seen_limits.append(kwargs.get("limit"))
+            return await real(svc, folder_id, **kwargs)
+
+        with patch.object(mig, "_list_children", spy):
+            result = await walk_drive(service, USER, "D", max_items=5, self_check=False)
+
+        # Remaining allowance (5) plus one sentinel so overflow is detectable.
+        assert seen_limits == [6]
+        rows = _report_rows(tmp_path, "walk_Big")
+        assert len(rows) == 5
+        assert "truncated: 1" in result
+
+    @pytest.mark.asyncio
+    async def test_limit_shrinks_as_the_inventory_fills(self):
+        """Each folder may only fetch what is still allowed overall."""
+        nodes = {
+            "D": {"id": "D", "name": "Big", "mimeType": FOLDER},
+            "a": _file("a", "A", mime=FOLDER, parents=["D"]),
+            "b": _file("b", "B", mime=FOLDER, parents=["D"]),
+        }
+        children = {"D": ["a", "b"], "a": [], "b": []}
+        service = FakeTree(nodes, children)
+        seen_limits = []
+        real = mig._list_children
+
+        async def spy(svc, folder_id, **kwargs):
+            seen_limits.append(kwargs.get("limit"))
+            return await real(svc, folder_id, **kwargs)
+
+        with patch.object(mig, "_list_children", spy):
+            await walk_drive(service, USER, "D", max_items=10, self_check=False)
+
+        # Root asks for the full allowance+1; after two rows are recorded the
+        # next folder may only ask for what is left.
+        assert seen_limits[0] == 11
+        assert seen_limits[1] == 9
+
+
 class TestNoHardDeleteAnywhere:
     def test_migration_module_never_calls_files_delete(self):
         """The soft-delete invariant: this server never trashes or hard-deletes

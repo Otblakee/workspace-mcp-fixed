@@ -193,6 +193,19 @@ def _resource_id(result: Any, kwargs: dict) -> str:
         "thread_id",
         "calendar_id",
         "resource_name",
+        # Drive architecture / migration tools name their target differently.
+        # Without these the audit rows for permission grants, drive updates,
+        # folder-tree builds and hub rebuilds carry an empty resource_id, so
+        # "what happened to this drive?" cannot be answered from the log.
+        "file_or_drive_id",
+        "drive_id",
+        "root_id",
+        "source_folder_id",
+        "hub_folder_id",
+        "target_id",
+        "registry_spreadsheet_id",
+        # gadmin_write group mutations.
+        "group_email",
     ):
         v = kw.get(k)
         if v is not None and v != "":

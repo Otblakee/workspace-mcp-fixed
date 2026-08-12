@@ -30,6 +30,7 @@ unguarded legacy implementation still present in ``gdrive/drive_tools.py``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any, Dict, List, Optional
@@ -53,6 +54,29 @@ from gdrive.drive_helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Per-target locks for the revoke check-and-delete sequence. Two concurrent
+# revocations of different organizers can each list the same two organizers,
+# each conclude another one remains, and both delete — leaving the drive with
+# none.
+#
+# This narrows that window to zero *within one server process*, which is the
+# whole exposure for a single-instance deployment. It is NOT a distributed
+# lock: two Render instances, or a direct API call, can still race. The
+# durable protection is Drive's own refusal to remove the final organizer of a
+# shared drive, which this guardrail front-runs with a clearer message.
+_revoke_locks: Dict[str, asyncio.Lock] = {}
+_revoke_locks_guard = asyncio.Lock()
+
+
+async def _revoke_lock_for(target_id: str) -> asyncio.Lock:
+    async with _revoke_locks_guard:
+        lock = _revoke_locks.get(target_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _revoke_locks[target_id] = lock
+        return lock
+
 
 _DRIVE_FIELDS = (
     "id, name, themeId, colorRgb, createdTime, hidden, "
@@ -468,15 +492,41 @@ async def set_drive_permission(
 
     target = await _describe_target(service, file_or_drive_id)
     existing = await _list_permissions(service, file_or_drive_id)
+    # Match on type as well as address. Matching by email alone would find an
+    # existing type=user grant while the caller asked for a group, and then
+    # quietly no-op or update it — reporting an individual grant as a group
+    # one and skipping the create that Drive would have rejected. The
+    # groups-only guardrail depends on that rejection actually happening.
     match = next(
         (
             p
             for p in existing
             if (p.get("emailAddress") or "").lower() == email.lower()
+            and p.get("type") == principal_type
             and not p.get("deleted")
         ),
         None,
     )
+    conflicting = next(
+        (
+            p
+            for p in existing
+            if (p.get("emailAddress") or "").lower() == email.lower()
+            and p.get("type") != principal_type
+            and not p.get("deleted")
+        ),
+        None,
+    )
+    if match is None and conflicting is not None:
+        raise UserInputError(
+            f"'{email}' already holds a type='{conflicting.get('type')}' "
+            f"permission (role '{conflicting.get('role')}') on "
+            f"{target['kind']} '{target['name']}', but this call declared "
+            f"type='{principal_type}'. Refusing to modify a grant of a "
+            "different principal type. Pass allow_individual=True to manage "
+            "the individual grant explicitly, or revoke it first with "
+            "revoke_drive_permission."
+        )
 
     if match and match.get("role") == role and not expiration_time:
         return (
@@ -599,60 +649,70 @@ async def revoke_drive_permission(
         )
 
     target = await _describe_target(service, file_or_drive_id)
-    permissions = await _list_permissions(service, file_or_drive_id)
 
-    if wanted_permission_id:
-        match = next(
-            (p for p in permissions if p.get("id") == wanted_permission_id), None
-        )
-    else:
-        match = next(
-            (p for p in permissions if (p.get("emailAddress") or "").lower() == wanted),
-            None,
-        )
+    # Hold the per-target lock across list → check → delete. Reading the
+    # permissions outside it would let two concurrent revocations each see the
+    # same two organizers, each conclude one remains, and both delete.
+    async with await _revoke_lock_for(file_or_drive_id):
+        permissions = await _list_permissions(service, file_or_drive_id)
 
-    if match is None:
-        return (
-            f"ℹ️ No matching permission for "
-            f"'{wanted_permission_id or wanted}' on {target['kind']} "
-            f"'{target['name']}' ({file_or_drive_id}); nothing to revoke."
-        )
-
-    match_email = (match.get("emailAddress") or "").lower()
-    if match_email and match_email == user_google_email.lower():
-        raise UserInputError(
-            "Refusing to revoke your own access — that would lock you out of "
-            f"'{target['name']}'. Ask another organizer to do it."
-        )
-
-    if target["kind"] == "drive" and match.get("role") == "organizer":
-        organizers = [
-            p
-            for p in permissions
-            if p.get("role") == "organizer" and not p.get("deleted")
-        ]
-        if len(organizers) <= 1:
-            raise UserInputError(
-                f"Refusing to remove the last organizer of shared drive "
-                f"'{target['name']}' — the drive would be left with nobody who "
-                "can administer it. Add another organizer first."
+        if wanted_permission_id:
+            match = next(
+                (p for p in permissions if p.get("id") == wanted_permission_id), None
+            )
+        else:
+            match = next(
+                (
+                    p
+                    for p in permissions
+                    if (p.get("emailAddress") or "").lower() == wanted
+                ),
+                None,
             )
 
-    if dry_run:
-        return (
-            "DRY RUN — no permission was removed.\n"
-            f"   Target: {target['kind']} '{target['name']}' ({file_or_drive_id})\n"
-            f"   Would remove: {format_permission_info(match)}"
-        )
+        if match is None:
+            return (
+                f"ℹ️ No matching permission for "
+                f"'{wanted_permission_id or wanted}' on {target['kind']} "
+                f"'{target['name']}' ({file_or_drive_id}); nothing to revoke."
+            )
 
-    await execute_with_backoff(
-        lambda: service.permissions().delete(
-            fileId=file_or_drive_id,
-            permissionId=match["id"],
-            supportsAllDrives=True,
-        ),
-        label="permissions.delete",
-    )
+        match_email = (match.get("emailAddress") or "").lower()
+        if match_email and match_email == user_google_email.lower():
+            raise UserInputError(
+                "Refusing to revoke your own access — that would lock you out of "
+                f"'{target['name']}'. Ask another organizer to do it."
+            )
+
+        if target["kind"] == "drive" and match.get("role") == "organizer":
+            organizers = [
+                p
+                for p in permissions
+                if p.get("role") == "organizer" and not p.get("deleted")
+            ]
+            if len(organizers) <= 1:
+                raise UserInputError(
+                    f"Refusing to remove the last organizer of shared drive "
+                    f"'{target['name']}' — the drive would be left with nobody who "
+                    "can administer it. Add another organizer first."
+                )
+
+        if dry_run:
+            return (
+                "DRY RUN — no permission was removed.\n"
+                f"   Target: {target['kind']} '{target['name']}' "
+                f"({file_or_drive_id})\n"
+                f"   Would remove: {format_permission_info(match)}"
+            )
+
+        await execute_with_backoff(
+            lambda: service.permissions().delete(
+                fileId=file_or_drive_id,
+                permissionId=match["id"],
+                supportsAllDrives=True,
+            ),
+            label="permissions.delete",
+        )
     logger.info(
         "[revoke_drive_permission] removed permission %s (%s) on %s for %s",
         match.get("id"),

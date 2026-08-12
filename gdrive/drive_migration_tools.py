@@ -85,9 +85,20 @@ def is_native_google_file(mime_type: Optional[str]) -> bool:
 
 
 async def _list_children(
-    service, folder_id: str, *, include_trashed: bool, fields: str = INVENTORY_FIELDS
+    service,
+    folder_id: str,
+    *,
+    include_trashed: bool,
+    fields: str = INVENTORY_FIELDS,
+    limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """List every child of ``folder_id``, draining all pages."""
+    """List the children of ``folder_id``, draining pages up to ``limit``.
+
+    ``limit`` exists so a single folder with far more children than the whole
+    inventory cap cannot page through all of them before the caller gets a
+    chance to stop. Callers pass the remaining allowance plus one, so the
+    surplus item still signals truncation.
+    """
     trashed_clause = "" if include_trashed else " and trashed=false"
     query = f"'{_escape_query_value(folder_id)}' in parents{trashed_clause}"
     return await paginate(
@@ -100,6 +111,7 @@ async def _list_children(
             includeItemsFromAllDrives=True,
         ),
         items_key="files",
+        max_items=limit,
         label=f"files.list(children of {folder_id})",
     )
 
@@ -146,8 +158,20 @@ async def _inventory_tree(
     while queue:
         folder_id, folder_path = queue.popleft()
         folder_count += 1
+        # Fetch at most what is still allowed, plus one to detect overflow.
+        remaining = max_items - len(rows)
+        if remaining <= 0:
+            truncated = True
+            warnings.append(
+                f"walk stopped at max_items={max_items}; the inventory is a "
+                "floor, not a complete count. Re-run with a higher max_items."
+            )
+            break
         children = await _list_children(
-            service, folder_id, include_trashed=include_trashed
+            service,
+            folder_id,
+            include_trashed=include_trashed,
+            limit=remaining + 1,
         )
 
         for child in children:
@@ -738,7 +762,14 @@ async def create_folder_tree(
             )
             failures.append((folder_path, f"{type(exc).__name__}: {exc}"))
 
-    header = "DRY RUN — no folders were created." if dry_run else "Folder tree ready."
+    if dry_run:
+        header = "DRY RUN — no folders were created."
+    elif failures:
+        # Same reason as batch_copy: lead with the error marker so the audit
+        # row does not claim success for a partially failed run.
+        header = f"❌ Folder tree finished with {len(failures)} failed path(s)."
+    else:
+        header = "Folder tree ready."
     counts = {
         "paths_requested": len(set(wanted)),
         "folders_created" if not dry_run else "folders_to_create": (
@@ -1002,11 +1033,20 @@ async def batch_copy_from_manifest(
         results, filename=f"copy_results_{migration_batch or 'batch'}.jsonl"
     )
 
-    header = (
-        "DRY RUN — nothing was copied."
-        if dry_run
-        else f"Batch copy complete (batch label: '{migration_batch or 'unset'}')."
-    )
+    failed_count = counts["failed"]
+    # The audit wrapper decides success/error by inspecting the START of the
+    # returned string. A run where every row failed used to open with "Batch
+    # copy complete" and be recorded as a success, which is exactly the wrong
+    # thing for a migration audit trail.
+    if dry_run:
+        header = "DRY RUN — nothing was copied."
+    elif failed_count:
+        header = (
+            f"❌ Batch copy finished with {failed_count} failed row(s) "
+            f"(batch label: '{migration_batch or 'unset'}')."
+        )
+    else:
+        header = f"Batch copy complete (batch label: '{migration_batch or 'unset'}')."
     lines = [header, summarise_counts(counts)]
     failures = [r for r in results if r["status"] == "failed"]
     if failures:

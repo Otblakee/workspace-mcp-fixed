@@ -478,6 +478,95 @@ class TestSetDrivePermission:
         assert "Updated" in result
 
     @pytest.mark.asyncio
+    async def test_existing_user_grant_does_not_satisfy_a_group_request(self):
+        """Matching on email alone found a type=user grant when the caller
+        asked for a group, then quietly no-op'd or updated it — reporting an
+        individual grant as a group one and skipping the create that Drive
+        would have rejected."""
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_list_result = {
+            "permissions": [
+                {
+                    "id": "p1",
+                    "type": "user",
+                    "role": "writer",
+                    "emailAddress": "someone@otbgroup.co.uk",
+                }
+            ]
+        }
+
+        with pytest.raises(UserInputError, match="different principal type"):
+            await set_drive_permission(
+                service, USER, "d1", principal="someone@otbgroup.co.uk", role="writer"
+            )
+
+        assert "permissions.create" not in service.call_names()
+        assert "permissions.update" not in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_existing_user_grant_is_managed_with_allow_individual(self):
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_list_result = {
+            "permissions": [
+                {
+                    "id": "p1",
+                    "type": "user",
+                    "role": "reader",
+                    "emailAddress": "someone@otbgroup.co.uk",
+                }
+            ]
+        }
+        service.permissions_update_result = {
+            "id": "p1",
+            "type": "user",
+            "role": "writer",
+            "emailAddress": "someone@otbgroup.co.uk",
+        }
+
+        result = await set_drive_permission(
+            service,
+            USER,
+            "d1",
+            principal="someone@otbgroup.co.uk",
+            role="writer",
+            allow_individual=True,
+        )
+
+        assert service.kwargs_for("permissions.update")[0]["permissionId"] == "p1"
+        assert "Updated" in result
+
+    @pytest.mark.asyncio
+    async def test_group_grant_matches_only_the_group_permission(self):
+        """A user and a group permission can coexist for the same address."""
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_list_result = {
+            "permissions": [
+                {
+                    "id": "puser",
+                    "type": "user",
+                    "role": "reader",
+                    "emailAddress": "shared@otbgroup.co.uk",
+                },
+                {
+                    "id": "pgroup",
+                    "type": "group",
+                    "role": "writer",
+                    "emailAddress": "shared@otbgroup.co.uk",
+                },
+            ]
+        }
+
+        result = await set_drive_permission(
+            service, USER, "d1", principal="shared@otbgroup.co.uk", role="writer"
+        )
+
+        assert "No change" in result
+        assert "pgroup" in result
+
+    @pytest.mark.asyncio
     async def test_dry_run_changes_nothing(self):
         service = FakeDrive()
         service.drives_get_result = {"id": "d1", "name": "Drive"}
@@ -648,6 +737,64 @@ class TestRevokeDrivePermission:
             await revoke_drive_permission(service, USER, "d1", principal="anyone")
 
         assert "permissions.delete" not in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_organizer_revocations_cannot_both_succeed(self):
+        """Two revocations of different organizers could each list the same
+        two organizers, each conclude one remains, and both delete."""
+        import asyncio as _asyncio
+
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_list_result = {
+            "permissions": [
+                {
+                    "id": "o1",
+                    "type": "group",
+                    "role": "organizer",
+                    "emailAddress": "a@otbgroup.co.uk",
+                },
+                {
+                    "id": "o2",
+                    "type": "group",
+                    "role": "organizer",
+                    "emailAddress": "b@otbgroup.co.uk",
+                },
+            ]
+        }
+
+        # After either delete lands, only one organizer remains.
+        real_permissions = service.permissions
+
+        def shrinking_permissions():
+            handle = real_permissions()
+            original_delete = handle.delete
+
+            def delete(**kwargs):
+                removed = kwargs["permissionId"]
+                service.permissions_list_result = {
+                    "permissions": [
+                        p
+                        for p in service.permissions_list_result["permissions"]
+                        if p["id"] != removed
+                    ]
+                }
+                return original_delete(**kwargs)
+
+            handle.delete = delete
+            return handle
+
+        service.permissions = shrinking_permissions
+
+        results = await _asyncio.gather(
+            revoke_drive_permission(service, USER, "d1", principal="a@otbgroup.co.uk"),
+            revoke_drive_permission(service, USER, "d1", principal="b@otbgroup.co.uk"),
+            return_exceptions=True,
+        )
+
+        deletes = service.kwargs_for("permissions.delete")
+        assert len(deletes) == 1, "both revocations deleted; the drive is orphaned"
+        assert any(isinstance(r, UserInputError) for r in results)
 
     @pytest.mark.asyncio
     async def test_a_public_permission_can_still_be_removed_by_id(self):
