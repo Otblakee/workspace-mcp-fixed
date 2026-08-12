@@ -194,6 +194,21 @@ class TestResolvePrincipal:
         monkeypatch.delenv("DRIVE_PERMISSION_ALLOWED_DOMAINS", raising=False)
         assert drive_batch.resolve_principal("team@example.com")[0] == "group"
 
+    def test_a_real_group_named_anyone_is_not_mistaken_for_public_sharing(
+        self, monkeypatch
+    ):
+        """The bare Drive principal types have no '@' and are refused by the
+        address check. Matching on a prefix would reject an ordinary
+        distribution list that happens to start with one of those words."""
+        monkeypatch.delenv("DRIVE_PERMISSION_ALLOWED_DOMAINS", raising=False)
+        assert drive_batch.resolve_principal("anyone@otbgroup.co.uk") == (
+            "group",
+            "anyone@otbgroup.co.uk",
+        )
+        assert drive_batch.resolve_principal("domain-admins@otbgroup.co.uk")[0] == (
+            "group"
+        )
+
 
 class TestValidateDriveRole:
     @pytest.mark.parametrize(

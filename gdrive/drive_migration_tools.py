@@ -468,7 +468,9 @@ async def walk_drive(
             lines.append(f"   • {row['name']} ({row['id']}) at {row['path']}")
         if len(sweep_only) > 20:
             lines.append(f"   … and {len(sweep_only) - 20} more (see manifest)")
-    elif self_check and is_drive_root:
+    elif self_check and is_drive_root and not counts.get("truncated"):
+        # Only claim a pass when the sweep actually ran to completion; a
+        # truncated sweep finding nothing extra proves nothing.
         lines.append("✅ Self-check passed: the sweep found nothing the walk missed.")
     for warning in warnings[:20]:
         lines.append(f"⚠️ {warning}")
@@ -591,8 +593,8 @@ def _manifest_paths(
     }
     wanted_drive = (drive or "").strip()
 
-    if wanted_drive:
-        if drives_present and wanted_drive not in drives_present:
+    if wanted_drive and drives_present:
+        if wanted_drive not in drives_present:
             raise UserInputError(
                 f"No manifest rows for drive {wanted_drive!r}. Drives present: "
                 f"{', '.join(sorted(drives_present))}."
@@ -600,6 +602,14 @@ def _manifest_paths(
         active = [
             row for row in active if str(row.get("drive") or "").strip() == wanted_drive
         ]
+    elif wanted_drive:
+        # A drive was named but the manifest has no drive column to filter on.
+        # Every row is for this root by construction; filtering on the absent
+        # column would silently discard all of them.
+        logger.info(
+            "[create_folder_tree] drive=%r ignored: manifest has no drive column",
+            wanted_drive,
+        )
     elif len(drives_present) > 1:
         raise UserInputError(
             "Manifest spans multiple drives "
@@ -920,10 +930,12 @@ async def batch_copy_from_manifest(
         manifest_path,
         required_keys=("source_id", "dest_folder_id"),
     )
+    capped_by_max_rows = False
     if max_rows is not None:
         if max_rows < 1:
             raise UserInputError("max_rows must be at least 1.")
         if len(rows) > max_rows:
+            capped_by_max_rows = True
             logger.info(
                 "[batch_copy_from_manifest] capping %d rows at max_rows=%d",
                 len(rows),
@@ -1009,7 +1021,10 @@ async def batch_copy_from_manifest(
             f"⚠️ {counts['unstamped_copies']} copy/copies came back without the "
             "provenance property — re-check before reconciling."
         )
-    if max_rows is not None and len(rows) == max_rows:
+    if capped_by_max_rows:
+        # Recorded at cap time, not inferred from the final row count —
+        # de-duplication runs afterwards and can shrink the list back below
+        # max_rows, which would have silently suppressed this notice.
         lines.append(f"ℹ️ Capped at max_rows={max_rows}; more rows may remain.")
     lines.append(f"Per-row result log (JSONL): {access_line}")
     return "\n".join(lines)

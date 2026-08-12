@@ -244,7 +244,11 @@ def resolve_principal(
             "this deployment."
         )
     lowered = email.lower()
-    if lowered.startswith("anyone") or lowered in {"domain", "anyone"}:
+    # Exact match only. The bare Drive principal types carry no "@" and are
+    # already refused above; matching on a prefix here would reject a real
+    # group whose address merely starts with one of these words (an
+    # ``anyone@…`` distribution list is a perfectly ordinary Workspace group).
+    if lowered in {"domain", "anyone", "anyonewithlink"}:
         raise UserInputError(
             "Public / domain-wide sharing is refused: a public link is a "
             "permanent leak. Grant access to a group instead."

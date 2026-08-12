@@ -1332,6 +1332,69 @@ class TestRebuildHubSheetsScope:
                 await rebuild_hub(service, USER, "sheet1", "hub")
 
 
+class TestReportingAccuracy:
+    """Second review pass: the summary must not misreport what happened."""
+
+    @pytest.mark.asyncio
+    async def test_max_rows_notice_survives_deduplication(self):
+        """The cap notice is recorded when the cap bites, not inferred from
+        the final row count — dedup runs afterwards and can shrink the list
+        back below max_rows, suppressing the notice."""
+        service = _copy_service()
+        manifest = json.dumps(
+            [
+                {"source_id": "s1", "dest_folder_id": "dest"},
+                {"source_id": "s1", "dest_folder_id": "dest"},
+                {"source_id": "s2", "dest_folder_id": "dest"},
+            ]
+        )
+
+        result = await batch_copy_from_manifest(
+            service, USER, manifest_json=manifest, max_rows=2
+        )
+
+        # 2 rows survive the cap, dedup collapses them to 1 — the notice must
+        # still appear because a row really was dropped by the cap.
+        assert "Capped at max_rows=2" in result
+
+    @pytest.mark.asyncio
+    async def test_truncated_sweep_does_not_claim_a_clean_self_check(self):
+        """A truncated sweep that happened to find nothing extra proves
+        nothing, so it must not print the pass line."""
+        nodes = {
+            "D": {"id": "D", "name": "Big", "mimeType": FOLDER},
+            "f1": _file("f1", "a.pdf", md5="m1", parents=["D"]),
+            "f2": _file("f2", "b.pdf", md5="m2", parents=["D"]),
+            "f3": _file("f3", "c.pdf", md5="m3", parents=["D"]),
+        }
+        service = FakeTree(nodes, {"D": ["f1", "f2", "f3"]}, drive_id="D")
+
+        result = await walk_drive(service, USER, "D", max_items=2)
+
+        assert "Self-check passed" not in result
+        assert "truncated: 1" in result
+
+    @pytest.mark.asyncio
+    async def test_drive_selector_is_ignored_when_manifest_has_no_drive_column(self):
+        """Filtering on an absent column would discard every row and report
+        the misleading 'no folder paths to create'."""
+        nodes = {"root": {"id": "root", "name": "Root", "mimeType": FOLDER}}
+        service = FakeTree(nodes, {"root": []})
+        manifest = json.dumps([{"folder_path": "01_A"}, {"folder_path": "02_B"}])
+
+        with patch(
+            "gdrive.drive_migration_tools.resolve_folder_id",
+            new_callable=AsyncMock,
+            return_value="root",
+        ):
+            result = await create_folder_tree(
+                service, USER, "root", manifest_json=manifest, drive="OTB-Hub"
+            )
+
+        assert [b["name"] for b in service.created] == ["01_A", "02_B"]
+        assert "01_A" in result
+
+
 class TestNoHardDeleteAnywhere:
     def test_migration_module_never_calls_files_delete(self):
         """The soft-delete invariant: this server never trashes or hard-deletes
