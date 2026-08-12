@@ -33,7 +33,9 @@ scope alone is not enough.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional
 
 from googleapiclient.errors import HttpError
@@ -73,6 +75,23 @@ async def _get_group(service, group_key: str) -> Optional[Dict[str, Any]]:
 
 
 ADMIN_ROLES = {"OWNER", "MANAGER"}
+
+# Per-group locks for the last-administrator check. Two concurrent requests
+# demoting or removing different admins can each see the same two, each
+# conclude another remains, and both proceed — leaving the group with none.
+# Same shape, and the same honest limitation, as the shared-drive revocation
+# lock: this is process-local, not distributed.
+_group_admin_locks: Dict[str, asyncio.Lock] = {}
+_group_admin_locks_guard = asyncio.Lock()
+
+
+async def _group_admin_lock(group_key: str) -> asyncio.Lock:
+    async with _group_admin_locks_guard:
+        lock = _group_admin_locks.get(group_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _group_admin_locks[group_key] = lock
+        return lock
 
 
 async def _assert_not_last_admin(
@@ -254,38 +273,51 @@ async def add_group_member(
         )
 
     # Demoting the sole administrator strands the group exactly as removing
-    # them would, so the same guard applies to both paths.
-    if existing is not None and member_role not in ADMIN_ROLES:
-        await _assert_not_last_admin(
-            service, group_key, existing_role, action=f"demote to {member_role}"
-        )
+    # them would, so the same guard applies to both paths. The check and the
+    # update are held under one per-group lock: two concurrent demotions of
+    # different admins could otherwise each see two and both proceed.
+    is_demotion = (
+        existing is not None
+        and existing_role in ADMIN_ROLES
+        and member_role not in ADMIN_ROLES
+    )
 
-    if dry_run:
-        current = f" (currently {existing.get('role')})" if existing is not None else ""
-        verb = "update" if existing is not None else "add"
-        return (
-            "DRY RUN — no membership was changed.\n"
-            f"   Would {verb}: {member_key} → {group_key} as {member_role}{current}"
-        )
+    async with AsyncExitStack() as stack:
+        if is_demotion:
+            await stack.enter_async_context(await _group_admin_lock(group_key))
+            await _assert_not_last_admin(
+                service, group_key, existing_role, action=f"demote to {member_role}"
+            )
 
-    if existing is not None:
-        updated = await execute_with_backoff(
-            lambda: service.members().update(
-                groupKey=group_key, memberKey=member_key, body={"role": member_role}
-            ),
-            label="directory.members.update",
-        )
-        logger.info(
-            "[add_group_member] role change %s in %s → %s by %s",
-            member_key,
-            group_key,
-            member_role,
-            user_google_email,
-        )
-        return (
-            f"✅ Updated {member_key} in {group_key}: "
-            f"{existing.get('role')} → {updated.get('role', member_role)}"
-        )
+        if dry_run:
+            current = (
+                f" (currently {existing.get('role')})" if existing is not None else ""
+            )
+            verb = "update" if existing is not None else "add"
+            return (
+                "DRY RUN — no membership was changed.\n"
+                f"   Would {verb}: {member_key} → {group_key} as "
+                f"{member_role}{current}"
+            )
+
+        if existing is not None:
+            updated = await execute_with_backoff(
+                lambda: service.members().update(
+                    groupKey=group_key, memberKey=member_key, body={"role": member_role}
+                ),
+                label="directory.members.update",
+            )
+            logger.info(
+                "[add_group_member] role change %s in %s → %s by %s",
+                member_key,
+                group_key,
+                member_role,
+                user_google_email,
+            )
+            return (
+                f"✅ Updated {member_key} in {group_key}: "
+                f"{existing.get('role')} → {updated.get('role', member_role)}"
+            )
 
     added = await execute_with_backoff(
         lambda: service.members().insert(
@@ -351,19 +383,28 @@ async def remove_group_member(
         return f"ℹ️ {member_key} is not a member of {group_key}; nothing to remove."
 
     member_role = (existing.get("role") or "").upper()
-    await _assert_not_last_admin(service, group_key, member_role, action="remove")
 
-    if dry_run:
-        return (
-            "DRY RUN — no membership was removed.\n"
-            f"   Would remove: {member_key} ({member_role or 'MEMBER'}) from "
-            f"{group_key}"
+    # Same lock as the demotion path, for the same reason: the check and the
+    # delete must not be interleaved with another admin removal.
+    async with AsyncExitStack() as stack:
+        if member_role in ADMIN_ROLES:
+            await stack.enter_async_context(await _group_admin_lock(group_key))
+            await _assert_not_last_admin(
+                service, group_key, member_role, action="remove"
+            )
+
+        if dry_run:
+            return (
+                "DRY RUN — no membership was removed.\n"
+                f"   Would remove: {member_key} ({member_role or 'MEMBER'}) from "
+                f"{group_key}"
+            )
+
+        await execute_with_backoff(
+            lambda: service.members().delete(groupKey=group_key, memberKey=member_key),
+            label="directory.members.delete",
         )
 
-    await execute_with_backoff(
-        lambda: service.members().delete(groupKey=group_key, memberKey=member_key),
-        label="directory.members.delete",
-    )
     logger.info(
         "[remove_group_member] removed %s from %s by %s",
         member_key,

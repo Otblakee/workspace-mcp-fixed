@@ -602,6 +602,21 @@ class TestSetDrivePermission:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_directory_lookup(request):
+    """Existing revoke tests must not reach for a real Admin Directory
+    service. Tests that exercise the membership guard opt out."""
+    if "uses_directory" in request.keywords:
+        yield
+        return
+    with patch.object(
+        shared_drive_tools,
+        "_caller_is_group_member",
+        new=AsyncMock(return_value=(False, True)),
+    ):
+        yield
+
+
 class TestRevokeDrivePermission:
     @pytest.mark.asyncio
     async def test_revokes_a_group_permission(self):
@@ -737,6 +752,104 @@ class TestRevokeDrivePermission:
             await revoke_drive_permission(service, USER, "d1", principal="anyone")
 
         assert "permissions.delete" not in service.call_names()
+
+    @pytest.mark.uses_directory
+    @pytest.mark.asyncio
+    async def test_refuses_to_revoke_a_group_the_caller_belongs_to(self):
+        """Group-granted access is the default architecture, so checking only
+        the direct email would let the tool lock the operator out while
+        promising it cannot."""
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_list_result = {
+            "permissions": [
+                {
+                    "id": "p1",
+                    "type": "group",
+                    "role": "writer",
+                    "emailAddress": "otb-premises@otbgroup.co.uk",
+                },
+                {
+                    "id": "p2",
+                    "type": "user",
+                    "role": "organizer",
+                    "emailAddress": "other@otbgroup.co.uk",
+                },
+            ]
+        }
+
+        with patch.object(
+            shared_drive_tools,
+            "_caller_is_group_member",
+            new=AsyncMock(return_value=(True, True)),
+        ):
+            with pytest.raises(UserInputError, match="member of that group"):
+                await revoke_drive_permission(
+                    service, USER, "d1", principal="otb-premises@otbgroup.co.uk"
+                )
+
+        assert "permissions.delete" not in service.call_names()
+
+    @pytest.mark.uses_directory
+    @pytest.mark.asyncio
+    async def test_allow_self_lockout_overrides_the_group_guard(self):
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_list_result = {
+            "permissions": [
+                {
+                    "id": "p1",
+                    "type": "group",
+                    "role": "writer",
+                    "emailAddress": "otb-premises@otbgroup.co.uk",
+                }
+            ]
+        }
+
+        with patch.object(
+            shared_drive_tools,
+            "_caller_is_group_member",
+            new=AsyncMock(return_value=(True, True)),
+        ):
+            result = await revoke_drive_permission(
+                service,
+                USER,
+                "d1",
+                principal="otb-premises@otbgroup.co.uk",
+                allow_self_lockout=True,
+            )
+
+        assert "Revoked" in result
+        assert service.kwargs_for("permissions.delete")[0]["permissionId"] == "p1"
+
+    @pytest.mark.uses_directory
+    @pytest.mark.asyncio
+    async def test_unverifiable_membership_is_disclosed_not_implied(self):
+        """When Directory is unreachable we must not imply a check happened."""
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_list_result = {
+            "permissions": [
+                {
+                    "id": "p1",
+                    "type": "group",
+                    "role": "writer",
+                    "emailAddress": "otb-premises@otbgroup.co.uk",
+                }
+            ]
+        }
+
+        with patch.object(
+            shared_drive_tools,
+            "_caller_is_group_member",
+            new=AsyncMock(return_value=(False, False)),
+        ):
+            result = await revoke_drive_permission(
+                service, USER, "d1", principal="otb-premises@otbgroup.co.uk"
+            )
+
+        assert "Could not verify" in result
+        assert "Revoked" in result
 
     @pytest.mark.asyncio
     async def test_concurrent_organizer_revocations_cannot_both_succeed(self):

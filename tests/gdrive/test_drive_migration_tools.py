@@ -1705,6 +1705,152 @@ class TestChildListingIsBounded:
         assert seen_limits[1] == 9
 
 
+class TestExactlyCappedTreeIsNotTruncated:
+    def _tree(self, item_count):
+        nodes = {"D": {"id": "D", "name": "Exact", "mimeType": FOLDER}}
+        children = {"D": []}
+        for i in range(item_count):
+            nodes[f"f{i}"] = _file(f"f{i}", f"f{i}.pdf", md5=f"m{i}", parents=["D"])
+            children["D"].append(f"f{i}")
+        return FakeTree(nodes, children)
+
+    @pytest.mark.asyncio
+    async def test_tree_of_exactly_max_items_is_complete(self):
+        """Reaching the cap is not evidence of truncation. Marking it so made
+        an exactly-capped tree permanently inconclusive at the gate, with no
+        way to pass short of guessing a bigger cap."""
+        result = await walk_drive(
+            self._tree(5), USER, "D", max_items=5, self_check=False
+        )
+
+        assert "truncated: 0" in result
+        assert "items_total: 5" in result
+
+    @pytest.mark.asyncio
+    async def test_one_item_over_the_cap_is_truncated(self):
+        result = await walk_drive(
+            self._tree(6), USER, "D", max_items=5, self_check=False
+        )
+
+        assert "truncated: 1" in result
+
+    @pytest.mark.asyncio
+    async def test_exactly_capped_reconciliation_can_still_pass(self):
+        """The end-to-end consequence of the fix."""
+        nodes = {
+            "src": {"id": "src", "name": "S", "mimeType": FOLDER},
+            "dst": {"id": "dst", "name": "D", "mimeType": FOLDER},
+            "s1": _file("s1", "a.pdf", md5="m1", size="1", parents=["src"]),
+            "d1": _file("d1", "a.pdf", md5="m1", size="1", parents=["dst"]),
+        }
+        service = FakeTree(nodes, {"src": ["s1"], "dst": ["d1"]})
+
+        result = await reconcile_folders(service, USER, "src", "dst", max_items=1)
+
+        assert "Reconciliation clean" in result
+        assert "Inconclusive" not in result
+
+
+class TestDuplicateSiblingPairing:
+    @pytest.mark.asyncio
+    async def test_partial_overlap_names_the_right_missing_file(self, tmp_path):
+        """Source [A, B] vs destination [B]: sorting and zipping compared A
+        against B as a checksum mismatch and then called B missing, when B is
+        the one that is present and only A is absent."""
+        nodes = {
+            "src": {"id": "src", "name": "S", "mimeType": FOLDER},
+            "dst": {"id": "dst", "name": "D", "mimeType": FOLDER},
+            "sA": _file("sA", "foo.pdf", md5="A", size="1", parents=["src"]),
+            "sB": _file("sB", "foo.pdf", md5="B", size="2", parents=["src"]),
+            "dB": _file("dB", "foo.pdf", md5="B", size="2", parents=["dst"]),
+        }
+        service = FakeTree(nodes, {"src": ["sA", "sB"], "dst": ["dB"]})
+
+        await reconcile_folders(service, USER, "src", "dst")
+
+        rows = _report_rows(tmp_path, "reconcile_report")
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "missing_in_dest"
+        # The absent file is A, not B.
+        assert rows[0]["source_id"] == "sA"
+
+    @pytest.mark.asyncio
+    async def test_no_checksum_mismatch_is_invented(self, tmp_path):
+        nodes = {
+            "src": {"id": "src", "name": "S", "mimeType": FOLDER},
+            "dst": {"id": "dst", "name": "D", "mimeType": FOLDER},
+            "sA": _file("sA", "foo.pdf", md5="A", size="1", parents=["src"]),
+            "sB": _file("sB", "foo.pdf", md5="B", size="2", parents=["src"]),
+            "dB": _file("dB", "foo.pdf", md5="B", size="2", parents=["dst"]),
+        }
+        service = FakeTree(nodes, {"src": ["sA", "sB"], "dst": ["dB"]})
+
+        await reconcile_folders(service, USER, "src", "dst")
+
+        kinds = {r["kind"] for r in _report_rows(tmp_path, "reconcile_report")}
+        assert "checksum_mismatch" not in kinds
+
+
+class TestDuplicateFolderAmbiguity:
+    @pytest.mark.asyncio
+    async def test_same_named_sibling_folders_block_a_clean_verdict(self, tmp_path):
+        """Two `foo` folders make every descendant path ambiguous: a source
+        that splits a and b across them compares identical to a destination
+        that puts both under one and leaves the other empty."""
+        nodes = {
+            "src": {"id": "src", "name": "S", "mimeType": FOLDER},
+            "dst": {"id": "dst", "name": "D", "mimeType": FOLDER},
+            "sf1": _file("sf1", "foo", mime=FOLDER, parents=["src"]),
+            "sf2": _file("sf2", "foo", mime=FOLDER, parents=["src"]),
+            "sa": _file("sa", "a.pdf", md5="ma", size="1", parents=["sf1"]),
+            "sb": _file("sb", "b.pdf", md5="mb", size="2", parents=["sf2"]),
+            "df1": _file("df1", "foo", mime=FOLDER, parents=["dst"]),
+            "df2": _file("df2", "foo", mime=FOLDER, parents=["dst"]),
+            "da": _file("da", "a.pdf", md5="ma", size="1", parents=["df1"]),
+            "db": _file("db", "b.pdf", md5="mb", size="2", parents=["df1"]),
+        }
+        children = {
+            "src": ["sf1", "sf2"],
+            "dst": ["df1", "df2"],
+            "sf1": ["sa"],
+            "sf2": ["sb"],
+            "df1": ["da", "db"],
+            "df2": [],
+        }
+        service = FakeTree(nodes, children)
+
+        result = await reconcile_folders(service, USER, "src", "dst")
+
+        kinds = {r["kind"] for r in _report_rows(tmp_path, "reconcile_report")}
+        assert "ambiguous_duplicate_folders" in kinds
+        assert "Reconciliation clean" not in result
+        assert "cannot be distinguished by path" in result
+
+    @pytest.mark.asyncio
+    async def test_distinct_folder_names_stay_clean(self):
+        nodes = {
+            "src": {"id": "src", "name": "S", "mimeType": FOLDER},
+            "dst": {"id": "dst", "name": "D", "mimeType": FOLDER},
+            "sf1": _file("sf1", "foo", mime=FOLDER, parents=["src"]),
+            "sf2": _file("sf2", "bar", mime=FOLDER, parents=["src"]),
+            "df1": _file("df1", "foo", mime=FOLDER, parents=["dst"]),
+            "df2": _file("df2", "bar", mime=FOLDER, parents=["dst"]),
+        }
+        children = {
+            "src": ["sf1", "sf2"],
+            "dst": ["df1", "df2"],
+            "sf1": [],
+            "sf2": [],
+            "df1": [],
+            "df2": [],
+        }
+        service = FakeTree(nodes, children)
+
+        result = await reconcile_folders(service, USER, "src", "dst")
+
+        assert "Reconciliation clean" in result
+
+
 class TestNoHardDeleteAnywhere:
     def test_migration_module_never_calls_files_delete(self):
         """The soft-delete invariant: this server never trashes or hard-deletes

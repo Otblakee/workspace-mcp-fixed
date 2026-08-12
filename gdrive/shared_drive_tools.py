@@ -17,9 +17,12 @@ guarded replacements:
   requires ``allow_individual=True`` passed explicitly. ``anyone`` and
   ``domain`` principals are refused outright, so no tool on this server can
   create a public link.
-* ``revoke_drive_permission`` refuses to revoke the caller's own access and
-  refuses to remove the last organizer of a shared drive, so it cannot orphan
-  a drive or lock the operator out.
+* ``revoke_drive_permission`` refuses to revoke the caller's own access —
+  whether held directly or via the group being revoked — and refuses to remove
+  the last organizer of a shared drive, so it cannot orphan a drive or lock the
+  operator out. Group membership is verified through the Admin Directory API
+  when that is reachable; when it is not, the result says the check could not
+  be made rather than implying it passed.
 
 The removal tool is deliberately **not** named ``remove_drive_permission``:
 that name is on the hard denylist in ``core/tool_policy.py`` and would be
@@ -33,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from googleapiclient.errors import HttpError
 
@@ -126,6 +129,57 @@ async def _describe_target(service, target_id: str) -> Dict[str, Any]:
         "name": meta.get("name", target_id),
         "mimeType": meta.get("mimeType"),
     }
+
+
+@require_google_service("admin_directory", "admin_directory_group_member_read")
+async def _directory_service(service, user_google_email: str):
+    """Lazily acquire an Admin Directory service for the membership check.
+
+    Separate, like ``_hub_registry_service`` in the migration module, so the
+    rest of this file needs only Drive scope. Deployments that do not enable an
+    admin service simply cannot verify membership, and the caller is told so.
+    """
+    return service
+
+
+async def _caller_is_group_member(
+    group_email: str, user_google_email: str
+) -> Tuple[bool, bool]:
+    """Return ``(is_member, verified)`` for the caller's membership of a group.
+
+    ``verified`` is False when the Admin Directory API could not be reached at
+    all — no scope, not an admin, service not enabled. The caller must not read
+    ``is_member=False`` as "definitely not a member" in that case.
+    """
+    try:
+        directory = await _directory_service(user_google_email=user_google_email)
+        member = await execute_with_backoff(
+            lambda: directory.members().get(
+                groupKey=group_email, memberKey=user_google_email
+            ),
+            label="directory.members.get(self)",
+        )
+        return bool(member), True
+    except HttpError as error:
+        status = getattr(getattr(error, "resp", None), "status", None)
+        if status == 404:
+            # Directory answered: definitively not a member.
+            return False, True
+        logger.info(
+            "[revoke_drive_permission] membership check for %s in %s failed: %s",
+            user_google_email,
+            group_email,
+            error,
+        )
+        return False, False
+    except Exception as exc:  # noqa: BLE001 - unavailable service, not a failure
+        logger.info(
+            "[revoke_drive_permission] Admin Directory unavailable for the "
+            "membership check (%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
+        return False, False
 
 
 async def _list_permissions(service, target_id: str) -> List[Dict[str, Any]]:
@@ -606,15 +660,24 @@ async def revoke_drive_permission(
     file_or_drive_id: str,
     principal: Optional[str] = None,
     permission_id: Optional[str] = None,
+    allow_self_lockout: bool = False,
     dry_run: bool = False,
 ) -> str:
     """
     Removes a group's (or user's) access to a shared drive, folder or file.
 
-    Two guardrails, both fail-closed:
-      * refuses to revoke the calling user's own access (no self-lockout);
+    Guardrails:
+      * refuses to revoke the calling user's own access, whether held directly
+        **or through the group being revoked** — group-granted access is the
+        default architecture here, so checking only the direct grant would let
+        the tool lock the operator out while claiming it cannot;
       * refuses to remove the last ``organizer`` of a shared drive (no orphaned
         drive that nobody can administer).
+
+    Group membership is checked via the Admin Directory API. When that is not
+    available — the ``gadmin``/``gadmin_write`` service is not enabled, or the
+    caller is not a Workspace admin — membership cannot be verified, and the
+    result says so explicitly rather than implying a check happened.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -623,6 +686,8 @@ async def revoke_drive_permission(
             remove. Either this or permission_id is required.
         permission_id (Optional[str]): Permission ID to remove (from
             get_drive_file_permissions).
+        allow_self_lockout (bool): Explicit opt-in to revoke access the caller
+            themselves depends on. Defaults to False.
         dry_run (bool): Report what would be removed without removing it.
 
     Returns:
@@ -678,11 +743,38 @@ async def revoke_drive_permission(
             )
 
         match_email = (match.get("emailAddress") or "").lower()
-        if match_email and match_email == user_google_email.lower():
+        if (
+            match_email
+            and match_email == user_google_email.lower()
+            and not allow_self_lockout
+        ):
             raise UserInputError(
                 "Refusing to revoke your own access — that would lock you out of "
-                f"'{target['name']}'. Ask another organizer to do it."
+                f"'{target['name']}'. Ask another organizer to do it, or pass "
+                "allow_self_lockout=True if you mean it."
             )
+
+        # Group-granted access is the default architecture, so a direct-email
+        # check alone is a guardrail that misses the common case.
+        membership_note = ""
+        if match.get("type") == "group" and match_email:
+            is_member, verified = await _caller_is_group_member(
+                match_email, user_google_email
+            )
+            if is_member and not allow_self_lockout:
+                raise UserInputError(
+                    f"Refusing to revoke '{match_email}' — you are a member of "
+                    f"that group, so this would remove your own access to "
+                    f"'{target['name']}'. Pass allow_self_lockout=True if you "
+                    "mean it, or have someone outside the group do it."
+                )
+            if not verified:
+                membership_note = (
+                    f"\n⚠️ Could not verify whether you belong to '{match_email}' "
+                    "(the Admin Directory service is not available to this "
+                    "server). If you are a member, you have just removed your "
+                    "own access."
+                )
 
         if target["kind"] == "drive" and match.get("role") == "organizer":
             organizers = [
@@ -724,6 +816,7 @@ async def revoke_drive_permission(
         f"✅ Revoked access on {target['kind']} '{target['name']}' "
         f"({file_or_drive_id})\n"
         f"   Removed: {format_permission_info(match)}"
+        f"{membership_note}"
     )
 
 

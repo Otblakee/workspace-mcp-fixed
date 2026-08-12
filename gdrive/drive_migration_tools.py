@@ -158,21 +158,24 @@ async def _inventory_tree(
     while queue:
         folder_id, folder_path = queue.popleft()
         folder_count += 1
-        # Fetch at most what is still allowed, plus one to detect overflow.
+
+        # Fetch at most what is still allowed, plus one sentinel. Reaching the
+        # cap is NOT itself evidence of truncation — a tree holding exactly
+        # max_items items is complete. Only the sentinel (an item we asked for
+        # beyond the cap and actually received) or an unvisited folder left in
+        # the queue proves content remains. Marking truncation on the count
+        # alone made an exactly-capped tree permanently "inconclusive" at the
+        # reconciliation gate, unguessable without raising the cap.
         remaining = max_items - len(rows)
-        if remaining <= 0:
-            truncated = True
-            warnings.append(
-                f"walk stopped at max_items={max_items}; the inventory is a "
-                "floor, not a complete count. Re-run with a higher max_items."
-            )
-            break
         children = await _list_children(
             service,
             folder_id,
             include_trashed=include_trashed,
             limit=remaining + 1,
         )
+        if len(children) > remaining:
+            truncated = True
+            children = children[:remaining]
 
         for child in children:
             child_id = child.get("id", "")
@@ -189,20 +192,20 @@ async def _inventory_tree(
             seen_ids.add(child_id)
 
             rows.append(_inventory_row(child, child_path, "walk"))
-            if len(rows) >= max_items:
-                truncated = True
-                queue.clear()
-                break
-
             if child.get("mimeType") == FOLDER_MIME_TYPE:
                 queue.append((child_id, child_path))
 
-        if truncated:
-            warnings.append(
-                f"walk stopped at max_items={max_items}; the inventory is a "
-                "floor, not a complete count. Re-run with a higher max_items."
-            )
+        if len(rows) >= max_items:
+            # Anything still queued is content we will never look at.
+            if queue:
+                truncated = True
             break
+
+    if truncated:
+        warnings.append(
+            f"walk stopped at max_items={max_items}; the inventory is a "
+            "floor, not a complete count. Re-run with a higher max_items."
+        )
 
     counts = {
         "folders_traversed": folder_count,
@@ -1089,18 +1092,27 @@ def _group_by_path(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]
     return grouped
 
 
-def _pairing_key(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
-    """Stable ordering for same-path siblings so the two sides pair up.
+def _content_key(row: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Identity of an item by content, for matching across two inventories.
 
-    Checksum first, then size: identical content lines up across the two
-    inventories even when Drive returns the siblings in a different order.
+    Deliberately excludes the file ID: a copied file has a new ID on the
+    destination side, so including it would mean no cross-drive pair ever
+    matched exactly.
     """
     return (
         str(row.get("md5Checksum") or ""),
         str(row.get("size") or ""),
         str(row.get("mimeType") or ""),
-        str(row.get("id") or ""),
     )
+
+
+def _pairing_key(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Stable ordering for same-path siblings.
+
+    Content first so identical items line up even when Drive returns siblings
+    in a different order; the ID only breaks ties so the sort is deterministic.
+    """
+    return (*_content_key(row), str(row.get("id") or ""))
 
 
 def _compare_one(
@@ -1223,7 +1235,59 @@ def _compare_inventories(
         sources = sorted(source_by_path[path], key=_pairing_key)
         dests = sorted(dest_by_path.get(path, []), key=_pairing_key)
 
-        for source, dest in zip(sources, dests):
+        # Two same-named folders at one path make every descendant path
+        # ambiguous: `foo/a` and `foo/b` no longer say WHICH `foo` they came
+        # from, so a destination that put both files under one `foo` and left
+        # the other empty compares identical to a source that split them.
+        # Path keying cannot express that difference, so say so rather than
+        # return a clean verdict over a tree we did not really compare.
+        source_folders = [s for s in sources if s.get("mimeType") == FOLDER_MIME_TYPE]
+        dest_folders = [d for d in dests if d.get("mimeType") == FOLDER_MIME_TYPE]
+        if len(source_folders) > 1 or len(dest_folders) > 1:
+            discrepancies.append(
+                {
+                    "kind": "ambiguous_duplicate_folders",
+                    "path": path,
+                    "source_ids": [f["id"] for f in source_folders],
+                    "dest_ids": [f["id"] for f in dest_folders],
+                    "note": (
+                        "several folders share this path, so their subtrees "
+                        "cannot be told apart by path. Descendant comparisons "
+                        "below this point are not trustworthy — rename the "
+                        "duplicates (the folder-hygiene step) or verify this "
+                        "subtree by hand."
+                    ),
+                }
+            )
+
+        # Pair exact content matches first. Sorting and zipping alone mispairs
+        # partial overlaps: source [A, B] against destination [B] would compare
+        # A with B as a checksum mismatch and then report B as missing, when in
+        # fact B is present and only A is absent.
+        remaining_sources = list(sources)
+        remaining_dests = list(dests)
+        for source in list(remaining_sources):
+            twin = next(
+                (d for d in remaining_dests if _content_key(d) == _content_key(source)),
+                None,
+            )
+            if twin is None:
+                continue
+            remaining_sources.remove(source)
+            remaining_dests.remove(twin)
+            discrepancy, is_unverifiable = _compare_one(
+                path, source, twin, compare_checksums=compare_checksums
+            )
+            if is_unverifiable:
+                unverifiable += 1
+            if discrepancy is not None:
+                discrepancies.append(discrepancy)
+            else:
+                matched += 1
+
+        # Whatever is left has no exact counterpart; compare positionally so a
+        # genuine mismatch is still described, then report the surplus.
+        for source, dest in zip(remaining_sources, remaining_dests):
             discrepancy, is_unverifiable = _compare_one(
                 path, source, dest, compare_checksums=compare_checksums
             )
@@ -1234,8 +1298,7 @@ def _compare_inventories(
             else:
                 matched += 1
 
-        # Surplus on either side of a shared path is a real discrepancy.
-        for source in sources[len(dests) :]:
+        for source in remaining_sources[len(remaining_dests) :]:
             discrepancies.append(
                 {
                     "kind": "missing_in_dest",
@@ -1244,7 +1307,7 @@ def _compare_inventories(
                     "mimeType": source.get("mimeType"),
                 }
             )
-        for dest in dests[len(sources) :]:
+        for dest in remaining_dests[len(remaining_sources) :]:
             discrepancies.append(
                 {
                     "kind": "extra_in_dest",
@@ -1416,6 +1479,14 @@ async def reconcile_folders(
             f"ℹ️ {by_kind['shortcut_target_differs']} shortcut(s) point at "
             "different targets on the two sides. Expected after a copy-based "
             "migration, but confirm the mapping against the copy result log."
+        )
+    if "ambiguous_duplicate_folders" in by_kind:
+        lines.append(
+            f"⛔ {by_kind['ambiguous_duplicate_folders']} path(s) hold several "
+            "folders of the same name. Their subtrees cannot be distinguished "
+            "by path, so no clean verdict is possible below those points — "
+            "rename the duplicates or verify those subtrees by hand. This is "
+            "counted as blocking deliberately."
         )
     for warning in (source_warnings + dest_warnings)[:10]:
         lines.append(f"⚠️ {warning}")
