@@ -389,9 +389,7 @@ def main():
         # the OAuth consent screen / domain-wide delegation; loading them
         # silently on every fresh deploy would break the existing user's
         # consent flow.
-        tools_to_import = [
-            t for t in tool_imports.keys() if t not in OPT_IN_TOOLS
-        ]
+        tools_to_import = [t for t in tool_imports.keys() if t not in OPT_IN_TOOLS]
         # Don't filter individual tools when importing all
         set_enabled_tool_names(None)
 

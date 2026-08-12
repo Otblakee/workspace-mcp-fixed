@@ -59,16 +59,20 @@ logger = logging.getLogger(__name__)
 # Map non-Doc Workspace mime types to the tool family the caller probably
 # meant to use. Anything else returns a generic-but-still-clearer hint.
 _WORKSPACE_TYPE_LABELS: Dict[str, tuple] = {
-    "application/vnd.google-apps.spreadsheet":
-        ("Google Sheet", "Sheets tool (e.g. read_sheet_values)"),
-    "application/vnd.google-apps.presentation":
-        ("Google Slides presentation", "Slides tool"),
-    "application/vnd.google-apps.form":
-        ("Google Form", "Forms tool"),
-    "application/vnd.google-apps.folder":
-        ("Drive folder", "Drive tool (e.g. list_drive_items)"),
-    "application/vnd.google-apps.drawing":
-        ("Google Drawing", "Drive tool"),
+    "application/vnd.google-apps.spreadsheet": (
+        "Google Sheet",
+        "Sheets tool (e.g. read_sheet_values)",
+    ),
+    "application/vnd.google-apps.presentation": (
+        "Google Slides presentation",
+        "Slides tool",
+    ),
+    "application/vnd.google-apps.form": ("Google Form", "Forms tool"),
+    "application/vnd.google-apps.folder": (
+        "Drive folder",
+        "Drive tool (e.g. list_drive_items)",
+    ),
+    "application/vnd.google-apps.drawing": ("Google Drawing", "Drive tool"),
 }
 
 
@@ -1749,6 +1753,7 @@ async def get_doc_as_markdown(
     # the latter triggers a false governance alarm when an LLM passes a Sheet
     # ID to a Docs tool by mistake.
     from googleapiclient.errors import HttpError as _DocsHttpError
+
     try:
         doc = await asyncio.to_thread(
             docs_service.documents().get(documentId=document_id).execute

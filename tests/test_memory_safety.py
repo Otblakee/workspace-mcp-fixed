@@ -167,9 +167,7 @@ class TestChatAttachmentStreaming:
         assert meta["mime_type"] == "image/png"
 
     @pytest.mark.asyncio
-    async def test_refreshes_expired_token_before_download(
-        self, monkeypatch, tmp_path
-    ):
+    async def test_refreshes_expired_token_before_download(self, monkeypatch, tmp_path):
         """Cached services can hold expired tokens; the tool must refresh
         before hitting the media endpoint."""
         from core import attachment_storage as st
@@ -391,9 +389,7 @@ class TestContentCap:
         service.files.return_value.export_media.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_under_cap_returns_content_with_explicit_chunksize(
-        self, monkeypatch
-    ):
+    async def test_under_cap_returns_content_with_explicit_chunksize(self, monkeypatch):
         from gdrive import drive_tools
 
         impl = _unwrap(drive_tools.get_drive_file_content)

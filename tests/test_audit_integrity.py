@@ -45,8 +45,9 @@ def captured_audit(monkeypatch):
 
     monkeypatch.setattr(audit, "logger", lambda: cap)
     # Skip the FastMCP context lookup; we don't care about user attribution here.
-    monkeypatch.setattr(audit, "_resolve_user_email",
-                        lambda: _async_return("test@example.com"))
+    monkeypatch.setattr(
+        audit, "_resolve_user_email", lambda: _async_return("test@example.com")
+    )
     monkeypatch.setattr(audit, "_resolve_client", lambda: "")
     return cap
 
@@ -116,7 +117,9 @@ class TestAuditFailureDetection:
 
         @audit_log()
         async def jsonish(**kwargs):
-            return {"error": {"code": 400, "message": "Bad request: index out of range"}}
+            return {
+                "error": {"code": 400, "message": "Bad request: index out of range"}
+            }
 
         await jsonish(document_id="d1")
         row = captured_audit.entries[0]
@@ -203,9 +206,7 @@ class TestClientClassification:
     def test_claude_web_pattern(self):
         from core.audit import _classify_client
 
-        assert _classify_client(
-            "Mozilla/5.0 ... claude.ai/web/2026"
-        ) == "claude-web"
+        assert _classify_client("Mozilla/5.0 ... claude.ai/web/2026") == "claude-web"
         assert _classify_client("Anthropic-Web/1.0") == "claude-web"
 
     def test_claude_desktop_pattern(self):
@@ -235,8 +236,15 @@ class TestClientClassification:
         assert "client" in HEADERS
         # Append-only: existing columns kept in order.
         assert HEADERS[:9] == [
-            "timestamp_utc", "user", "service", "tool", "params_summary",
-            "resource_id", "status", "error", "latency_ms",
+            "timestamp_utc",
+            "user",
+            "service",
+            "tool",
+            "params_summary",
+            "resource_id",
+            "status",
+            "error",
+            "latency_ms",
         ]
 
     @pytest.mark.asyncio
@@ -289,10 +297,12 @@ class TestSensitiveCompleteness:
 
         assert "attachments" in SENSITIVE
         payload = "BASE64_BLOB_" + "x" * 5000
-        out = _redact({
-            "to": "ops@example.com",
-            "attachments": [{"filename": "secret.pdf", "content": payload}],
-        })
+        out = _redact(
+            {
+                "to": "ops@example.com",
+                "attachments": [{"filename": "secret.pdf", "content": payload}],
+            }
+        )
         assert payload not in out
         assert "secret.pdf" not in out  # whole list collapses
         assert "<redacted:list:1>" in out

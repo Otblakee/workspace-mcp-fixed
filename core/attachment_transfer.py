@@ -101,9 +101,7 @@ async def resolve_transfer_folder(
             f"and '{parent_id}' in parents and trashed = false"
         )
         listing = await asyncio.to_thread(
-            drive_service.files()
-            .list(q=query, fields="files(id)", pageSize=1)
-            .execute
+            drive_service.files().list(q=query, fields="files(id)", pageSize=1).execute
         )
         files = listing.get("files", [])
         if files:

@@ -273,9 +273,7 @@ class AttachmentStorage:
                         file_path.unlink()
                         logger.debug(f"Deleted expired attachment file: {file_path}")
                 except Exception as e:
-                    logger.warning(
-                        f"Failed to delete attachment file {file_path}: {e}"
-                    )
+                    logger.warning(f"Failed to delete attachment file {file_path}: {e}")
                 del self._metadata[file_id]
 
     def cleanup_expired(self) -> int:

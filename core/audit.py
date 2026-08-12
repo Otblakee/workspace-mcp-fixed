@@ -36,8 +36,18 @@ SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
 ENABLED = bool(AUDIT_SHEET_ID)
 
-HEADERS = ["timestamp_utc", "user", "service", "tool", "params_summary",
-           "resource_id", "status", "error", "latency_ms", "client"]
+HEADERS = [
+    "timestamp_utc",
+    "user",
+    "service",
+    "tool",
+    "params_summary",
+    "resource_id",
+    "status",
+    "error",
+    "latency_ms",
+    "client",
+]
 
 # A1 range covering all HEADERS columns. Bumped from A:I to A:J when the
 # ``client`` column was appended in the Wave 2 audit-hardening change.
@@ -47,21 +57,44 @@ HEADERS = ["timestamp_utc", "user", "service", "tool", "params_summary",
 _SHEET_RANGE_ALL_COLS = f"A:{chr(ord('A') + len(HEADERS) - 1)}"
 _SHEET_RANGE_HEADER_ROW = f"A1:{chr(ord('A') + len(HEADERS) - 1)}1"
 
-SERVICE_MAP = {"drive": "drive", "gmail": "gmail", "calendar": "calendar",
-    "event": "calendar", "doc": "docs", "comment": "docs", "spreadsheet": "sheets",
-    "sheet": "sheets", "contact": "contacts", "label": "gmail", "filter": "gmail",
-    "permission": "drive"}
+SERVICE_MAP = {
+    "drive": "drive",
+    "gmail": "gmail",
+    "calendar": "calendar",
+    "event": "calendar",
+    "doc": "docs",
+    "comment": "docs",
+    "spreadsheet": "sheets",
+    "sheet": "sheets",
+    "contact": "contacts",
+    "label": "gmail",
+    "filter": "gmail",
+    "permission": "drive",
+}
 
-SENSITIVE = {"body", "text_content", "message_body", "html_body", "values",
-             "data", "content", "notes", "description", "subject", "query",
-             "base64_content", "fileUrl", "attachments",
-             # Gmail's native RFC822 send format ("raw" message bytes,
-             # base64url). String truncation alone would still leak the
-             # first ~150 bytes of headers (From/To/Subject).
-             "raw",
-             # Resumable upload session URIs are short-lived bearer-equivalent
-             # tokens — anyone with one can PUT bytes to the in-flight upload.
-             "upload_uri"}
+SENSITIVE = {
+    "body",
+    "text_content",
+    "message_body",
+    "html_body",
+    "values",
+    "data",
+    "content",
+    "notes",
+    "description",
+    "subject",
+    "query",
+    "base64_content",
+    "fileUrl",
+    "attachments",
+    # Gmail's native RFC822 send format ("raw" message bytes,
+    # base64url). String truncation alone would still leak the
+    # first ~150 bytes of headers (From/To/Subject).
+    "raw",
+    # Resumable upload session URIs are short-lived bearer-equivalent
+    # tokens — anyone with one can PUT bytes to the in-flight upload.
+    "upload_uri",
+}
 
 
 # Module-prefix overrides for service tagging. The bare-name SERVICE_MAP
@@ -151,13 +184,28 @@ def _resource_id(result: Any, kwargs: dict) -> str:
     # the literal string "None" which is useless noise in the audit sheet
     # and confusing in queries that expect either a real ID or empty.
     kw = kwargs or {}
-    for k in ("file_id", "document_id", "spreadsheet_id", "message_id",
-              "event_id", "thread_id", "calendar_id", "resource_name"):
+    for k in (
+        "file_id",
+        "document_id",
+        "spreadsheet_id",
+        "message_id",
+        "event_id",
+        "thread_id",
+        "calendar_id",
+        "resource_name",
+    ):
         v = kw.get(k)
         if v is not None and v != "":
             return str(v)[:200]
     if isinstance(result, dict):
-        for k in ("id", "fileId", "documentId", "spreadsheetId", "messageId", "resourceName"):
+        for k in (
+            "id",
+            "fileId",
+            "documentId",
+            "spreadsheetId",
+            "messageId",
+            "resourceName",
+        ):
             v = result.get(k)
             if v is not None and v != "":
                 return str(v)[:200]
@@ -212,6 +260,7 @@ def _resolve_client() -> str:
     """
     try:
         from fastmcp.server.dependencies import get_http_headers
+
         headers = get_http_headers() or {}
         ua = headers.get("user-agent") or headers.get("User-Agent") or ""
         return _classify_client(ua)
@@ -225,8 +274,14 @@ def _resolve_client() -> str:
 # failure and returns a "successful" value, we inspect the returned shape for
 # common error markers and override status to ``error`` so the audit row is
 # truthful. Cheap pattern match — no parsing, no I/O.
-_STR_ERROR_PREFIXES = ("error:", "❌", "failed:", "batch operation failed",
-                       "table creation failed", "api error in ")
+_STR_ERROR_PREFIXES = (
+    "error:",
+    "❌",
+    "failed:",
+    "batch operation failed",
+    "table creation failed",
+    "api error in ",
+)
 
 
 def _inspect_result_for_error(result: Any) -> tuple[bool, str]:
@@ -259,7 +314,11 @@ def _inspect_result_for_error(result: Any) -> tuple[bool, str]:
             for i, reply in enumerate(replies):
                 if isinstance(reply, dict) and reply.get("error"):
                     detail = reply["error"]
-                    msg = detail.get("message") if isinstance(detail, dict) else str(detail)
+                    msg = (
+                        detail.get("message")
+                        if isinstance(detail, dict)
+                        else str(detail)
+                    )
                     return True, f"replies[{i}].error: {msg}"[:300]
     return False, ""
 
@@ -293,6 +352,7 @@ async def _resolve_user_email() -> str:
     empty value usually indicates a middleware bug worth seeing."""
     try:
         from fastmcp.server.dependencies import get_context
+
         ctx = get_context()
         if ctx is None:
             return DEFAULT_USER
@@ -321,10 +381,13 @@ def _resolve_credentials(user_email: str):
     that user and try another in the batch."""
     try:
         from auth.oauth_config import is_oauth21_enabled
+
         if is_oauth21_enabled():
             from auth.oauth21_session_store import get_oauth21_session_store
+
             return get_oauth21_session_store().get_credentials(user_email)
         from auth.google_auth import get_credentials as _get_oauth20_credentials
+
         return _get_oauth20_credentials(
             user_google_email=user_email,
             required_scopes=[SHEETS_SCOPE],
@@ -399,9 +462,7 @@ class AuditLogger:
                 except asyncio.CancelledError:
                     pass
                 except Exception as e:
-                    log.debug(
-                        "Audit flusher task ended with error during stop: %s", e
-                    )
+                    log.debug("Audit flusher task ended with error during stop: %s", e)
             except Exception as e:
                 log.debug("Audit flusher task ended with error during stop: %s", e)
         if self.q.empty():
@@ -521,14 +582,21 @@ class AuditLogger:
                     tab_ensured_this_flush = True
                 rows = [[e.get(h, "") for h in HEADERS] for e in entries]
                 await asyncio.to_thread(
-                    sheets.spreadsheets().values().append(
+                    sheets.spreadsheets()
+                    .values()
+                    .append(
                         spreadsheetId=AUDIT_SHEET_ID,
                         range=f"'{tab}'!{_SHEET_RANGE_ALL_COLS}",
                         valueInputOption="RAW",
                         insertDataOption="INSERT_ROWS",
-                        body={"values": rows}).execute)
+                        body={"values": rows},
+                    )
+                    .execute
+                )
             except Exception as e:
-                log.warning("Audit append failed for %s (%d rows): %s", email, len(entries), e)
+                log.warning(
+                    "Audit append failed for %s (%d rows): %s", email, len(entries), e
+                )
                 unwritten.extend(entries)
             finally:
                 # Drop the per-user sheets client; googleapiclient Resource
@@ -545,7 +613,8 @@ class AuditLogger:
         if unwritten:
             log.warning(
                 "audit flush: %d of %d rows had no usable user creds",
-                len(unwritten), len(batch),
+                len(unwritten),
+                len(batch),
             )
         return unwritten
 
@@ -570,54 +639,79 @@ class AuditLogger:
     def _ensure_tab(self, sheets, tab):
         meta = sheets.spreadsheets().get(spreadsheetId=AUDIT_SHEET_ID).execute()
         if tab not in {s["properties"]["title"] for s in meta.get("sheets", [])}:
-            add_resp = sheets.spreadsheets().batchUpdate(
-                spreadsheetId=AUDIT_SHEET_ID,
-                body={"requests": [{"addSheet": {"properties": {"title": tab}}}]}).execute()
+            add_resp = (
+                sheets.spreadsheets()
+                .batchUpdate(
+                    spreadsheetId=AUDIT_SHEET_ID,
+                    body={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
+                )
+                .execute()
+            )
             sheets.spreadsheets().values().update(
                 spreadsheetId=AUDIT_SHEET_ID,
                 range=f"'{tab}'!{_SHEET_RANGE_HEADER_ROW}",
                 valueInputOption="RAW",
-                body={"values": [HEADERS]}).execute()
+                body={"values": [HEADERS]},
+            ).execute()
             try:
-                new_sheet_id = add_resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+                new_sheet_id = add_resp["replies"][0]["addSheet"]["properties"][
+                    "sheetId"
+                ]
                 self._apply_tab_formatting(sheets, new_sheet_id)
             except Exception as e:
-                log.warning("Audit tab '%s' created without conditional formatting: %s", tab, e)
+                log.warning(
+                    "Audit tab '%s' created without conditional formatting: %s", tab, e
+                )
 
     def _apply_tab_formatting(self, sheets, sheet_id):
         grid_range = {
             "sheetId": sheet_id,
-            "startRowIndex": 1, "endRowIndex": 1000,
-            "startColumnIndex": 0, "endColumnIndex": len(HEADERS),
+            "startRowIndex": 1,
+            "endRowIndex": 1000,
+            "startColumnIndex": 0,
+            "endColumnIndex": len(HEADERS),
         }
-        write_ops_re = ('=REGEXMATCH($D2,"^(create|modify|send|delete|update|share|'
-                       'set|add|remove|transfer|batch|draft|import|copy|format|'
-                       'insert|manage|reply|resolve)_")')
+        write_ops_re = (
+            '=REGEXMATCH($D2,"^(create|modify|send|delete|update|share|'
+            "set|add|remove|transfer|batch|draft|import|copy|format|"
+            'insert|manage|reply|resolve)_")'
+        )
         rules = [
-            ('=$G2="error"',
-             {"red": 0.988, "green": 0.894, "blue": 0.894},
-             {"red": 0.612, "green": 0.0, "blue": 0.024}),
-            (write_ops_re,
-             {"red": 1.0, "green": 0.949, "blue": 0.8},
-             {"red": 0.498, "green": 0.376, "blue": 0.0}),
+            (
+                '=$G2="error"',
+                {"red": 0.988, "green": 0.894, "blue": 0.894},
+                {"red": 0.612, "green": 0.0, "blue": 0.024},
+            ),
+            (
+                write_ops_re,
+                {"red": 1.0, "green": 0.949, "blue": 0.8},
+                {"red": 0.498, "green": 0.376, "blue": 0.0},
+            ),
         ]
-        requests = [{
-            "addConditionalFormatRule": {
-                "index": i,
-                "rule": {
-                    "ranges": [grid_range],
-                    "booleanRule": {
-                        "condition": {"type": "CUSTOM_FORMULA",
-                                      "values": [{"userEnteredValue": formula}]},
-                        "format": {"backgroundColor": bg,
-                                   "textFormat": {"foregroundColor": fg}},
+        requests = [
+            {
+                "addConditionalFormatRule": {
+                    "index": i,
+                    "rule": {
+                        "ranges": [grid_range],
+                        "booleanRule": {
+                            "condition": {
+                                "type": "CUSTOM_FORMULA",
+                                "values": [{"userEnteredValue": formula}],
+                            },
+                            "format": {
+                                "backgroundColor": bg,
+                                "textFormat": {"foregroundColor": fg},
+                            },
+                        },
                     },
                 },
-            },
-        } for i, (formula, bg, fg) in enumerate(rules)]
+            }
+            for i, (formula, bg, fg) in enumerate(rules)
+        ]
         sheets.spreadsheets().batchUpdate(
-            spreadsheetId=AUDIT_SHEET_ID,
-            body={"requests": requests}).execute()
+            spreadsheetId=AUDIT_SHEET_ID, body={"requests": requests}
+        ).execute()
 
 
 def _run_periodic_memory_sweeps() -> None:
@@ -633,6 +727,7 @@ def _run_periodic_memory_sweeps() -> None:
     """
     try:
         from core.attachment_storage import get_attachment_storage
+
         removed = get_attachment_storage().cleanup_expired()
         if removed:
             log.info("Attachment cleanup removed %d expired files", removed)
@@ -640,6 +735,7 @@ def _run_periodic_memory_sweeps() -> None:
         log.debug("Attachment cleanup sweep failed: %s", e)
     try:
         from auth.oauth21_session_store import get_oauth21_session_store
+
         store = get_oauth21_session_store()
         # Cleanup expired OAuth states via the store's public API (takes its
         # own lock internally — no private-member reach-through from here).
@@ -670,6 +766,7 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
     an additional fallback layer between the context lookup and DEFAULT_USER
     — useful for tests and any future tool that wants to override the
     attribution."""
+
     def deco(fn):
         @functools.wraps(fn)
         async def wrap(*args, **kwargs):
@@ -707,19 +804,27 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                         except Exception:
                             pass
                     client = _resolve_client()
-                    logger().submit({
-                        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                        "user": user,
-                        "service": _service(fn.__name__, getattr(fn, "__module__", "")),
-                        "tool": fn.__name__,
-                        "params_summary": _redact(kwargs),
-                        "resource_id": resource_id,
-                        "status": status,
-                        "error": err,
-                        "latency_ms": int((time.perf_counter() - t0) * 1000),
-                        "client": client,
-                    })
+                    logger().submit(
+                        {
+                            "timestamp_utc": datetime.now(timezone.utc).isoformat(
+                                timespec="seconds"
+                            ),
+                            "user": user,
+                            "service": _service(
+                                fn.__name__, getattr(fn, "__module__", "")
+                            ),
+                            "tool": fn.__name__,
+                            "params_summary": _redact(kwargs),
+                            "resource_id": resource_id,
+                            "status": status,
+                            "error": err,
+                            "latency_ms": int((time.perf_counter() - t0) * 1000),
+                            "client": client,
+                        }
+                    )
                 except Exception as ae:
                     log.error("Audit submit failed (non-fatal): %s", ae)
+
         return wrap
+
     return deco

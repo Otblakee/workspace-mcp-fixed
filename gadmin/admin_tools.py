@@ -34,7 +34,6 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from googleapiclient.errors import HttpError
 from mcp import Resource
 
 from auth.service_decorator import require_google_service
@@ -285,9 +284,7 @@ async def get_group(
         group_key: Group email or unique group ID.
     """
     logger.info(f"[get_group] group_key={group_key}")
-    group = await asyncio.to_thread(
-        service.groups().get(groupKey=group_key).execute
-    )
+    group = await asyncio.to_thread(service.groups().get(groupKey=group_key).execute)
     return _format_group(group)
 
 
@@ -390,9 +387,7 @@ async def list_orgunits(
     """
     logger.info(f"[list_orgunits] type={org_unit_type}")
     result = await asyncio.to_thread(
-        service.orgunits()
-        .list(customerId=_MY_CUSTOMER, type=org_unit_type)
-        .execute
+        service.orgunits().list(customerId=_MY_CUSTOMER, type=org_unit_type).execute
     )
     ous = result.get("organizationUnits") or []
     if not ous:
@@ -425,9 +420,7 @@ async def get_orgunit(
     normalized = orgunit_path.lstrip("/")
     logger.info(f"[get_orgunit] orgunit_path={orgunit_path}")
     ou = await asyncio.to_thread(
-        service.orgunits()
-        .get(customerId=_MY_CUSTOMER, orgUnitPath=normalized)
-        .execute
+        service.orgunits().get(customerId=_MY_CUSTOMER, orgUnitPath=normalized).execute
     )
     path = ou.get("orgUnitPath") or orgunit_path
     name = ou.get("name") or ""
@@ -449,9 +442,7 @@ async def get_orgunit(
 
 
 @server.tool()
-@require_google_service(
-    "admin_directory", "admin_directory_rolemanagement_read"
-)
+@require_google_service("admin_directory", "admin_directory_rolemanagement_read")
 @handle_http_errors(
     "list_admin_roles", is_read_only=True, service_type="admin_directory"
 )
@@ -488,9 +479,7 @@ async def list_admin_roles(
 
 
 @server.tool()
-@require_google_service(
-    "admin_directory", "admin_directory_rolemanagement_read"
-)
+@require_google_service("admin_directory", "admin_directory_rolemanagement_read")
 @handle_http_errors(
     "list_role_assignments", is_read_only=True, service_type="admin_directory"
 )
@@ -517,12 +506,8 @@ async def list_role_assignments(
         params["roleId"] = role_id
     if user_key:
         params["userKey"] = user_key
-    logger.info(
-        f"[list_role_assignments] role_id={role_id} user_key={user_key}"
-    )
-    result = await asyncio.to_thread(
-        service.roleAssignments().list(**params).execute
-    )
+    logger.info(f"[list_role_assignments] role_id={role_id} user_key={user_key}")
+    result = await asyncio.to_thread(service.roleAssignments().list(**params).execute)
     assignments = result.get("items") or []
     next_page = result.get("nextPageToken")
     if not assignments:
@@ -587,9 +572,7 @@ async def list_oauth_tokens_for_user(
     ``gadmin/admin_tools.py`` for the rationale.
     """
     logger.info(f"[list_oauth_tokens_for_user] user_key={user_key}")
-    result = await asyncio.to_thread(
-        service.tokens().list(userKey=user_key).execute
-    )
+    result = await asyncio.to_thread(service.tokens().list(userKey=user_key).execute)
     tokens = result.get("items") or []
     if not tokens:
         return f"User {user_key} has no third-party OAuth tokens."
@@ -600,17 +583,14 @@ async def list_oauth_tokens_for_user(
         native = "native" if t.get("nativeApp") else "web"
         anonymous = " anonymous=true" if t.get("anonymous") else ""
         scopes = t.get("scopes") or []
-        scope_summary = (
-            ", ".join(scopes[:6])
-            + (f", …(+{len(scopes) - 6} more)" if len(scopes) > 6 else "")
+        scope_summary = ", ".join(scopes[:6]) + (
+            f", …(+{len(scopes) - 6} more)" if len(scopes) > 6 else ""
         )
         lines.append(
             f"- client_id={client_id} display={display!r} kind={native}"
             f"{anonymous}\n    scopes: {scope_summary}"
         )
-    return (
-        f"{len(tokens)} OAuth token(s) for {user_key}:\n" + "\n".join(lines)
-    )
+    return f"{len(tokens)} OAuth token(s) for {user_key}:\n" + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -651,15 +631,11 @@ async def _query_activities(
     if end_time:
         params["endTime"] = end_time
 
-    result = await asyncio.to_thread(
-        service.activities().list(**params).execute
-    )
+    result = await asyncio.to_thread(service.activities().list(**params).execute)
     activities = result.get("items") or []
     next_page = result.get("nextPageToken")
     if not activities:
-        return (
-            f"No {application_name} audit events matched the supplied filters."
-        )
+        return f"No {application_name} audit events matched the supplied filters."
     body = "\n".join(_format_activity(a) for a in activities)
     suffix = f"\n\nnext_page_token: {next_page}" if next_page else ""
     return f"{len(activities)} {application_name} event(s):\n{body}{suffix}"
@@ -690,9 +666,7 @@ async def query_admin_audit_log(
         end_time: RFC3339 timestamp upper bound.
         max_results: Page size cap, max 1000 per Reports API.
     """
-    logger.info(
-        f"[query_admin_audit_log] actor={actor_email} event={event_name}"
-    )
+    logger.info(f"[query_admin_audit_log] actor={actor_email} event={event_name}")
     return await _query_activities(
         service,
         application_name="admin",
@@ -729,9 +703,7 @@ async def query_login_audit_log(
         end_time: RFC3339 timestamp upper bound.
         max_results: Page size cap, max 1000 per Reports API.
     """
-    logger.info(
-        f"[query_login_audit_log] actor={actor_email} event={event_name}"
-    )
+    logger.info(f"[query_login_audit_log] actor={actor_email} event={event_name}")
     return await _query_activities(
         service,
         application_name="login",
@@ -769,9 +741,7 @@ async def query_token_audit_log(
         end_time: RFC3339 timestamp upper bound.
         max_results: Page size cap, max 1000 per Reports API.
     """
-    logger.info(
-        f"[query_token_audit_log] actor={actor_email} event={event_name}"
-    )
+    logger.info(f"[query_token_audit_log] actor={actor_email} event={event_name}")
     return await _query_activities(
         service,
         application_name="token",
@@ -810,9 +780,7 @@ async def query_drive_audit_log(
         end_time: RFC3339 timestamp upper bound.
         max_results: Page size cap, max 1000 per Reports API.
     """
-    logger.info(
-        f"[query_drive_audit_log] actor={actor_email} event={event_name}"
-    )
+    logger.info(f"[query_drive_audit_log] actor={actor_email} event={event_name}")
     return await _query_activities(
         service,
         application_name="drive",
@@ -861,12 +829,8 @@ async def query_usage_report(
     if parameters:
         params["parameters"] = ",".join(parameters)
 
-    logger.info(
-        f"[query_usage_report] user_key={user_key} date={target_date}"
-    )
-    result = await asyncio.to_thread(
-        service.userUsageReport().get(**params).execute
-    )
+    logger.info(f"[query_usage_report] user_key={user_key} date={target_date}")
+    result = await asyncio.to_thread(service.userUsageReport().get(**params).execute)
     usage_reports = result.get("usageReports") or []
     next_page = result.get("nextPageToken")
     if not usage_reports:
@@ -885,7 +849,8 @@ async def query_usage_report(
                     rendered.append(f"{name}={p[v_key]}")
                     break
         lines.append(
-            f"- {entity_email}\n    " + "\n    ".join(rendered) if rendered
+            f"- {entity_email}\n    " + "\n    ".join(rendered)
+            if rendered
             else f"- {entity_email} (no parameter values)"
         )
     suffix = f"\n\nnext_page_token: {next_page}" if next_page else ""

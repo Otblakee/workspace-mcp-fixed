@@ -259,7 +259,9 @@ class TestHeaderFooterSegmentId:
         ]
         for request in requests:
             if "deleteContentRange" in request:
-                assert request["deleteContentRange"]["range"]["segmentId"] == "ftr.xyz789"
+                assert (
+                    request["deleteContentRange"]["range"]["segmentId"] == "ftr.xyz789"
+                )
             else:
                 assert request["insertText"]["location"]["segmentId"] == "ftr.xyz789"
 
@@ -353,7 +355,9 @@ class TestChatSearchMessages:
         assert "Found 2 messages" in result
 
         # No server-side filter on any messages.list call.
-        list_calls = chat_service.spaces.return_value.messages.return_value.list.call_args_list
+        list_calls = (
+            chat_service.spaces.return_value.messages.return_value.list.call_args_list
+        )
         assert len(list_calls) == 2
         for call in list_calls:
             assert "filter" not in call.kwargs
@@ -629,11 +633,7 @@ class TestSharedDrivePermissionsFallback:
                 ],
                 "nextPageToken": "page-2",
             },
-            {
-                "permissions": [
-                    {"id": "perm-2", "type": "anyone", "role": "reader"}
-                ]
-            },
+            {"permissions": [{"id": "perm-2", "type": "anyone", "role": "reader"}]},
         ]
 
         result = await impl(

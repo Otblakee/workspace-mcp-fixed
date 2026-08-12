@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -41,7 +41,9 @@ def _make_service_with_token(token: str = "ya29.fake-token") -> MagicMock:
     return service
 
 
-def _httpx_response(status_code: int, headers: dict | None = None, text: str = "") -> httpx.Response:
+def _httpx_response(
+    status_code: int, headers: dict | None = None, text: str = ""
+) -> httpx.Response:
     return httpx.Response(
         status_code=status_code,
         headers=headers or {},
@@ -60,7 +62,6 @@ class TestCreateDriveUploadSession:
         from gdrive.drive_tools import create_drive_upload_session
 
         impl = _unwrap(create_drive_upload_session)
-        params = list(impl.__wrapped__.__code__.co_varnames[: impl.__wrapped__.__code__.co_argcount]) if False else None
         # Just look at the unwrapped signature
         import inspect
 
@@ -80,7 +81,11 @@ class TestCreateDriveUploadSession:
 
         service = _make_service_with_token()
         service.files.return_value.create.return_value.execute = MagicMock(
-            return_value={"id": "drive-file-abc", "name": "big.bin", "parents": ["folder-1"]}
+            return_value={
+                "id": "drive-file-abc",
+                "name": "big.bin",
+                "parents": ["folder-1"],
+            }
         )
 
         async def fake_resolve(svc, fid):
@@ -90,7 +95,9 @@ class TestCreateDriveUploadSession:
 
         ok_response = _httpx_response(
             200,
-            headers={"Location": "https://www.googleapis.com/upload/drive/v3/files?upload_id=ABC"},
+            headers={
+                "Location": "https://www.googleapis.com/upload/drive/v3/files?upload_id=ABC"
+            },
         )
 
         async def fake_patch(self, url, headers=None, content=None):
@@ -112,7 +119,10 @@ class TestCreateDriveUploadSession:
         )
 
         assert "file_id: drive-file-abc" in result
-        assert "upload_uri: https://www.googleapis.com/upload/drive/v3/files?upload_id=ABC" in result
+        assert (
+            "upload_uri: https://www.googleapis.com/upload/drive/v3/files?upload_id=ABC"
+            in result
+        )
         assert "expires_at:" in result
         # Caller-facing instructions reach for confirm_drive_upload, not raw bytes here.
         assert "confirm_drive_upload" in result
@@ -184,7 +194,9 @@ class TestCreateDriveUploadSession:
         service.files.return_value.create.return_value.execute = MagicMock(
             return_value={"id": "drive-file-xyz"}
         )
-        service.files.return_value.delete.return_value.execute = MagicMock(return_value={})
+        service.files.return_value.delete.return_value.execute = MagicMock(
+            return_value={}
+        )
 
         async def fake_resolve(svc, fid):
             return "folder-1"
@@ -261,7 +273,9 @@ class TestConfirmDriveUpload:
         assert "Upload status: complete" in result
         assert "file_id: drive-file-abc" in result
         assert "size: 10485760 bytes" in result
-        assert "webViewLink: https://drive.google.com/file/d/drive-file-abc/view" in result
+        assert (
+            "webViewLink: https://drive.google.com/file/d/drive-file-abc/view" in result
+        )
 
     @pytest.mark.asyncio
     async def test_incomplete_parses_range_header(self, monkeypatch):
@@ -429,8 +443,10 @@ class TestDownloadDriveFile:
         assert "path: " in result
 
         # Verify the file actually landed on disk and contains the expected bytes.
-        path_line = next(line for line in result.splitlines() if line.startswith("path: "))
-        path = Path(path_line[len("path: "):])
+        path_line = next(
+            line for line in result.splitlines() if line.startswith("path: ")
+        )
+        path = Path(path_line[len("path: ") :])
         assert path.exists()
         assert path.read_bytes() == b"A" * 5000
 
@@ -516,7 +532,9 @@ class TestDownloadDriveFile:
             file_id="huge",
         )
 
-        assert chunk_calls["n"] == 9, f"expected 9 chunked reads, got {chunk_calls['n']}"
+        assert chunk_calls["n"] == 9, (
+            f"expected 9 chunked reads, got {chunk_calls['n']}"
+        )
 
     @pytest.mark.asyncio
     async def test_requests_name_field_and_surfaces_actual_filename(
@@ -589,10 +607,12 @@ class TestAuditFixes:
     def test_redact_hides_upload_uri(self):
         from core.audit import _redact
 
-        out = _redact({
-            "file_id": "drive-file-abc",
-            "upload_uri": "https://www.googleapis.com/upload/drive/v3/files?upload_id=SECRET",
-        })
+        out = _redact(
+            {
+                "file_id": "drive-file-abc",
+                "upload_uri": "https://www.googleapis.com/upload/drive/v3/files?upload_id=SECRET",
+            }
+        )
         assert "drive-file-abc" in out
         assert "SECRET" not in out
         assert "<redacted:" in out
@@ -653,7 +673,9 @@ class TestAuditFixes:
 
 
 class TestAttachmentStorageExtension:
-    def test_reserve_path_returns_absolute_path_inside_storage_dir(self, tmp_path, monkeypatch):
+    def test_reserve_path_returns_absolute_path_inside_storage_dir(
+        self, tmp_path, monkeypatch
+    ):
         from core import attachment_storage as st
 
         monkeypatch.setattr(st, "STORAGE_DIR", tmp_path)
@@ -663,7 +685,9 @@ class TestAttachmentStorageExtension:
         assert str(tmp_path) in path
         assert file_id  # non-empty UUID
 
-    def test_register_existing_file_makes_metadata_lookup_work(self, tmp_path, monkeypatch):
+    def test_register_existing_file_makes_metadata_lookup_work(
+        self, tmp_path, monkeypatch
+    ):
         from core import attachment_storage as st
 
         monkeypatch.setattr(st, "STORAGE_DIR", tmp_path)

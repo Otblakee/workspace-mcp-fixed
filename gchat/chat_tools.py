@@ -40,6 +40,7 @@ async def _ensure_fresh_chat_token(service) -> str:
         await asyncio.to_thread(creds.refresh, _GoogleAuthRequest())
     return creds.token
 
+
 # In-memory cache for user ID → display name (bounded to avoid unbounded growth)
 _SENDER_CACHE_MAX_SIZE = 256
 _sender_name_cache: Dict[str, str] = {}
@@ -567,9 +568,7 @@ async def download_chat_attachment(
                         raise Exception(
                             f"HTTP {resp.status_code} from {download_url}\n{body}"
                         )
-                    async for chunk in resp.aiter_bytes(
-                        chunk_size=_CHAT_STREAM_CHUNK
-                    ):
+                    async for chunk in resp.aiter_bytes(chunk_size=_CHAT_STREAM_CHUNK):
                         if len(head) < 75:
                             head += chunk[: 75 - len(head)]
                         size_bytes += len(chunk)
@@ -614,9 +613,9 @@ async def download_chat_attachment(
                         headers={"Authorization": f"Bearer {access_token}"},
                     ) as resp:
                         if resp.status_code != 200:
-                            body = (
-                                await resp.aread()
-                            ).decode("utf-8", errors="replace")[:500]
+                            body = (await resp.aread()).decode(
+                                "utf-8", errors="replace"
+                            )[:500]
                             raise Exception(
                                 f"HTTP {resp.status_code} from {download_url}\n{body}"
                             )

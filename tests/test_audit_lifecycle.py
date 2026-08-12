@@ -91,7 +91,9 @@ def audit_logger_factory(monkeypatch):
 
 
 def _fallback_dumps(caplog) -> list[str]:
-    return [r.getMessage() for r in caplog.records if "AUDIT_FALLBACK" in r.getMessage()]
+    return [
+        r.getMessage() for r in caplog.records if "AUDIT_FALLBACK" in r.getMessage()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +320,11 @@ class TestMultiBatchDrain:
 
         assert [len(b) for b in flushed_batches] == [2, 2, 1]
         assert [e["tool"] for b in flushed_batches for e in b] == [
-            "t0", "t1", "t2", "t3", "t4",
+            "t0",
+            "t1",
+            "t2",
+            "t3",
+            "t4",
         ]
         assert logger.q.empty()
 

@@ -18,7 +18,6 @@ from auth.oauth21_session_store import (
 )
 from auth.oauth_config import (
     is_oauth21_enabled,
-    get_oauth_config,
     is_external_oauth21_provider,
 )
 from core.context import set_fastmcp_session_id

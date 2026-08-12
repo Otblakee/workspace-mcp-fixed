@@ -16,7 +16,6 @@ the same class of cross-user leak:
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -49,10 +48,11 @@ class TestDetectOAuthVersionFailClosed:
     def test_returns_true_when_validated_access_token_present(self):
         from auth import service_decorator
 
-        with patch.object(
-            service_decorator, "is_oauth21_enabled", return_value=True
-        ), patch.object(
-            service_decorator, "get_access_token", return_value=MagicMock()
+        with (
+            patch.object(service_decorator, "is_oauth21_enabled", return_value=True),
+            patch.object(
+                service_decorator, "get_access_token", return_value=MagicMock()
+            ),
         ):
             assert service_decorator._detect_oauth_version(None, None, "tool") is True
 
@@ -63,9 +63,10 @@ class TestDetectOAuthVersionFailClosed:
         from auth import service_decorator
         from auth.google_auth import GoogleAuthenticationError
 
-        with patch.object(
-            service_decorator, "is_oauth21_enabled", return_value=True
-        ), patch.object(service_decorator, "get_access_token", return_value=None):
+        with (
+            patch.object(service_decorator, "is_oauth21_enabled", return_value=True),
+            patch.object(service_decorator, "get_access_token", return_value=None),
+        ):
             with pytest.raises(GoogleAuthenticationError, match="OAuth 2.1"):
                 service_decorator._detect_oauth_version(None, "session-x", "tool")
 
@@ -74,12 +75,13 @@ class TestDetectOAuthVersionFailClosed:
         from auth import service_decorator
         from auth.google_auth import GoogleAuthenticationError
 
-        with patch.object(
-            service_decorator, "is_oauth21_enabled", return_value=True
-        ), patch.object(
-            service_decorator,
-            "get_access_token",
-            side_effect=RuntimeError("token plumbing exploded"),
+        with (
+            patch.object(service_decorator, "is_oauth21_enabled", return_value=True),
+            patch.object(
+                service_decorator,
+                "get_access_token",
+                side_effect=RuntimeError("token plumbing exploded"),
+            ),
         ):
             with pytest.raises(GoogleAuthenticationError):
                 service_decorator._detect_oauth_version(None, None, "tool")
@@ -152,9 +154,7 @@ class TestRedactDeep:
         """``parts`` isn't sensitive, but each part has a sensitive ``content``."""
         from core.audit import _redact
 
-        out = _redact(
-            {"parts": [{"name": "a.txt", "content": "x"}, {"content": "y"}]}
-        )
+        out = _redact({"parts": [{"name": "a.txt", "content": "x"}, {"content": "y"}]})
         assert '"name": "a.txt"' in out
         assert '"content": "x"' not in out
         assert '"content": "y"' not in out
@@ -201,9 +201,10 @@ class TestResolveUserEmailLogging:
         ctx = MagicMock()
         ctx.get_state = AsyncMock(return_value=None)
 
-        with patch(
-            "fastmcp.server.dependencies.get_context", return_value=ctx
-        ), caplog.at_level("WARNING", logger="core.audit"):
+        with (
+            patch("fastmcp.server.dependencies.get_context", return_value=ctx),
+            caplog.at_level("WARNING", logger="core.audit"),
+        ):
             email = await audit._resolve_user_email()
 
         assert email == audit.DEFAULT_USER
@@ -218,9 +219,10 @@ class TestResolveUserEmailLogging:
         ctx = MagicMock()
         ctx.get_state = AsyncMock(side_effect=RuntimeError("boom"))
 
-        with patch(
-            "fastmcp.server.dependencies.get_context", return_value=ctx
-        ), caplog.at_level("WARNING", logger="core.audit"):
+        with (
+            patch("fastmcp.server.dependencies.get_context", return_value=ctx),
+            caplog.at_level("WARNING", logger="core.audit"),
+        ):
             email = await audit._resolve_user_email()
 
         assert email == audit.DEFAULT_USER
@@ -233,9 +235,10 @@ class TestResolveUserEmailLogging:
         """Stdio dev / background tasks legitimately have no context — quiet."""
         from core import audit
 
-        with patch(
-            "fastmcp.server.dependencies.get_context", return_value=None
-        ), caplog.at_level("WARNING", logger="core.audit"):
+        with (
+            patch("fastmcp.server.dependencies.get_context", return_value=None),
+            caplog.at_level("WARNING", logger="core.audit"),
+        ):
             email = await audit._resolve_user_email()
 
         assert email == audit.DEFAULT_USER
@@ -269,9 +272,7 @@ class TestDomainPolicy:
         from auth.auth_info_middleware import _claims_pass_domain_policy
 
         monkeypatch.setenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "otbgroup.co.uk")
-        ok, _ = _claims_pass_domain_policy(
-            {"hd": "otbgroup.co.uk"}, "u@otbgroup.co.uk"
-        )
+        ok, _ = _claims_pass_domain_policy({"hd": "otbgroup.co.uk"}, "u@otbgroup.co.uk")
         assert ok is True
 
     def test_hd_claim_mismatch_rejected_even_if_email_matches(self, monkeypatch):
@@ -300,9 +301,7 @@ class TestDomainPolicy:
     def test_multiple_domains_allowed(self, monkeypatch):
         from auth.auth_info_middleware import _claims_pass_domain_policy
 
-        monkeypatch.setenv(
-            "OAUTH_ALLOWED_EMAIL_DOMAINS", "otbgroup.co.uk, partner.com"
-        )
+        monkeypatch.setenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "otbgroup.co.uk, partner.com")
         for email in ["a@otbgroup.co.uk", "b@partner.com"]:
             ok, _ = _claims_pass_domain_policy({}, email)
             assert ok is True, email
@@ -318,9 +317,7 @@ class TestDomainPolicy:
         from auth.auth_info_middleware import _claims_pass_domain_policy
 
         monkeypatch.setenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "OTBgroup.CO.uk")
-        ok, _ = _claims_pass_domain_policy(
-            {"hd": "otbgroup.co.uk"}, "U@OTBGROUP.CO.UK"
-        )
+        ok, _ = _claims_pass_domain_policy({"hd": "otbgroup.co.uk"}, "U@OTBGROUP.CO.UK")
         assert ok is True
 
 

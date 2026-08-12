@@ -734,10 +734,7 @@ def ensure_session_from_access_token(
             if (
                 existing is None
                 or existing.get("access_token") != credentials.token
-                or (
-                    mcp_session_id
-                    and existing.get("mcp_session_id") != mcp_session_id
-                )
+                or (mcp_session_id and existing.get("mcp_session_id") != mcp_session_id)
             ):
                 store.store_session(
                     user_email=email,
