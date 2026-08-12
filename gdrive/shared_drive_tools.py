@@ -139,6 +139,29 @@ async def _describe_target(service, target_id: str) -> Dict[str, Any]:
     }
 
 
+async def _principal_is_a_user(directory, principal: str) -> bool:
+    """True when the Directory positively resolves ``principal`` as a user.
+
+    Used only to disambiguate an ambiguous ``groups.get`` failure. A False
+    here means "could not establish that it is a user" — never "it is a
+    group" — so callers must keep failing closed on it.
+    """
+    try:
+        await execute_with_backoff(
+            lambda: directory.users().get(userKey=principal, fields="id, primaryEmail"),
+            label="directory.users.get(disambiguate)",
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 - inconclusive, not a failure
+        logger.info(
+            "[set_drive_permission] could not resolve '%s' as a user either "
+            "(%s); treating the group check as unresolved",
+            principal,
+            type(exc).__name__,
+        )
+        return False
+
+
 async def assert_principal_is_group(
     principal: str, *, user_google_email: str, allow_unverified_group: bool
 ) -> str:
@@ -208,11 +231,32 @@ async def assert_principal_is_group(
                 "visible in the audit log."
             ) from error
 
-        # Any other status (403 for a non-admin caller, a persistent 5xx) means
-        # the question went unanswered, not that the answer was "no". That is
-        # the same situation as the service being unavailable, so it honours
-        # the same override — otherwise the escape hatch cannot unblock the
-        # deployments it exists for.
+        # A 403 here is ambiguous, and dangerously so. Live testing on
+        # 2026-08-12 showed the Directory answers `groups.get` with 403 — not
+        # 404 — when the key belongs to a *person*, using the same credentials
+        # that resolve a real group successfully. Reporting that as "the lookup
+        # failed, check your admin privileges, or retry with
+        # allow_unverified_group=True" pointed the operator straight at the
+        # override, in the one case where the override creates exactly the
+        # individual grant this guardrail exists to prevent.
+        #
+        # So disambiguate: ask whether the address is a user. A definite yes is
+        # a definite "not a group", and is refused outright with no override.
+        if status == 403 and await _principal_is_a_user(directory, principal):
+            raise UserInputError(
+                f"'{principal}' is a user account, not a Google Group, so it "
+                "cannot be granted group access. Drive would silently create "
+                "an INDIVIDUAL permission for this address rather than "
+                "refusing. If an individual grant is genuinely intended, pass "
+                "allow_individual=True — that choice should be explicit and "
+                "visible in the audit log."
+            ) from error
+
+        # Anything still unresolved (a genuine authorisation failure, a
+        # persistent 5xx) means the question went unanswered, not that the
+        # answer was "no". That is the same situation as the service being
+        # unavailable, so it honours the same override — otherwise the escape
+        # hatch cannot unblock the deployments it exists for.
         if allow_unverified_group:
             logger.warning(
                 "[set_drive_permission] granting to '%s' as a group WITHOUT "
@@ -245,7 +289,12 @@ async def assert_principal_is_group(
 # lookup in revoke_drive_permission, which reads members.
 @require_google_service(
     "admin_directory",
-    ["admin_directory_group_read", "admin_directory_group_member_read"],
+    [
+        "admin_directory_group_read",
+        "admin_directory_group_member_read",
+        # users.get, used only to disambiguate an ambiguous groups.get failure.
+        "admin_directory_user_read",
+    ],
 )
 async def _directory_service(service, user_google_email: str):
     """Lazily acquire an Admin Directory service for the membership check.
