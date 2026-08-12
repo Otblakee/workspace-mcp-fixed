@@ -188,3 +188,74 @@ The same caveat applies to the pre-existing concurrent `asyncio.gather` calls in
 `gchat/chat_tools.py` and `gappsscript/apps_script_tools.py`. Those fan out over
 two or a handful of requests rather than thousands of rows, so the exposure is
 much smaller, but the hazard is identical and they were not touched here.
+
+## Live scratch-drive findings, 2026-08-12
+
+First live run against a real scratch shared drive (`OTB-SCRATCH-mcp-test`,
+`0APbe2x9PvdJhUk9PVA`), executed after PR #27 merged and deployed.
+
+### 1. The groups-only guardrail did not work (fixed on the follow-up branch)
+
+**The finding.** `set_drive_permission` was called with a personal address
+(`katie.newton@otbgroup.co.uk`), role `reader`, and `allow_individual=False`.
+It **succeeded**, creating a `type=user` permission. Confirmed via
+`get_drive_file_permissions`.
+
+**Why the original design failed.** It declared `type=group` on the permission
+body and relied on Drive to reject an address that is not a group. Drive does
+not reject it — it coerces the type and creates an individual grant. The
+declared type is a hint, not a constraint. Every unit test passed because the
+mocks were written to the same false assumption.
+
+This is the single most important reason the live checklist exists. No amount
+of mocked testing could have found it.
+
+**The fix.** `assert_principal_is_group` resolves the address against the Admin
+Directory API *before* any grant is created. Not a group → refused. Directory
+unreachable → refused, unless `allow_unverified_group=True` is passed
+explicitly, which reports loudly. `allow_individual=True` skips the check as
+the documented, audited escape hatch.
+
+**Operational consequence.** `set_drive_permission` now requires a reachable
+Admin Directory service for group grants. The OTB deployment already has the
+`gadmin` read tools enabled, so this works today. A drive-only deployment must
+either enable `gadmin` or pass `allow_unverified_group=True`.
+
+### 2. Restriction changes need domain-admin privilege
+
+`update_shared_drive` renaming worked normally, but setting
+`copy_requires_writer_permission` returned 403
+`noManageTeamDriveAdministratorPrivilege`. New shared drives in this Workspace
+are created with `adminManagedRestrictions` already on (an org-level default),
+which reserves restriction changes to domain administrators. Passing
+`use_domain_admin_access=true` succeeded.
+
+Runbook note: any restriction flag set during the architecture build needs
+`use_domain_admin_access=true`. Renames do not.
+
+Secondary observation: the 403 surfaced with the generic
+`handle_http_errors` hint "You might need to re-authenticate for user 'N/A'".
+That is misleading — it is a privilege problem, not an auth problem — and the
+user email renders as `N/A` under OAuth 2.1 because it is not in kwargs. Both
+are pre-existing upstream behaviours, not introduced here. Worth tightening
+separately.
+
+### 3. Confirmed working live
+
+- `create_shared_drive` (dry run and real), OAuth identity resolved correctly.
+- `list_shared_drives` with a `name contains` query.
+- `update_shared_drive` rename, verified by the `drives.get` round-trip.
+- `set_drive_permission` group grant; repeat call reported "No change";
+  role change updated the same permission ID rather than duplicating.
+- The conflicting-principal-type refusal (added in review round three) fired
+  correctly on a real drive: attempting a group grant for the caller's address,
+  which already held a `type=user` organizer permission, was refused. Without
+  that fix the call would have **demoted the drive's only organizer to writer**
+  while reporting it as a group grant.
+- `revoke_drive_permission` removed the accidental individual grant cleanly.
+
+### Still to run
+
+Steps 5 to 10 of the checklist above (shortcut idempotency, folder tree, walk,
+copy, reconcile, hub rebuild) were not reached before the permission finding
+stopped the run. Re-run the whole checklist once the guardrail fix is deployed.

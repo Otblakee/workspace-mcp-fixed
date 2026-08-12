@@ -17,6 +17,14 @@ guarded replacements:
   requires ``allow_individual=True`` passed explicitly. ``anyone`` and
   ``domain`` principals are refused outright, so no tool on this server can
   create a public link.
+
+  The group requirement is enforced by resolving the address against the Admin
+  Directory API before granting, NOT by the permission's declared type. Live
+  testing on 2026-08-12 showed Drive accepts a ``type=group`` permission for a
+  personal address and silently creates a ``type=user`` one instead, so the
+  original "Drive will reject it" assumption was false and the guardrail did
+  nothing. Grants are refused when the address is not a group, and refused when
+  the Directory cannot be reached to check.
 * ``revoke_drive_permission`` refuses to revoke the caller's own access —
   whether held directly or via the group being revoked — and refuses to remove
   the last organizer of a shared drive, so it cannot orphan a drive or lock the
@@ -129,6 +137,77 @@ async def _describe_target(service, target_id: str) -> Dict[str, Any]:
         "name": meta.get("name", target_id),
         "mimeType": meta.get("mimeType"),
     }
+
+
+async def assert_principal_is_group(
+    principal: str, *, user_google_email: str, allow_unverified_group: bool
+) -> str:
+    """Verify that ``principal`` really is a Google Group before granting to it.
+
+    This is the groups-only guardrail's actual enforcement point.
+
+    It exists because the original design was wrong in a way only live testing
+    exposed. That design declared ``type=group`` on the permission and relied on
+    Drive to reject a personal address. On 2026-08-12, against a real shared
+    drive, Drive did not reject it: ``set_drive_permission`` called with a
+    personal address and ``allow_individual=False`` returned success and created
+    a ``type=user`` permission. Google treats the declared type as a hint and
+    coerces it, so the guardrail was inoperative for exactly the mistake it was
+    written to prevent.
+
+    Returns a short note describing how the principal was verified, for the
+    tool's output. Raises ``UserInputError`` when the address is not a group, or
+    when membership of the group directory cannot be established at all —
+    failing closed, because an unverifiable grant is precisely the case that
+    used to slip through.
+    """
+    try:
+        directory = await _directory_service(user_google_email=user_google_email)
+    except Exception as exc:  # noqa: BLE001 - service unavailable, not a failure
+        if allow_unverified_group:
+            logger.warning(
+                "[set_drive_permission] granting to '%s' as a group WITHOUT "
+                "verification (%s: %s)",
+                principal,
+                type(exc).__name__,
+                exc,
+            )
+            return (
+                "\n   ⚠️ Could not verify that this address is a group (the Admin "
+                "Directory service is not available to this server) and "
+                "allow_unverified_group=True was passed. Google silently "
+                "converts a group grant on a personal address into an "
+                "individual one, so confirm the resulting permission type."
+            )
+        raise UserInputError(
+            f"Cannot verify that '{principal}' is a Google Group: the Admin "
+            "Directory service is not available to this server "
+            f"({type(exc).__name__}). Refusing the grant — Drive does NOT "
+            "reject a group grant aimed at a personal address, it silently "
+            "creates an individual one, so an unverified grant cannot be "
+            "allowed. Enable the 'gadmin' service, or pass "
+            "allow_individual=True for a deliberate individual grant, or "
+            "allow_unverified_group=True to accept the risk explicitly."
+        ) from exc
+
+    try:
+        await execute_with_backoff(
+            lambda: directory.groups().get(groupKey=principal, fields="id, email"),
+            label="directory.groups.get(verify)",
+        )
+    except HttpError as error:
+        status = getattr(getattr(error, "resp", None), "status", None)
+        if status in (404, 400):
+            raise UserInputError(
+                f"'{principal}' is not a Google Group in this domain, so it "
+                "cannot be granted group access. Drive would silently create "
+                "an INDIVIDUAL permission for this address rather than "
+                "refusing. If an individual grant is genuinely intended, pass "
+                "allow_individual=True — that choice should be explicit and "
+                "visible in the audit log."
+            ) from error
+        raise
+    return ""
 
 
 @require_google_service("admin_directory", "admin_directory_group_member_read")
@@ -498,6 +577,7 @@ async def set_drive_permission(
     principal: str,
     role: str,
     allow_individual: bool = False,
+    allow_unverified_group: bool = False,
     expiration_time: Optional[str] = None,
     send_notification_email: bool = False,
     dry_run: bool = False,
@@ -509,6 +589,13 @@ async def set_drive_permission(
     to an individual, so access follows group membership and survives
     offboarding (Build Sheet decision 2026-01-21). Pass
     ``allow_individual=True`` to grant to a person explicitly.
+
+    The group requirement is enforced by resolving the address against the
+    Admin Directory API before granting. That check is the guardrail: Drive
+    itself does NOT refuse a group grant aimed at a personal address — it
+    silently creates an individual permission instead (confirmed against a live
+    drive on 2026-08-12). If the Directory cannot be reached, the grant is
+    refused rather than attempted.
 
     Public (``anyone``) and domain-wide sharing are refused outright — no tool
     on this server can create a public link.
@@ -525,6 +612,10 @@ async def set_drive_permission(
         role (str): One of organizer, fileOrganizer, writer, commenter, reader.
         allow_individual (bool): Explicit opt-in to grant an individual rather
             than a group. Defaults to False.
+        allow_unverified_group (bool): Proceed with a group grant when the
+            Admin Directory service is unavailable to verify it. Defaults to
+            False (refuse). Only relevant on deployments without an admin
+            service enabled.
         expiration_time (Optional[str]): RFC 3339 expiry. Google only accepts
             expiries on reader/commenter/writer file permissions — shared drive
             memberships cannot expire.
@@ -541,6 +632,16 @@ async def set_drive_permission(
     principal_type, email = resolve_principal(
         principal, allow_individual=allow_individual
     )
+    # Enforce the groups-only rule here, before anything is created. Declaring
+    # type=group is not enough: Drive coerces it to an individual permission
+    # when the address belongs to a person.
+    verification_note = ""
+    if principal_type == "group":
+        verification_note = await assert_principal_is_group(
+            email,
+            user_google_email=user_google_email,
+            allow_unverified_group=allow_unverified_group,
+        )
     if expiration_time:
         validate_expiration_time(expiration_time)
 
@@ -645,6 +746,7 @@ async def set_drive_permission(
         f"✅ {verb} access on {target['kind']} '{target['name']}' "
         f"({file_or_drive_id})\n"
         f"   {format_permission_info(permission)}"
+        f"{verification_note}"
     )
 
 

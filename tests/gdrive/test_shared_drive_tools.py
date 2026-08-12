@@ -347,6 +347,21 @@ class TestListSharedDrives:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _group_verification_passes(request):
+    """Most set_drive_permission tests assume the principal is a real group.
+    Tests that exercise the verification itself opt out."""
+    if "uses_directory" in request.keywords:
+        yield
+        return
+    with patch.object(
+        shared_drive_tools,
+        "assert_principal_is_group",
+        new=AsyncMock(return_value=""),
+    ):
+        yield
+
+
 class TestSetDrivePermission:
     @pytest.mark.asyncio
     async def test_grants_group_access_to_a_shared_drive(self):
@@ -1061,6 +1076,178 @@ NEW_DRIVE_TOOLS = {
     "reconcile_folders",
     "rebuild_hub",
 }
+
+
+class TestGroupsOnlyGuardrailIsEnforced:
+    """Regression for the live failure found on 2026-08-12.
+
+    The original guardrail declared type=group and trusted Drive to reject a
+    personal address. Against a real shared drive Drive did not reject it — it
+    returned success and created a type=user permission. Enforcement therefore
+    has to happen before the grant, by resolving the address in the Directory.
+    """
+
+    def _service(self):
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_create_result = {"id": "p1", "type": "group"}
+        return service
+
+    @pytest.mark.uses_directory
+    @pytest.mark.asyncio
+    async def test_personal_address_is_refused_before_any_grant(self):
+        service = self._service()
+
+        async def not_a_group(principal, **kwargs):
+            raise UserInputError(f"'{principal}' is not a Google Group in this domain")
+
+        with patch.object(
+            shared_drive_tools, "assert_principal_is_group", side_effect=not_a_group
+        ):
+            with pytest.raises(UserInputError, match="not a Google Group"):
+                await set_drive_permission(
+                    service, USER, "d1", principal="katie@otbgroup.co.uk", role="reader"
+                )
+
+        # The crucial assertion: nothing was created. The old code reached
+        # permissions.create and Drive happily made an individual grant.
+        assert "permissions.create" not in service.call_names()
+
+    @pytest.mark.uses_directory
+    @pytest.mark.asyncio
+    async def test_verification_is_skipped_for_explicit_individual_grants(self):
+        """allow_individual=True is the documented, audited escape hatch, so it
+        must not be blocked by the group check."""
+        service = self._service()
+        service.permissions_create_result = {"id": "p1", "type": "user"}
+        checked = []
+
+        async def spy(principal, **kwargs):
+            checked.append(principal)
+            return ""
+
+        with patch.object(
+            shared_drive_tools, "assert_principal_is_group", side_effect=spy
+        ):
+            await set_drive_permission(
+                service,
+                USER,
+                "d1",
+                principal="katie@otbgroup.co.uk",
+                role="reader",
+                allow_individual=True,
+            )
+
+        assert checked == [], "individual grants must not be group-verified"
+        assert service.kwargs_for("permissions.create")[0]["body"]["type"] == "user"
+
+    @pytest.mark.uses_directory
+    @pytest.mark.asyncio
+    async def test_group_grant_is_verified_before_creation(self):
+        service = self._service()
+        order = []
+
+        async def spy(principal, **kwargs):
+            order.append("verified")
+            return ""
+
+        real_permissions = service.permissions
+
+        def tracking_permissions():
+            handle = real_permissions()
+            original = handle.create
+
+            def create(**kwargs):
+                order.append("created")
+                return original(**kwargs)
+
+            handle.create = create
+            return handle
+
+        service.permissions = tracking_permissions
+
+        with patch.object(
+            shared_drive_tools, "assert_principal_is_group", side_effect=spy
+        ):
+            await set_drive_permission(
+                service, USER, "d1", principal="bir-hs@otbgroup.co.uk", role="writer"
+            )
+
+        assert order == ["verified", "created"]
+
+
+@pytest.mark.uses_directory
+class TestAssertPrincipalIsGroup:
+    @pytest.mark.asyncio
+    async def test_unreachable_directory_fails_closed(self):
+        """An unverifiable grant is exactly the case that used to slip
+        through, so the default must be refusal, not optimism."""
+
+        async def unavailable(**kwargs):
+            raise RuntimeError("admin service not enabled")
+
+        with patch.object(
+            shared_drive_tools, "_directory_service", side_effect=unavailable
+        ):
+            with pytest.raises(UserInputError, match="Cannot verify"):
+                await shared_drive_tools.assert_principal_is_group(
+                    "team@otbgroup.co.uk",
+                    user_google_email=USER,
+                    allow_unverified_group=False,
+                )
+
+    @pytest.mark.asyncio
+    async def test_unreachable_directory_can_be_overridden_loudly(self):
+        async def unavailable(**kwargs):
+            raise RuntimeError("admin service not enabled")
+
+        with patch.object(
+            shared_drive_tools, "_directory_service", side_effect=unavailable
+        ):
+            note = await shared_drive_tools.assert_principal_is_group(
+                "team@otbgroup.co.uk",
+                user_google_email=USER,
+                allow_unverified_group=True,
+            )
+
+        assert "Could not verify" in note
+
+    @pytest.mark.asyncio
+    async def test_resolvable_group_passes_quietly(self):
+        directory = MagicMock()
+        directory.groups.return_value.get.return_value = _request(
+            {"id": "g1", "email": "bir-hs@otbgroup.co.uk"}
+        )
+
+        with patch.object(
+            shared_drive_tools,
+            "_directory_service",
+            new=AsyncMock(return_value=directory),
+        ):
+            note = await shared_drive_tools.assert_principal_is_group(
+                "bir-hs@otbgroup.co.uk",
+                user_google_email=USER,
+                allow_unverified_group=False,
+            )
+
+        assert note == ""
+
+    @pytest.mark.asyncio
+    async def test_address_the_directory_does_not_know_is_refused(self):
+        directory = MagicMock()
+        directory.groups.return_value.get.return_value = _request(_not_found())
+
+        with patch.object(
+            shared_drive_tools,
+            "_directory_service",
+            new=AsyncMock(return_value=directory),
+        ):
+            with pytest.raises(UserInputError, match="not a Google Group"):
+                await shared_drive_tools.assert_principal_is_group(
+                    "katie@otbgroup.co.uk",
+                    user_google_email=USER,
+                    allow_unverified_group=False,
+                )
 
 
 class TestRegistrationPolicy:
