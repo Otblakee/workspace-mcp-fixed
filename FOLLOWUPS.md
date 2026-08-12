@@ -259,3 +259,56 @@ separately.
 Steps 5 to 10 of the checklist above (shortcut idempotency, folder tree, walk,
 copy, reconcile, hub rebuild) were not reached before the permission finding
 stopped the run. Re-run the whole checklist once the guardrail fix is deployed.
+
+### Live run part 2 — checklist steps 5 to 11 (2026-08-12)
+
+Completed against the same scratch drive after the permission finding above.
+Everything below is confirmed working against real Google APIs.
+
+**`create_folder_tree` dry-run bug (found live, fixed on this branch).** The
+dry-run placeholder for a folder that would be created (`<would-create:...>`)
+was passed to Drive as a real parent ID when resolving the next path segment,
+which 404'd. A dry run of nested paths therefore reported every nested path as
+a failure: `folders_to_create: 3, paths_failed: 3` for six valid paths. Real
+runs were unaffected because they have real IDs — but dry run is precisely what
+an operator is told to run first, so it mattered. Nothing can exist inside a
+folder that does not exist yet, so the lookup is now skipped for planned
+parents.
+
+**Confirmed working live:**
+
+- `create_folder_tree`: six paths created, then an identical re-run reported
+  `folders_created: 0, folders_already_present: 6` with identical IDs.
+- `create_shortcut`: created once, second identical call reported the existing
+  shortcut and created nothing.
+- `walk_drive`: two consecutive walks of the static drive returned identical
+  counts (7 items, 6 folders, 1 file) and the self-check passed with
+  `found_only_by_sweep: 0`.
+- `batch_copy_from_manifest`: a manifest deliberately containing the same
+  (source, dest) pair twice reported `duplicate_rows_collapsed: 1` and copied
+  two files with `unstamped_copies: 0`. The re-run reported
+  `skipped_already_copied: 2, copied: 0` — the provenance key works against
+  real Drive appProperties.
+- `reconcile_folders`: clean verdict on the copied pair with checksums
+  compared; the deliberately mismatched pair correctly returned
+  `❌ 3 blocking discrepancies` naming the right files.
+- `rebuild_hub`: dry run planned two sections and three shortcuts; the real run
+  created them; the re-run reported `shortcuts_already_correct: 3`. After
+  renaming one registry label and deleting one row, the diff correctly reported
+  one rename and one orphan — both round-four fixes firing on live data.
+- Soft-delete invariant: `remove_orphans=True` moved the orphan shortcut to the
+  holding folder. Verified via a search for
+  `appProperties has {key='mcp_softdeleted' and value='true'} and trashed=false`
+  — the shortcut is alive, untrashed, and recoverable. `DRIVE_HOLDING_FOLDER_ID`
+  is set on Render.
+
+**Minor observations, not fixed:**
+
+- `walk_drive` reports the root of a shared drive as `'Drive'` rather than the
+  drive's name, because `files.get` on a shared-drive root returns that literal.
+  Cosmetic; the manifest and IDs are correct. Fetch the name via `drives.get`
+  when the root is a drive if this ever matters for reports.
+- `rebuild_hub` only scans section *folders* under the hub. A shortcut sitting
+  loose in the hub root is neither reported nor removed. That matches the
+  intended hub shape (sections contain shortcuts), but it means stray items at
+  the root are invisible to the drift check.

@@ -74,6 +74,15 @@ PROV_COPIED_AT = "mcp_copied_at"
 DEFAULT_MAX_ITEMS = 50_000
 
 
+# Marker for a folder a dry run would create. It is not a Drive ID, so it must
+# never be sent to the API as one.
+_DRY_RUN_PLACEHOLDER = "<would-create:"
+
+
+def _dry_run_placeholder(path: str) -> str:
+    return f"{_DRY_RUN_PLACEHOLDER}{path}>"
+
+
 def _escape_query_value(value: str) -> str:
     """Escape a literal for use inside a single-quoted Drive query term."""
     return value.replace("\\", "\\\\").replace("'", "\\'")
@@ -725,6 +734,16 @@ async def create_folder_tree(
                 if current_path in known:
                     continue
 
+                # A planned parent has no real ID, so it cannot be queried —
+                # and nothing can already exist inside a folder that does not
+                # exist yet. Querying anyway sent the placeholder to Drive as a
+                # parent ID and 404'd, which made a dry run report every nested
+                # path as a failure. Found on the live scratch drive.
+                if dry_run and parent_id.startswith(_DRY_RUN_PLACEHOLDER):
+                    known[current_path] = _dry_run_placeholder(current_path)
+                    planned.append(current_path)
+                    continue
+
                 match = await _find_child_folder(service, parent_id, segment)
                 if match:
                     known[current_path] = match["id"]
@@ -734,7 +753,7 @@ async def create_folder_tree(
                 if dry_run:
                     # No ID exists yet; use a placeholder so deeper segments of
                     # the same path can still be planned.
-                    known[current_path] = f"<would-create:{current_path}>"
+                    known[current_path] = _dry_run_placeholder(current_path)
                     planned.append(current_path)
                     continue
 

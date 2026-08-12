@@ -1233,6 +1233,50 @@ class TestAssertPrincipalIsGroup:
         assert note == ""
 
     @pytest.mark.asyncio
+    async def test_lookup_failure_is_not_read_as_a_no(self):
+        """A 403 (non-admin caller) or 5xx means the question went unanswered,
+        not that the answer was 'not a group'. Default is still refusal, but
+        the override must apply here too — otherwise the escape hatch cannot
+        unblock the deployments it exists for."""
+        resp = MagicMock()
+        resp.status = 403
+        forbidden = HttpError(resp, b'{"error": {"message": "not an admin"}}')
+        directory = MagicMock()
+        directory.groups.return_value.get.return_value = _request(forbidden)
+
+        with patch.object(
+            shared_drive_tools,
+            "_directory_service",
+            new=AsyncMock(return_value=directory),
+        ):
+            with pytest.raises(UserInputError, match="Could not determine"):
+                await shared_drive_tools.assert_principal_is_group(
+                    "team@otbgroup.co.uk",
+                    user_google_email=USER,
+                    allow_unverified_group=False,
+                )
+
+            note = await shared_drive_tools.assert_principal_is_group(
+                "team@otbgroup.co.uk",
+                user_google_email=USER,
+                allow_unverified_group=True,
+            )
+        assert "Could not verify" in note
+        assert "403" in note
+
+    def test_helper_requests_the_scope_groups_get_actually_needs(self):
+        """groups.get needs the group-read scope. Declaring only the
+        group-member scope would authenticate fine and then 403 on the lookup,
+        refusing every default group grant on a valid session."""
+        import inspect
+
+        source = inspect.getsource(shared_drive_tools)
+        marker = source.split("async def _directory_service")[0]
+        decorator = marker[marker.rindex("@require_google_service") :]
+        assert "admin_directory_group_read" in decorator
+        assert "admin_directory_group_member_read" in decorator
+
+    @pytest.mark.asyncio
     async def test_address_the_directory_does_not_know_is_refused(self):
         directory = MagicMock()
         directory.groups.return_value.get.return_value = _request(_not_found())

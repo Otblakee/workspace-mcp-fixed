@@ -198,6 +198,7 @@ async def assert_principal_is_group(
     except HttpError as error:
         status = getattr(getattr(error, "resp", None), "status", None)
         if status in (404, 400):
+            # A definitive answer from the Directory: this is not a group.
             raise UserInputError(
                 f"'{principal}' is not a Google Group in this domain, so it "
                 "cannot be granted group access. Drive would silently create "
@@ -206,11 +207,46 @@ async def assert_principal_is_group(
                 "allow_individual=True — that choice should be explicit and "
                 "visible in the audit log."
             ) from error
-        raise
+
+        # Any other status (403 for a non-admin caller, a persistent 5xx) means
+        # the question went unanswered, not that the answer was "no". That is
+        # the same situation as the service being unavailable, so it honours
+        # the same override — otherwise the escape hatch cannot unblock the
+        # deployments it exists for.
+        if allow_unverified_group:
+            logger.warning(
+                "[set_drive_permission] granting to '%s' as a group WITHOUT "
+                "verification (groups.get returned %s)",
+                principal,
+                status,
+            )
+            return (
+                f"\n   ⚠️ Could not verify that this address is a group "
+                f"(directory lookup returned HTTP {status}) and "
+                "allow_unverified_group=True was passed. Google silently "
+                "converts a group grant on a personal address into an "
+                "individual one, so confirm the resulting permission type."
+            )
+        raise UserInputError(
+            f"Could not determine whether '{principal}' is a Google Group: the "
+            f"directory lookup failed with HTTP {status}. Refusing the grant — "
+            "Drive does NOT reject a group grant aimed at a personal address, "
+            "it silently creates an individual one. Check the caller's admin "
+            "privileges, or pass allow_individual=True for a deliberate "
+            "individual grant, or allow_unverified_group=True to accept the "
+            "risk explicitly."
+        ) from error
     return ""
 
 
-@require_google_service("admin_directory", "admin_directory_group_member_read")
+# groups.get needs the group *read* scope, not the group-member scope — the
+# repo's own gadmin.get_group uses admin_directory_group_read for this exact
+# endpoint. Both are requested because this helper also backs the membership
+# lookup in revoke_drive_permission, which reads members.
+@require_google_service(
+    "admin_directory",
+    ["admin_directory_group_read", "admin_directory_group_member_read"],
+)
 async def _directory_service(service, user_google_email: str):
     """Lazily acquire an Admin Directory service for the membership check.
 
