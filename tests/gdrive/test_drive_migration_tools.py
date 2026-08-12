@@ -132,11 +132,15 @@ class FakeTree:
     def _resolve_query(self, kwargs):
         query = kwargs.get("q") or ""
         if kwargs.get("corpora") == "drive":
-            # Drive-wide sweep: everything, parents notwithstanding.
+            # Drive-wide sweep: everything in that drive, parents
+            # notwithstanding. Nodes may carry an explicit driveId so a single
+            # double can host two drives (source and destination).
+            wanted_drive = kwargs.get("driveId")
             return [
-                dict(node, driveId=self.drive_id)
+                dict(node, driveId=node.get("driveId", self.drive_id))
                 for node_id, node in self.nodes.items()
-                if node_id != self.drive_id
+                if node_id != wanted_drive
+                and node.get("driveId", self.drive_id) == wanted_drive
             ]
 
         if "appProperties has" in query:
@@ -826,6 +830,505 @@ class TestRebuildHub:
             mig, "_hub_registry_service", new_callable=AsyncMock, return_value=sheets
         ):
             with pytest.raises(UserInputError, match="hub_section"):
+                await rebuild_hub(service, USER, "sheet1", "hub")
+
+
+# ---------------------------------------------------------------------------
+# Review-round regressions (Codex review of ebcd25d)
+# ---------------------------------------------------------------------------
+
+
+class TestSweepCompleteness:
+    def _drive_with_hidden_subtree(self):
+        """'hidden' is unreachable from the parent walk but holds a child."""
+        nodes = {
+            "D": {"id": "D", "name": "BIR-Projects", "mimeType": FOLDER},
+            "f1": _file("f1", "01_Design", mime=FOLDER, parents=["D"]),
+            "hidden": _file("hidden", "99_Hidden", mime=FOLDER, parents=["D"]),
+            "buried": _file(
+                "buried", "buried.pdf", md5="m9", size="9", parents=["hidden"]
+            ),
+        }
+        children = {"D": ["f1", "hidden"], "f1": [], "hidden": ["buried"]}
+        return FakeTree(nodes, children, drive_id="D", unreachable=["hidden"])
+
+    @pytest.mark.asyncio
+    async def test_sweep_only_subtree_keeps_its_shape(self, tmp_path):
+        """A child of a sweep-only folder must resolve through its ancestor,
+        not collapse to <unreached>/child — otherwise unrelated subtrees
+        flatten onto colliding paths and path-keyed reconciliation breaks."""
+        await walk_drive(self._drive_with_hidden_subtree(), USER, "D")
+
+        rows = {r["id"]: r for r in _report_rows(tmp_path, "walk_BIR-Projects")}
+        # 'hidden' hangs directly off the root, so its path resolves fully.
+        assert rows["hidden"]["path"] == "99_Hidden"
+        # The point of the fix: 'buried' resolves *through* its sweep-only
+        # ancestor rather than collapsing to a bare name at an unknown depth.
+        assert rows["buried"]["path"] == "99_Hidden/buried.pdf"
+        assert rows["buried"]["discovered_by"] == "sweep"
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_ancestor_falls_back_to_unreached(self, tmp_path):
+        """When the chain runs off the end of the swept corpus we say so
+        rather than inventing a path."""
+        nodes = {
+            "D": {"id": "D", "name": "BIR-Projects", "mimeType": FOLDER},
+            "f1": _file("f1", "01_Design", mime=FOLDER, parents=["D"]),
+            "waif": _file("waif", "waif.pdf", md5="m4", parents=["vanished"]),
+        }
+        service = FakeTree(
+            nodes, {"D": ["f1"], "f1": []}, drive_id="D", unreachable=["waif"]
+        )
+
+        await walk_drive(service, USER, "D")
+
+        rows = {r["id"]: r for r in _report_rows(tmp_path, "walk_BIR-Projects")}
+        assert rows["waif"]["path"] == "<unreached>/waif.pdf"
+
+    @pytest.mark.asyncio
+    async def test_sweep_honours_max_items(self, tmp_path):
+        """The cap is a safety limit on the whole inventory, so the sweep
+        cannot append past it after the walk has already filled up."""
+        service = self._drive_with_hidden_subtree()
+
+        result = await walk_drive(service, USER, "D", max_items=2)
+
+        rows = _report_rows(tmp_path, "walk_BIR-Projects")
+        assert len(rows) <= 2
+        assert "truncated: 1" in result
+
+    @pytest.mark.asyncio
+    async def test_sweep_truncation_is_deterministic(self, tmp_path):
+        first = await walk_drive(
+            self._drive_with_hidden_subtree(), USER, "D", max_items=3
+        )
+        rows_first = _report_rows(tmp_path, "walk_BIR-Projects")
+        for path in tmp_path.glob("walk_BIR-Projects*"):
+            path.unlink()
+        second = await walk_drive(
+            self._drive_with_hidden_subtree(), USER, "D", max_items=3
+        )
+        assert rows_first == _report_rows(tmp_path, "walk_BIR-Projects")
+        assert first.splitlines()[1:4] == second.splitlines()[1:4]
+
+
+class TestReconcileUsesTheSweep:
+    def _two_drives(self, *, unreachable=()):
+        """Source and destination shared drives in one double."""
+        nodes = {
+            "src": {
+                "id": "src",
+                "name": "Source",
+                "mimeType": FOLDER,
+                "driveId": "src",
+            },
+            "dst": {"id": "dst", "name": "Dest", "mimeType": FOLDER, "driveId": "dst"},
+            "s_a": dict(
+                _file("s_a", "plan.pdf", md5="m1", size="10", parents=["src"]),
+                driveId="src",
+            ),
+            "s_lost": dict(
+                _file("s_lost", "lost.pdf", md5="m2", size="20", parents=["src"]),
+                driveId="src",
+            ),
+            "d_a": dict(
+                _file("d_a", "plan.pdf", md5="m1", size="10", parents=["dst"]),
+                driveId="dst",
+            ),
+        }
+        children = {"src": ["s_a", "s_lost"], "dst": ["d_a"]}
+        return FakeTree(nodes, children, unreachable=unreachable)
+
+    @pytest.mark.asyncio
+    async def test_source_item_unreachable_by_walk_still_blocks(self, tmp_path):
+        """An item missing from the destination AND unreachable from the
+        source's parent graph must not vanish from both sides and yield a
+        clean verdict — that would sign off on lost content."""
+        service = self._two_drives(unreachable=["s_lost"])
+
+        result = await reconcile_folders(service, USER, "src", "dst")
+
+        assert "blocking discrepancy" in result
+        kinds = {r["kind"] for r in _report_rows(tmp_path, "reconcile_report")}
+        assert "missing_in_dest" in kinds
+        assert "sweep contributed" in result
+
+    @pytest.mark.asyncio
+    async def test_fully_migrated_pair_is_still_clean(self):
+        nodes = {
+            "src": {"id": "src", "name": "S", "mimeType": FOLDER, "driveId": "src"},
+            "dst": {"id": "dst", "name": "D", "mimeType": FOLDER, "driveId": "dst"},
+            "s_a": dict(
+                _file("s_a", "plan.pdf", md5="m1", size="10", parents=["src"]),
+                driveId="src",
+            ),
+            "d_a": dict(
+                _file("d_a", "plan.pdf", md5="m1", size="10", parents=["dst"]),
+                driveId="dst",
+            ),
+        }
+        service = FakeTree(nodes, {"src": ["s_a"], "dst": ["d_a"]})
+
+        result = await reconcile_folders(service, USER, "src", "dst")
+
+        assert "Reconciliation clean" in result
+
+
+class TestReconcileDuplicateSiblings:
+    @pytest.mark.asyncio
+    async def test_two_sources_one_dest_is_not_clean(self, tmp_path):
+        """Drive allows same-named siblings. Collapsing them by path would
+        report a clean migration while one file was never copied."""
+        nodes = {
+            "src": {"id": "src", "name": "S", "mimeType": FOLDER},
+            "dst": {"id": "dst", "name": "D", "mimeType": FOLDER},
+            "s1": _file("s1", "foo.pdf", md5="m1", size="10", parents=["src"]),
+            "s2": _file("s2", "foo.pdf", md5="m2", size="20", parents=["src"]),
+            "d1": _file("d1", "foo.pdf", md5="m1", size="10", parents=["dst"]),
+        }
+        service = FakeTree(nodes, {"src": ["s1", "s2"], "dst": ["d1"]})
+
+        result = await reconcile_folders(service, USER, "src", "dst")
+
+        assert "blocking discrepancy" in result
+        rows = _report_rows(tmp_path, "reconcile_report")
+        missing = [r for r in rows if r["kind"] == "missing_in_dest"]
+        assert len(missing) == 1
+        assert missing[0]["source_id"] == "s2"
+
+    @pytest.mark.asyncio
+    async def test_matching_duplicate_siblings_are_clean(self):
+        nodes = {
+            "src": {"id": "src", "name": "S", "mimeType": FOLDER},
+            "dst": {"id": "dst", "name": "D", "mimeType": FOLDER},
+            "s1": _file("s1", "foo.pdf", md5="m1", size="10", parents=["src"]),
+            "s2": _file("s2", "foo.pdf", md5="m2", size="20", parents=["src"]),
+            "d1": _file("d1", "foo.pdf", md5="m1", size="10", parents=["dst"]),
+            "d2": _file("d2", "foo.pdf", md5="m2", size="20", parents=["dst"]),
+        }
+        service = FakeTree(nodes, {"src": ["s1", "s2"], "dst": ["d1", "d2"]})
+
+        result = await reconcile_folders(service, USER, "src", "dst")
+
+        assert "Reconciliation clean" in result
+        assert "matched: 2" in result
+
+
+class TestFolderTreeMultiDrive:
+    MULTI = json.dumps(
+        [
+            {"drive": "OTB-Hub", "folder_path": "01_A", "action": "create"},
+            {"drive": "OTB-Knowledge Base", "folder_path": "02_B", "action": "create"},
+        ]
+    )
+
+    def _root(self):
+        nodes = {"root": {"id": "root", "name": "Root", "mimeType": FOLDER}}
+        return FakeTree(nodes, {"root": []})
+
+    @pytest.mark.asyncio
+    async def test_multi_drive_manifest_is_refused_without_a_selector(self):
+        """root_id names one drive; building every drive's folders under it
+        would be silent and expensive to unpick."""
+        with pytest.raises(UserInputError, match="spans multiple drives"):
+            await create_folder_tree(
+                self._root(), USER, "root", manifest_json=self.MULTI
+            )
+
+    @pytest.mark.asyncio
+    async def test_drive_selector_filters_the_manifest(self):
+        service = self._root()
+
+        with patch(
+            "gdrive.drive_migration_tools.resolve_folder_id",
+            new_callable=AsyncMock,
+            return_value="root",
+        ):
+            result = await create_folder_tree(
+                service, USER, "root", manifest_json=self.MULTI, drive="OTB-Hub"
+            )
+
+        assert [b["name"] for b in service.created] == ["01_A"]
+        assert "02_B" not in result
+
+    @pytest.mark.asyncio
+    async def test_unknown_drive_selector_is_rejected(self):
+        with pytest.raises(UserInputError, match="No manifest rows for drive"):
+            await create_folder_tree(
+                self._root(), USER, "root", manifest_json=self.MULTI, drive="Nope"
+            )
+
+    @pytest.mark.asyncio
+    async def test_single_drive_manifest_needs_no_selector(self):
+        service = self._root()
+        single = json.dumps([{"drive": "OTB-Hub", "folder_path": "01_A"}])
+
+        with patch(
+            "gdrive.drive_migration_tools.resolve_folder_id",
+            new_callable=AsyncMock,
+            return_value="root",
+        ):
+            await create_folder_tree(service, USER, "root", manifest_json=single)
+
+        assert [b["name"] for b in service.created] == ["01_A"]
+
+
+class TestFolderTreePartialFailure:
+    @pytest.mark.asyncio
+    async def test_one_failing_path_does_not_abort_the_batch(self):
+        """A resumable batch must not need a manual manifest edit to make
+        progress past one unwritable location."""
+        nodes = {"root": {"id": "root", "name": "Root", "mimeType": FOLDER}}
+        service = FakeTree(nodes, {"root": []})
+        real_files = service.files
+
+        def flaky_files():
+            handle = real_files()
+            original_create = handle.create
+
+            def create(**kwargs):
+                if kwargs["body"].get("name") == "02_Bad":
+                    raise RuntimeError("insufficientFilePermissions")
+                return original_create(**kwargs)
+
+            handle.create = create
+            return handle
+
+        service.files = flaky_files
+
+        with patch(
+            "gdrive.drive_migration_tools.resolve_folder_id",
+            new_callable=AsyncMock,
+            return_value="root",
+        ):
+            result = await create_folder_tree(
+                service, USER, "root", paths=["01_Good", "02_Bad", "03_Also_Good"]
+            )
+
+        created = [b["name"] for b in service.created]
+        assert "01_Good" in created and "03_Also_Good" in created
+        assert "paths_failed: 1" in result
+        assert "RuntimeError" in result
+
+
+class TestBatchCopyDeduplication:
+    @pytest.mark.asyncio
+    async def test_repeated_key_in_one_manifest_copies_once(self, tmp_path):
+        """The provenance pre-check cannot see a copy that does not exist yet,
+        so a concatenated manifest naming the same pair twice must be collapsed
+        before any work starts."""
+        service = _copy_service()
+        manifest = json.dumps(
+            [
+                {"source_id": "s1", "dest_folder_id": "dest"},
+                {"source_id": "s1", "dest_folder_id": "dest"},
+                {"source_id": "s2", "dest_folder_id": "dest"},
+            ]
+        )
+
+        result = await batch_copy_from_manifest(
+            service, USER, manifest_json=manifest, migration_batch="DEDUP"
+        )
+
+        copied_sources = [kw["fileId"] for kw in service.kwargs_for("files.copy")]
+        assert sorted(copied_sources) == ["s1", "s2"]
+        assert "duplicate_rows_collapsed: 1" in result
+        rows = _report_rows(tmp_path, "copy_results_DEDUP")
+        assert len(rows) == 2
+
+    @pytest.mark.asyncio
+    async def test_same_source_to_two_destinations_is_not_deduped(self):
+        service = _copy_service()
+        service.nodes["dest2"] = {"id": "dest2", "name": "D2", "mimeType": FOLDER}
+        service.children["dest2"] = []
+        manifest = json.dumps(
+            [
+                {"source_id": "s1", "dest_folder_id": "dest"},
+                {"source_id": "s1", "dest_folder_id": "dest2"},
+            ]
+        )
+
+        await batch_copy_from_manifest(service, USER, manifest_json=manifest)
+
+        assert len(service.kwargs_for("files.copy")) == 2
+
+
+class TestRebuildHubFullDiff:
+    def _hub_with(self, section_folders, shortcuts):
+        nodes = {"hub": {"id": "hub", "name": "OTB-Hub", "mimeType": FOLDER}}
+        children = {"hub": []}
+        for section_id, name in section_folders:
+            nodes[section_id] = _file(section_id, name, mime=FOLDER, parents=["hub"])
+            children["hub"].append(section_id)
+            children[section_id] = []
+        for shortcut in shortcuts:
+            nodes[shortcut["id"]] = shortcut
+            children[shortcut["parents"][0]].append(shortcut["id"])
+        nodes.setdefault("t1", _file("t1", "08_Alterations", mime=FOLDER))
+        return FakeTree(nodes, children)
+
+    def _sheets(self, rows):
+        sheets = MagicMock()
+        sheets.spreadsheets.return_value.values.return_value.get.return_value = (
+            _request({"values": rows})
+        )
+        return sheets
+
+    def _shortcut(self, sid, name, parent, target):
+        return {
+            "id": sid,
+            "name": name,
+            "mimeType": SHORTCUT,
+            "parents": [parent],
+            "shortcutDetails": {"targetId": target},
+        }
+
+    @pytest.mark.asyncio
+    async def test_duplicate_shortcuts_to_one_target_are_orphans(self):
+        """One shortcut per target per section is the promised state, so the
+        extras must show up in the diff."""
+        service = self._hub_with(
+            [("sec", "Premises")],
+            [
+                self._shortcut("sc1", "08_Alterations", "sec", "t1"),
+                self._shortcut("sc2", "08_Alterations (copy)", "sec", "t1"),
+            ],
+        )
+        sheets = self._sheets(
+            [
+                ["folder_id", "folder_name", "hub_section"],
+                ["t1", "08_Alterations", "Premises"],
+            ]
+        )
+
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(
+                mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+            ),
+        ):
+            result = await rebuild_hub(service, USER, "sheet1", "hub")
+
+        assert "shortcuts_already_correct: 1" in result
+        assert "orphan_shortcuts: 1" in result
+        assert "duplicate shortcut" in result
+
+    @pytest.mark.asyncio
+    async def test_section_dropped_from_registry_is_scanned(self):
+        """Removing a section's last registry row used to strand its whole
+        shortcut set: never reported, never removed."""
+        service = self._hub_with(
+            [("sec", "Premises"), ("old", "Retired Section")],
+            [self._shortcut("sc9", "Stale", "old", "gone")],
+        )
+        sheets = self._sheets(
+            [
+                ["folder_id", "folder_name", "hub_section"],
+                ["t1", "08_Alterations", "Premises"],
+            ]
+        )
+
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(
+                mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+            ),
+        ):
+            result = await rebuild_hub(service, USER, "sheet1", "hub")
+
+        assert "stale_sections_scanned: 1" in result
+        assert "orphan_shortcuts: 1" in result
+        assert "section no longer in registry" in result
+
+    @pytest.mark.asyncio
+    async def test_empty_registry_still_reports_the_whole_hub(self):
+        """An empty registry means every shortcut in the hub is an orphan —
+        returning early would leave exactly the drift this tool prevents."""
+        service = self._hub_with(
+            [("sec", "Premises")],
+            [self._shortcut("sc1", "Stale", "sec", "t1")],
+        )
+        sheets = self._sheets(
+            [["folder_id", "folder_name", "hub_section"], ["t1", "A", ""]]
+        )
+
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(
+                mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+            ),
+        ):
+            result = await rebuild_hub(service, USER, "sheet1", "hub")
+
+        assert "orphan_shortcuts: 1" in result
+
+    @pytest.mark.asyncio
+    async def test_stale_section_orphans_soft_delete_not_trash(self, monkeypatch):
+        monkeypatch.setenv("DRIVE_HOLDING_FOLDER_ID", "holding")
+        service = self._hub_with(
+            [("sec", "Premises"), ("old", "Retired")],
+            [self._shortcut("sc9", "Stale", "old", "gone")],
+        )
+        sheets = self._sheets(
+            [
+                ["folder_id", "folder_name", "hub_section"],
+                ["t1", "08_Alterations", "Premises"],
+            ]
+        )
+
+        async def fake_resolve(_service, folder_id, **_kwargs):
+            return "holding" if folder_id == "holding" else "hub"
+
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(mig, "resolve_folder_id", side_effect=fake_resolve),
+        ):
+            result = await rebuild_hub(
+                service, USER, "sheet1", "hub", remove_orphans=True
+            )
+
+        assert "files.delete" not in service.call_names()
+        update = next(
+            kw for kw in service.kwargs_for("files.update") if kw["fileId"] == "sc9"
+        )
+        assert update["addParents"] == "holding"
+        assert update["removeParents"] == "old"
+        assert "orphans_removed: 1" in result
+
+
+class TestRebuildHubSheetsScope:
+    @pytest.mark.asyncio
+    async def test_missing_sheets_scope_gives_actionable_error(self):
+        """With only the drive service enabled, the consent flow never
+        requested a Sheets scope; the failure must say so."""
+        nodes = {"hub": {"id": "hub", "name": "OTB-Hub", "mimeType": FOLDER}}
+        service = FakeTree(nodes, {"hub": []})
+
+        async def boom(**_kwargs):
+            raise Exception("insufficient authentication scopes")
+
+        with patch.object(mig, "_hub_registry_service", side_effect=boom):
+            with pytest.raises(UserInputError, match="'sheets' service"):
                 await rebuild_hub(service, USER, "sheet1", "hub")
 
 
