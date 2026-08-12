@@ -267,17 +267,22 @@ def resolve_principal(
     *,
     allow_individual: bool = False,
 ) -> Tuple[str, str]:
-    """Apply the groups-only guardrail and return ``(type, emailAddress)``.
+    """Apply the address-shape checks and return the declared ``(type, email)``.
 
     The Build Sheet decision of 2026-01-21 is that Drive access is granted to
     Google Groups, never to individuals: an individual grant is invisible to
     the group-membership model and survives offboarding. Passing
     ``allow_individual=True`` is the documented, explicit escape hatch.
 
-    Note the type is *declared*, not verified here — Drive itself rejects a
-    ``type=group`` permission whose address is not a group, so a mistyped
-    individual address fails closed at the API rather than silently becoming
-    a personal grant.
+    IMPORTANT — this function does NOT establish that the principal is a group.
+    It was originally written on the assumption that Drive rejects a
+    ``type=group`` permission whose address belongs to a person. Live testing
+    on 2026-08-12 disproved that: Drive **accepted** the request and silently
+    created a ``type=user`` permission instead. The declared type is a request,
+    not a constraint.
+
+    The actual enforcement is ``assert_principal_is_group`` below, which
+    resolves the address against the Directory API before any grant is made.
     """
     email = (principal or "").strip()
     if not email or "@" not in email:

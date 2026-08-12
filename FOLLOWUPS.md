@@ -188,3 +188,127 @@ The same caveat applies to the pre-existing concurrent `asyncio.gather` calls in
 `gchat/chat_tools.py` and `gappsscript/apps_script_tools.py`. Those fan out over
 two or a handful of requests rather than thousands of rows, so the exposure is
 much smaller, but the hazard is identical and they were not touched here.
+
+## Live scratch-drive findings, 2026-08-12
+
+First live run against a real scratch shared drive (`OTB-SCRATCH-mcp-test`,
+`0APbe2x9PvdJhUk9PVA`), executed after PR #27 merged and deployed.
+
+### 1. The groups-only guardrail did not work (fixed on the follow-up branch)
+
+**The finding.** `set_drive_permission` was called with a personal address
+(`katie.newton@otbgroup.co.uk`), role `reader`, and `allow_individual=False`.
+It **succeeded**, creating a `type=user` permission. Confirmed via
+`get_drive_file_permissions`.
+
+**Why the original design failed.** It declared `type=group` on the permission
+body and relied on Drive to reject an address that is not a group. Drive does
+not reject it — it coerces the type and creates an individual grant. The
+declared type is a hint, not a constraint. Every unit test passed because the
+mocks were written to the same false assumption.
+
+This is the single most important reason the live checklist exists. No amount
+of mocked testing could have found it.
+
+**The fix.** `assert_principal_is_group` resolves the address against the Admin
+Directory API *before* any grant is created. Not a group → refused. Directory
+unreachable → refused, unless `allow_unverified_group=True` is passed
+explicitly, which reports loudly. `allow_individual=True` skips the check as
+the documented, audited escape hatch.
+
+**Operational consequence.** `set_drive_permission` now requires a reachable
+Admin Directory service for group grants. The OTB deployment already has the
+`gadmin` read tools enabled, so this works today. A drive-only deployment must
+either enable `gadmin` or pass `allow_unverified_group=True`.
+
+### 2. Restriction changes need domain-admin privilege
+
+`update_shared_drive` renaming worked normally, but setting
+`copy_requires_writer_permission` returned 403
+`noManageTeamDriveAdministratorPrivilege`. New shared drives in this Workspace
+are created with `adminManagedRestrictions` already on (an org-level default),
+which reserves restriction changes to domain administrators. Passing
+`use_domain_admin_access=true` succeeded.
+
+Runbook note: any restriction flag set during the architecture build needs
+`use_domain_admin_access=true`. Renames do not.
+
+Secondary observation: the 403 surfaced with the generic
+`handle_http_errors` hint "You might need to re-authenticate for user 'N/A'".
+That is misleading — it is a privilege problem, not an auth problem — and the
+user email renders as `N/A` under OAuth 2.1 because it is not in kwargs. Both
+are pre-existing upstream behaviours, not introduced here. Worth tightening
+separately.
+
+### 3. Confirmed working live
+
+- `create_shared_drive` (dry run and real), OAuth identity resolved correctly.
+- `list_shared_drives` with a `name contains` query.
+- `update_shared_drive` rename, verified by the `drives.get` round-trip.
+- `set_drive_permission` group grant; repeat call reported "No change";
+  role change updated the same permission ID rather than duplicating.
+- The conflicting-principal-type refusal (added in review round three) fired
+  correctly on a real drive: attempting a group grant for the caller's address,
+  which already held a `type=user` organizer permission, was refused. Without
+  that fix the call would have **demoted the drive's only organizer to writer**
+  while reporting it as a group grant.
+- `revoke_drive_permission` removed the accidental individual grant cleanly.
+
+### Still to run
+
+Steps 5 to 10 of the checklist above (shortcut idempotency, folder tree, walk,
+copy, reconcile, hub rebuild) were not reached before the permission finding
+stopped the run. Re-run the whole checklist once the guardrail fix is deployed.
+
+### Live run part 2 — checklist steps 5 to 11 (2026-08-12)
+
+Completed against the same scratch drive after the permission finding above.
+Everything below is confirmed working against real Google APIs.
+
+**`create_folder_tree` dry-run bug (found live, fixed on this branch).** The
+dry-run placeholder for a folder that would be created (`<would-create:...>`)
+was passed to Drive as a real parent ID when resolving the next path segment,
+which 404'd. A dry run of nested paths therefore reported every nested path as
+a failure: `folders_to_create: 3, paths_failed: 3` for six valid paths. Real
+runs were unaffected because they have real IDs — but dry run is precisely what
+an operator is told to run first, so it mattered. Nothing can exist inside a
+folder that does not exist yet, so the lookup is now skipped for planned
+parents.
+
+**Confirmed working live:**
+
+- `create_folder_tree`: six paths created, then an identical re-run reported
+  `folders_created: 0, folders_already_present: 6` with identical IDs.
+- `create_shortcut`: created once, second identical call reported the existing
+  shortcut and created nothing.
+- `walk_drive`: two consecutive walks of the static drive returned identical
+  counts (7 items, 6 folders, 1 file) and the self-check passed with
+  `found_only_by_sweep: 0`.
+- `batch_copy_from_manifest`: a manifest deliberately containing the same
+  (source, dest) pair twice reported `duplicate_rows_collapsed: 1` and copied
+  two files with `unstamped_copies: 0`. The re-run reported
+  `skipped_already_copied: 2, copied: 0` — the provenance key works against
+  real Drive appProperties.
+- `reconcile_folders`: clean verdict on the copied pair with checksums
+  compared; the deliberately mismatched pair correctly returned
+  `❌ 3 blocking discrepancies` naming the right files.
+- `rebuild_hub`: dry run planned two sections and three shortcuts; the real run
+  created them; the re-run reported `shortcuts_already_correct: 3`. After
+  renaming one registry label and deleting one row, the diff correctly reported
+  one rename and one orphan — both round-four fixes firing on live data.
+- Soft-delete invariant: `remove_orphans=True` moved the orphan shortcut to the
+  holding folder. Verified via a search for
+  `appProperties has {key='mcp_softdeleted' and value='true'} and trashed=false`
+  — the shortcut is alive, untrashed, and recoverable. `DRIVE_HOLDING_FOLDER_ID`
+  is set on Render.
+
+**Minor observations, not fixed:**
+
+- `walk_drive` reports the root of a shared drive as `'Drive'` rather than the
+  drive's name, because `files.get` on a shared-drive root returns that literal.
+  Cosmetic; the manifest and IDs are correct. Fetch the name via `drives.get`
+  when the root is a drive if this ever matters for reports.
+- `rebuild_hub` only scans section *folders* under the hub. A shortcut sitting
+  loose in the hub root is neither reported nor removed. That matches the
+  intended hub shape (sections contain shortcuts), but it means stray items at
+  the root are invisible to the drift check.

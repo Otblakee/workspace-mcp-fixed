@@ -407,6 +407,57 @@ class TestCreateFolderTree:
         assert service.created == []
 
     @pytest.mark.asyncio
+    async def test_dry_run_plans_nested_paths_without_querying_placeholders(self):
+        """Found live: the dry-run placeholder for a planned parent was sent to
+        Drive as a real parent ID in the next segment's lookup, so every nested
+        path came back as a spurious failure. Nothing can exist inside a folder
+        that does not exist yet, so no lookup should happen at all."""
+        nodes = {"root": {"id": "root", "name": "Root", "mimeType": FOLDER}}
+        service = FakeTree(nodes, {"root": []})
+
+        with patch(
+            "gdrive.drive_migration_tools.resolve_folder_id",
+            new_callable=AsyncMock,
+            return_value="root",
+        ):
+            result = await create_folder_tree(
+                service,
+                USER,
+                "root",
+                paths=["01_Gov", "01_Gov/01_Policies", "01_Gov/01_Policies/2026"],
+                dry_run=True,
+            )
+
+        assert "paths_failed: 0" in result
+        assert "folders_to_create: 3" in result
+        assert "(not resolved)" not in result
+        # The placeholder must never reach the API as a parent id.
+        for kwargs in service.kwargs_for("files.list"):
+            assert "would-create" not in (kwargs.get("q") or "")
+
+    @pytest.mark.asyncio
+    async def test_dry_run_still_detects_existing_folders(self):
+        """The short-circuit must not skip real lookups for real parents."""
+        nodes = {
+            "root": {"id": "root", "name": "Root", "mimeType": FOLDER},
+            "g": _file("g", "01_Gov", mime=FOLDER, parents=["root"]),
+        }
+        service = FakeTree(nodes, {"root": ["g"], "g": []})
+
+        with patch(
+            "gdrive.drive_migration_tools.resolve_folder_id",
+            new_callable=AsyncMock,
+            return_value="root",
+        ):
+            result = await create_folder_tree(
+                service, USER, "root", paths=["01_Gov/01_Policies"], dry_run=True
+            )
+
+        assert "folders_already_present: 1" in result
+        assert "folders_to_create: 1" in result
+        assert "paths_failed: 0" in result
+
+    @pytest.mark.asyncio
     async def test_rejects_paths_and_manifest_together(self):
         with pytest.raises(UserInputError, match="not both"):
             await create_folder_tree(
