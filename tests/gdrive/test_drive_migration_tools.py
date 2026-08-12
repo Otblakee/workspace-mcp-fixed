@@ -1395,6 +1395,175 @@ class TestReportingAccuracy:
         assert "01_A" in result
 
 
+class TestTruncatedReconciliationIsInconclusive:
+    @pytest.mark.asyncio
+    async def test_truncated_run_is_not_reported_clean(self, tmp_path):
+        """A truncated inventory compared only a prefix. Whatever that prefix
+        showed, the run proves nothing about the items never examined, so it
+        must not yield a green verdict automation could act on."""
+        nodes = {
+            "src": {"id": "src", "name": "S", "mimeType": FOLDER},
+            "dst": {"id": "dst", "name": "D", "mimeType": FOLDER},
+        }
+        children = {"src": [], "dst": []}
+        for i in range(4):
+            nodes[f"s{i}"] = _file(
+                f"s{i}", f"f{i}.pdf", md5=f"m{i}", size="1", parents=["src"]
+            )
+            nodes[f"d{i}"] = _file(
+                f"d{i}", f"f{i}.pdf", md5=f"m{i}", size="1", parents=["dst"]
+            )
+            children["src"].append(f"s{i}")
+            children["dst"].append(f"d{i}")
+        service = FakeTree(nodes, children)
+
+        result = await reconcile_folders(service, USER, "src", "dst", max_items=2)
+
+        assert "Inconclusive" in result
+        assert "Reconciliation clean" not in result
+        rows = _report_rows(tmp_path, "reconcile_report")
+        kinds = {r["kind"] for r in rows}
+        assert "inconclusive_truncated" in kinds
+        # The clean marker must never appear alongside a truncated run.
+        assert "clean" not in kinds
+
+
+class TestShortcutReconciliation:
+    def _pair(self, source_target, dest_target):
+        nodes = {
+            "src": {"id": "src", "name": "S", "mimeType": FOLDER},
+            "dst": {"id": "dst", "name": "D", "mimeType": FOLDER},
+            "s_sc": dict(
+                _file("s_sc", "Link", mime=SHORTCUT, parents=["src"]),
+                shortcutDetails={"targetId": source_target},
+            ),
+            "d_sc": dict(
+                _file("d_sc", "Link", mime=SHORTCUT, parents=["dst"]),
+                shortcutDetails={"targetId": dest_target},
+            ),
+        }
+        return FakeTree(nodes, {"src": ["s_sc"], "dst": ["d_sc"]})
+
+    @pytest.mark.asyncio
+    async def test_matching_targets_count_as_matched(self):
+        result = await reconcile_folders(self._pair("t1", "t1"), USER, "src", "dst")
+        assert "matched: 1" in result
+        assert "Reconciliation clean" in result
+
+    @pytest.mark.asyncio
+    async def test_differing_targets_are_reported_not_dismissed_as_native(
+        self, tmp_path
+    ):
+        """A shortcut's mimeType is under the google-apps namespace, so it used
+        to be written off as an unmeasurable native document even though the
+        inventory records its target."""
+        result = await reconcile_folders(self._pair("t1", "t9"), USER, "src", "dst")
+
+        rows = _report_rows(tmp_path, "reconcile_report")
+        kinds = {r["kind"] for r in rows}
+        assert kinds == {"shortcut_target_differs"}
+        assert "unverifiable_native" not in kinds
+        row = rows[0]
+        assert row["source_target_id"] == "t1"
+        assert row["dest_target_id"] == "t9"
+        # Non-blocking: a copy-based migration legitimately re-points targets.
+        assert "Reconciliation clean" in result
+        assert "point at different targets" in result
+
+
+class TestHubLabelDrift:
+    @pytest.mark.asyncio
+    async def test_registry_label_change_renames_the_shortcut(self):
+        """The registry is the source of truth for the label too; a renamed
+        row otherwise leaves the hub showing the old navigation label."""
+        nodes = {
+            "hub": {"id": "hub", "name": "OTB-Hub", "mimeType": FOLDER},
+            "sec": _file("sec", "Premises", mime=FOLDER, parents=["hub"]),
+            "t1": _file("t1", "08_Alterations", mime=FOLDER),
+            "sc1": {
+                "id": "sc1",
+                "name": "08_Alterations (old label)",
+                "mimeType": SHORTCUT,
+                "parents": ["sec"],
+                "shortcutDetails": {"targetId": "t1"},
+            },
+        }
+        service = FakeTree(nodes, {"hub": ["sec"], "sec": ["sc1"]})
+        sheets = MagicMock()
+        sheets.spreadsheets.return_value.values.return_value.get.return_value = (
+            _request(
+                {
+                    "values": [
+                        ["folder_id", "folder_name", "hub_section"],
+                        ["t1", "08_Alterations", "Premises"],
+                    ]
+                }
+            )
+        )
+
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(
+                mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+            ),
+        ):
+            result = await rebuild_hub(service, USER, "sheet1", "hub")
+
+        update = service.kwargs_for("files.update")[0]
+        assert update["fileId"] == "sc1"
+        assert update["body"]["name"] == "08_Alterations"
+        assert "shortcuts_renamed: 1" in result
+        assert "orphan_shortcuts: 0" in result
+
+    @pytest.mark.asyncio
+    async def test_matching_label_is_left_alone(self):
+        nodes = {
+            "hub": {"id": "hub", "name": "OTB-Hub", "mimeType": FOLDER},
+            "sec": _file("sec", "Premises", mime=FOLDER, parents=["hub"]),
+            "t1": _file("t1", "08_Alterations", mime=FOLDER),
+            "sc1": {
+                "id": "sc1",
+                "name": "08_Alterations",
+                "mimeType": SHORTCUT,
+                "parents": ["sec"],
+                "shortcutDetails": {"targetId": "t1"},
+            },
+        }
+        service = FakeTree(nodes, {"hub": ["sec"], "sec": ["sc1"]})
+        sheets = MagicMock()
+        sheets.spreadsheets.return_value.values.return_value.get.return_value = (
+            _request(
+                {
+                    "values": [
+                        ["folder_id", "folder_name", "hub_section"],
+                        ["t1", "08_Alterations", "Premises"],
+                    ]
+                }
+            )
+        )
+
+        with (
+            patch.object(
+                mig,
+                "_hub_registry_service",
+                new_callable=AsyncMock,
+                return_value=sheets,
+            ),
+            patch.object(
+                mig, "resolve_folder_id", new_callable=AsyncMock, return_value="hub"
+            ),
+        ):
+            result = await rebuild_hub(service, USER, "sheet1", "hub")
+
+        assert "files.update" not in service.call_names()
+        assert "shortcuts_already_correct: 1" in result
+
+
 class TestNoHardDeleteAnywhere:
     def test_migration_module_never_calls_files_delete(self):
         """The soft-delete invariant: this server never trashes or hard-deletes

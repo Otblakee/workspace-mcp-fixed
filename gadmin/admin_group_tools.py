@@ -72,6 +72,37 @@ async def _get_group(service, group_key: str) -> Optional[Dict[str, Any]]:
         raise
 
 
+ADMIN_ROLES = {"OWNER", "MANAGER"}
+
+
+async def _assert_not_last_admin(
+    service, group_key: str, current_role: str, *, action: str
+) -> None:
+    """Refuse an operation that would leave a group with no OWNER or MANAGER.
+
+    Shared by removal and demotion: revoking the last administrator and
+    demoting them to MEMBER reach the same end state, so guarding only one of
+    the two would be a guardrail in name only.
+    """
+    if current_role not in ADMIN_ROLES:
+        return
+
+    members: List[Dict[str, Any]] = await paginate(
+        lambda token: service.members().list(
+            groupKey=group_key, maxResults=200, pageToken=token
+        ),
+        items_key="members",
+        label="directory.members.list",
+    )
+    admins = [m for m in members if (m.get("role") or "").upper() in ADMIN_ROLES]
+    if len(admins) <= 1:
+        raise UserInputError(
+            f"Refusing to {action} the last {current_role} of {group_key} — the "
+            "group would be left with nobody who can administer it. Add "
+            "another manager or owner first."
+        )
+
+
 async def _get_member(
     service, group_key: str, member_key: str
 ) -> Optional[Dict[str, Any]]:
@@ -150,7 +181,9 @@ async def create_group(
         body["description"] = description
 
     created = await execute_with_backoff(
-        lambda: service.groups().insert(body=body), label="directory.groups.insert"
+        lambda: service.groups().insert(body=body),
+        label="directory.groups.insert",
+        idempotent=False,
     )
     logger.info(
         "[create_group] created %s (%s) by %s",
@@ -213,10 +246,18 @@ async def add_group_member(
         )
 
     existing = await _get_member(service, group_key, member_key)
-    if existing is not None and (existing.get("role") or "").upper() == member_role:
+    existing_role = (existing.get("role") or "").upper() if existing else ""
+    if existing is not None and existing_role == member_role:
         return (
             f"ℹ️ {member_key} is already a {member_role} of {group_key}. "
             "Nothing changed."
+        )
+
+    # Demoting the sole administrator strands the group exactly as removing
+    # them would, so the same guard applies to both paths.
+    if existing is not None and member_role not in ADMIN_ROLES:
+        await _assert_not_last_admin(
+            service, group_key, existing_role, action=f"demote to {member_role}"
         )
 
     if dry_run:
@@ -251,6 +292,7 @@ async def add_group_member(
             groupKey=group_key, body={"email": member_key, "role": member_role}
         ),
         label="directory.members.insert",
+        idempotent=False,
     )
     logger.info(
         "[add_group_member] added %s to %s as %s by %s",
@@ -309,23 +351,7 @@ async def remove_group_member(
         return f"ℹ️ {member_key} is not a member of {group_key}; nothing to remove."
 
     member_role = (existing.get("role") or "").upper()
-    if member_role in {"OWNER", "MANAGER"}:
-        members: List[Dict[str, Any]] = await paginate(
-            lambda token: service.members().list(
-                groupKey=group_key, maxResults=200, pageToken=token
-            ),
-            items_key="members",
-            label="directory.members.list",
-        )
-        admins = [
-            m for m in members if (m.get("role") or "").upper() in {"OWNER", "MANAGER"}
-        ]
-        if len(admins) <= 1:
-            raise UserInputError(
-                f"Refusing to remove the last {member_role} of {group_key} — the "
-                "group would be left with nobody who can administer it. Add "
-                "another manager or owner first."
-            )
+    await _assert_not_last_admin(service, group_key, member_role, action="remove")
 
     if dry_run:
         return (

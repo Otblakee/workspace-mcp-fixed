@@ -56,19 +56,30 @@ VALID_DRIVE_ROLES = (
 # prevent.
 ALLOWED_PRINCIPAL_TYPES = ("group", "user")
 
-# Google API error reasons that are worth retrying. Everything else (404,
-# 400, insufficient permissions) is a real failure and is surfaced at once.
-_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
-_RETRYABLE_REASONS = frozenset(
+# Retry classification turns on ONE question: did the server definitely not
+# perform the operation?
+#
+# A rate-limit rejection is a guarantee that nothing happened, so retrying is
+# always safe. A 5xx or a dropped connection is ambiguous — the write may have
+# been committed and only the response lost — so retrying a non-idempotent
+# mutation there can duplicate a copied file, a folder, a shortcut, or a group
+# membership. Those are retried only when the caller declares the request
+# idempotent.
+_REJECTED_STATUSES = frozenset({429})
+_AMBIGUOUS_STATUSES = frozenset({500, 502, 503, 504})
+
+# Drive signals rate limiting as 403 + reason rather than 429. Every reason
+# here means the request was refused outright.
+_REJECTED_REASONS = frozenset(
     {
         "rateLimitExceeded",
         "userRateLimitExceeded",
         "sharingRateLimitExceeded",
-        "backendError",
-        "internalError",
         "quotaExceeded",
     }
 )
+# Server-side faults reported with a 5xx-style reason. Ambiguous, same as 5xx.
+_AMBIGUOUS_REASONS = frozenset({"backendError", "internalError"})
 
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BASE_DELAY_S = 1.0
@@ -93,14 +104,29 @@ def _http_error_reason(error: HttpError) -> str:
     return str((payload.get("error") or {}).get("status") or "")
 
 
-def is_retryable_http_error(error: HttpError) -> bool:
-    """True when the Drive/Admin API failure is transient."""
+def is_retryable_http_error(error: HttpError, *, idempotent: bool = True) -> bool:
+    """True when the failure is transient AND retrying is safe.
+
+    ``idempotent=False`` restricts retries to failures that prove the server
+    did not perform the operation. See the constants above for why.
+    """
     status = getattr(getattr(error, "resp", None), "status", None)
-    if status in _RETRYABLE_STATUSES:
+    reason = _http_error_reason(error)
+
+    # Definitely refused — safe to retry whatever the operation is.
+    if status in _REJECTED_STATUSES:
         return True
-    # Drive signals rate limiting as 403 + a specific reason, not 429.
     if status == 403:
-        return _http_error_reason(error) in _RETRYABLE_REASONS
+        if reason in _REJECTED_REASONS:
+            return True
+        if reason in _AMBIGUOUS_REASONS:
+            return idempotent
+        return False
+
+    # Outcome unknown: the mutation may already have been committed.
+    if status in _AMBIGUOUS_STATUSES:
+        return idempotent
+
     return False
 
 
@@ -110,12 +136,25 @@ async def execute_with_backoff(
     label: str = "drive-call",
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     base_delay: float = DEFAULT_BASE_DELAY_S,
+    idempotent: bool = True,
 ) -> Any:
     """Execute a googleapiclient request with exponential backoff + jitter.
 
     ``request_factory`` must return a *fresh* request object on every call —
     re-executing a consumed request is not guaranteed to be safe across
     googleapiclient versions.
+
+    ``idempotent`` declares whether replaying the request is harmless. Pass
+    ``False`` for creating mutations — ``files.create``, ``files.copy``,
+    ``groups.insert``, ``members.insert`` — where a retry after an ambiguous
+    failure could produce a duplicate file, folder, shortcut or membership.
+    Those calls still retry on rate-limit rejections, which are proof the
+    operation did not happen; they stop on 5xx and dropped connections, where
+    the write may already have landed. The caller's own preflight check plus a
+    re-run of the manifest is the recovery path.
+
+    Reads default to ``True``: replaying a list or get costs a request and
+    nothing else.
 
     Non-retryable errors propagate immediately so the caller's
     ``handle_http_errors`` wrapper can render them.
@@ -126,11 +165,15 @@ async def execute_with_backoff(
             request = request_factory()
             return await asyncio.to_thread(request.execute)
         except HttpError as error:
-            if not is_retryable_http_error(error) or attempt == max_attempts - 1:
+            if (
+                not is_retryable_http_error(error, idempotent=idempotent)
+                or attempt == max_attempts - 1
+            ):
                 raise
             last_error = error
         except (TimeoutError, ConnectionError) as error:
-            if attempt == max_attempts - 1:
+            # Ambiguous by definition: the request may have reached Google.
+            if not idempotent or attempt == max_attempts - 1:
                 raise
             last_error = error
 

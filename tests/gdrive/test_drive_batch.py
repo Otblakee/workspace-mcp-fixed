@@ -115,6 +115,76 @@ class TestExecuteWithBackoff:
         assert factory.call_count == 1
 
 
+class TestNonIdempotentRetries:
+    """A retry after an ambiguous failure can duplicate a created resource.
+
+    Rate-limit rejections prove the request was refused, so they stay
+    retryable for every operation. 5xx and dropped connections do not, so a
+    creating mutation must surface them instead of replaying the write.
+    """
+
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    def test_ambiguous_statuses_are_not_retryable_for_mutations(self, status):
+        error = _http_error(status)
+        assert drive_batch.is_retryable_http_error(error, idempotent=True) is True
+        assert drive_batch.is_retryable_http_error(error, idempotent=False) is False
+
+    @pytest.mark.parametrize(
+        "reason", ["rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"]
+    )
+    def test_rate_limit_rejections_stay_retryable_for_mutations(self, reason):
+        error = _http_error(403, reason)
+        assert drive_batch.is_retryable_http_error(error, idempotent=False) is True
+
+    def test_429_stays_retryable_for_mutations(self):
+        assert (
+            drive_batch.is_retryable_http_error(_http_error(429), idempotent=False)
+            is True
+        )
+
+    def test_backend_error_reason_is_ambiguous(self):
+        error = _http_error(403, "backendError")
+        assert drive_batch.is_retryable_http_error(error, idempotent=True) is True
+        assert drive_batch.is_retryable_http_error(error, idempotent=False) is False
+
+    @pytest.mark.asyncio
+    async def test_mutation_does_not_replay_after_5xx(self):
+        bad = MagicMock()
+        bad.execute.side_effect = _http_error(503)
+        factory = MagicMock(return_value=bad)
+
+        with pytest.raises(HttpError):
+            await drive_batch.execute_with_backoff(factory, idempotent=False)
+
+        # One attempt only: the write may already have landed at Google.
+        assert factory.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_mutation_does_not_replay_after_connection_loss(self):
+        bad = MagicMock()
+        bad.execute.side_effect = ConnectionError("reset")
+        factory = MagicMock(return_value=bad)
+
+        with pytest.raises(ConnectionError):
+            await drive_batch.execute_with_backoff(factory, idempotent=False)
+
+        assert factory.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_mutation_still_retries_a_rate_limit(self):
+        good = MagicMock()
+        good.execute.return_value = {"id": "abc"}
+        bad = MagicMock()
+        bad.execute.side_effect = _http_error(403, "userRateLimitExceeded")
+        factory = MagicMock(side_effect=[bad, good])
+
+        with patch("gdrive.drive_batch.asyncio.sleep"):
+            result = await drive_batch.execute_with_backoff(factory, idempotent=False)
+
+        assert result == {"id": "abc"}
+        assert factory.call_count == 2
+
+
 class TestPaginate:
     @pytest.mark.asyncio
     async def test_drains_every_page(self):

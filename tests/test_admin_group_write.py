@@ -231,6 +231,72 @@ class TestAddGroupMember:
             )
 
     @pytest.mark.asyncio
+    async def test_demoting_the_last_manager_is_refused(self):
+        """Demoting the sole administrator strands the group exactly as
+        removing them would, so the same guard must apply to both paths."""
+        service = FakeDirectory(
+            group={"id": "g1"},
+            member={"id": "m0", "email": "boss@otbgroup.co.uk", "role": "MANAGER"},
+            members=[
+                {"email": "boss@otbgroup.co.uk", "role": "MANAGER"},
+                {"email": "s@otbgroup.co.uk", "role": "MEMBER"},
+            ],
+        )
+
+        with pytest.raises(UserInputError, match="last MANAGER"):
+            await add_group_member(
+                service,
+                USER,
+                "otb@otbgroup.co.uk",
+                "boss@otbgroup.co.uk",
+                role="MEMBER",
+            )
+
+        assert "members.update" not in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_demotion_allowed_when_another_admin_remains(self):
+        service = FakeDirectory(
+            group={"id": "g1"},
+            member={"id": "m0", "email": "boss@otbgroup.co.uk", "role": "MANAGER"},
+            members=[
+                {"email": "boss@otbgroup.co.uk", "role": "MANAGER"},
+                {"email": "owner@otbgroup.co.uk", "role": "OWNER"},
+            ],
+        )
+
+        result = await add_group_member(
+            service,
+            USER,
+            "otb@otbgroup.co.uk",
+            "boss@otbgroup.co.uk",
+            role="MEMBER",
+        )
+
+        assert service.kwargs_for("members.update")[0]["body"] == {"role": "MEMBER"}
+        assert "MANAGER → MEMBER" in result
+
+    @pytest.mark.asyncio
+    async def test_promotion_never_trips_the_guard(self):
+        """Promoting the sole manager to OWNER keeps an administrator, so it
+        must not be refused."""
+        service = FakeDirectory(
+            group={"id": "g1"},
+            member={"id": "m0", "email": "boss@otbgroup.co.uk", "role": "MANAGER"},
+            members=[{"email": "boss@otbgroup.co.uk", "role": "MANAGER"}],
+        )
+
+        result = await add_group_member(
+            service,
+            USER,
+            "otb@otbgroup.co.uk",
+            "boss@otbgroup.co.uk",
+            role="OWNER",
+        )
+
+        assert "MANAGER → OWNER" in result
+
+    @pytest.mark.asyncio
     async def test_dry_run_changes_nothing(self):
         service = FakeDirectory(group={"id": "g1"})
         result = await add_group_member(

@@ -69,6 +69,7 @@ class FakeDrive:
         self.drives_get_results = None
         self.drives_create_result = {"id": "drv1", "name": "New Drive"}
         self.drives_list_result = {"drives": []}
+        self.drives_hide_error = None
         self.files_get_result = {}
         self.files_list_result = {"files": []}
         self.files_create_result = {}
@@ -102,6 +103,12 @@ class FakeDrive:
             def list(self, **kwargs):
                 parent.calls.append(("drives.list", kwargs))
                 return _request(parent.drives_list_result)
+
+            def hide(self, **kwargs):
+                parent.calls.append(("drives.hide", kwargs))
+                if parent.drives_hide_error is not None:
+                    return _request(parent.drives_hide_error)
+                return _request({"id": kwargs.get("driveId")})
 
         return _Drives()
 
@@ -186,6 +193,37 @@ class TestCreateSharedDrive:
         result = await create_shared_drive(service, USER, name="OTB-Hub", dry_run=True)
         assert "DRY RUN" in result
         assert "drives.create" not in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_hidden_uses_the_dedicated_endpoint(self):
+        """`hidden` is a per-user view preference with its own method. Drive's
+        discovery document does not confirm it is honoured on create, so use
+        the endpoint that unambiguously is."""
+        service = FakeDrive()
+        service.drives_create_result = {"id": "0AB", "name": "Scratch"}
+
+        await create_shared_drive(service, USER, name="Scratch", hidden=True)
+
+        assert "hidden" not in service.kwargs_for("drives.create")[0]["body"]
+        assert service.kwargs_for("drives.hide")[0]["driveId"] == "0AB"
+
+    @pytest.mark.asyncio
+    async def test_hide_is_not_called_when_not_requested(self):
+        service = FakeDrive()
+        await create_shared_drive(service, USER, name="Scratch")
+        assert "drives.hide" not in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_hide_failure_is_reported_without_losing_the_drive(self):
+        """The drive exists by then; swallowing or raising would both mislead."""
+        service = FakeDrive()
+        service.drives_create_result = {"id": "0AB", "name": "Scratch"}
+        service.drives_hide_error = RuntimeError("hide unavailable")
+
+        result = await create_shared_drive(service, USER, name="Scratch", hidden=True)
+
+        assert "0AB" in result
+        assert "hiding it failed" in result
 
     @pytest.mark.asyncio
     async def test_blank_name_rejected(self):
@@ -581,6 +619,50 @@ class TestRevokeDrivePermission:
     async def test_requires_a_selector(self):
         with pytest.raises(UserInputError):
             await revoke_drive_permission(FakeDrive(), USER, "d1")
+
+    @pytest.mark.asyncio
+    async def test_whitespace_principal_is_rejected(self):
+        """A blank principal normalises to '' and would match a permission
+        with no emailAddress — i.e. an existing anyone/domain grant — and
+        revoke that instead."""
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_list_result = {
+            "permissions": [{"id": "pub", "type": "anyone", "role": "reader"}]
+        }
+
+        with pytest.raises(UserInputError, match="blank"):
+            await revoke_drive_permission(service, USER, "d1", principal="   ")
+
+        assert "permissions.delete" not in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_non_email_principal_cannot_match_a_public_permission(self):
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_list_result = {
+            "permissions": [{"id": "pub", "type": "anyone", "role": "reader"}]
+        }
+
+        with pytest.raises(UserInputError, match="must be an email address"):
+            await revoke_drive_permission(service, USER, "d1", principal="anyone")
+
+        assert "permissions.delete" not in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_a_public_permission_can_still_be_removed_by_id(self):
+        """Refusing the malformed principal must not remove the ability to
+        clean up an existing public grant deliberately."""
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_list_result = {
+            "permissions": [{"id": "pub", "type": "anyone", "role": "reader"}]
+        }
+
+        result = await revoke_drive_permission(service, USER, "d1", permission_id="pub")
+
+        assert service.kwargs_for("permissions.delete")[0]["permissionId"] == "pub"
+        assert "Revoked" in result
 
 
 # ---------------------------------------------------------------------------

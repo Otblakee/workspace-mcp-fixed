@@ -722,6 +722,7 @@ async def create_folder_tree(
                         supportsAllDrives=True,
                     ),
                     label="files.create(folder)",
+                    idempotent=False,
                 )
                 known[current_path] = created["id"]
                 created_paths.append(current_path)
@@ -850,6 +851,7 @@ async def _copy_one_row(
                 fields="id, name, mimeType, size, md5Checksum, appProperties",
             ),
             label="files.copy",
+            idempotent=False,
         )
         stamped = (copied.get("appProperties") or {}).get(PROV_SOURCE_ID)
         result.update(
@@ -1085,6 +1087,31 @@ def _compare_one(
     if source.get("mimeType") == FOLDER_MIME_TYPE:
         return None, False
 
+    if source.get("mimeType") == SHORTCUT_MIME_TYPE:
+        # A shortcut's mimeType is under the google-apps namespace, so without
+        # this branch it fell through to "checksumless native file" and was
+        # dismissed as unverifiable — even though the inventory records the
+        # target. A shortcut pointing somewhere wrong is a broken navigation
+        # link, not an unmeasurable document.
+        source_target = source.get("shortcutTargetId")
+        dest_target = dest.get("shortcutTargetId")
+        if source_target and dest_target and source_target == dest_target:
+            return None, False
+        return {
+            "kind": "shortcut_target_differs",
+            "path": path,
+            "source_id": source["id"],
+            "dest_id": dest["id"],
+            "source_target_id": source_target,
+            "dest_target_id": dest_target,
+            "note": (
+                "shortcut targets differ. Expected when the destination was "
+                "populated by copying (targets get new IDs), but the mapping "
+                "has to be confirmed against the copy result log — a shortcut "
+                "left pointing at the wrong item looks identical here."
+            ),
+        }, True
+
     if is_native_google_file(source.get("mimeType")):
         # No checksum exists for native Google files. Say so rather than
         # counting it as a verified match.
@@ -1275,9 +1302,30 @@ async def reconcile_folders(
         source_rows, dest_rows, compare_checksums=compare_checksums
     )
 
+    # A truncated inventory compared only a prefix of the tree. Whatever the
+    # prefix showed, the run proves nothing about the items never examined, so
+    # it must not produce a green verdict or a "clean" report marker that
+    # automation could act on.
+    truncated = bool(source_counts.get("truncated") or dest_counts.get("truncated"))
+
+    if truncated:
+        report_rows: List[Dict[str, Any]] = [
+            {
+                "kind": "inconclusive_truncated",
+                "note": (
+                    f"inventory hit max_items={max_items} on at least one side; "
+                    "items beyond the cap were never compared. Re-run with a "
+                    "higher max_items before treating this as a result."
+                ),
+            }
+        ] + discrepancies
+    else:
+        report_rows = discrepancies or [
+            {"kind": "clean", "note": "no discrepancies found"}
+        ]
+
     _, _, access_line = write_jsonl_report(
-        discrepancies or [{"kind": "clean", "note": "no discrepancies found"}],
-        filename="reconcile_report.jsonl",
+        report_rows, filename="reconcile_report.jsonl"
     )
 
     by_kind: Dict[str, int] = {}
@@ -1287,13 +1335,23 @@ async def reconcile_folders(
     blocking = sum(
         count
         for kind, count in by_kind.items()
-        if kind not in {"unverifiable_native", "checksum_unavailable"}
+        if kind
+        not in {
+            "unverifiable_native",
+            "checksum_unavailable",
+            "shortcut_target_differs",
+        }
     )
-    verdict = (
-        "✅ Reconciliation clean — no blocking discrepancies."
-        if blocking == 0
-        else f"❌ {blocking} blocking discrepancy/discrepancies — do not proceed."
-    )
+    if truncated:
+        verdict = (
+            "⛔ Inconclusive — the inventory was truncated at "
+            f"max_items={max_items}, so items beyond the cap were never "
+            "compared. Do not treat this as a pass."
+        )
+    elif blocking == 0:
+        verdict = "✅ Reconciliation clean — no blocking discrepancies."
+    else:
+        verdict = f"❌ {blocking} blocking discrepancy/discrepancies — do not proceed."
 
     lines = [
         f"Reconciliation: {source_folder_id} → {dest_folder_id}",
@@ -1313,9 +1371,15 @@ async def reconcile_folders(
             f"{len(dest_sweep)} destination item(s) the parent walk could not "
             "reach; they are included in this comparison."
         )
+    if "shortcut_target_differs" in by_kind:
+        lines.append(
+            f"ℹ️ {by_kind['shortcut_target_differs']} shortcut(s) point at "
+            "different targets on the two sides. Expected after a copy-based "
+            "migration, but confirm the mapping against the copy result log."
+        )
     for warning in (source_warnings + dest_warnings)[:10]:
         lines.append(f"⚠️ {warning}")
-    if source_counts.get("truncated") or dest_counts.get("truncated"):
+    if truncated:
         lines.append("⚠️ At least one side hit max_items — this report is incomplete.")
     lines.append(f"Discrepancy report (JSONL): {access_line}")
     return "\n".join(lines)
@@ -1611,6 +1675,7 @@ async def rebuild_hub(
 
     created: List[str] = []
     kept: List[str] = []
+    renamed: List[str] = []
     orphans: List[Dict[str, str]] = []
     removed: List[str] = []
     sections_created: List[str] = []
@@ -1637,6 +1702,7 @@ async def rebuild_hub(
                     supportsAllDrives=True,
                 ),
                 label="files.create(hub section)",
+                idempotent=False,
             )
             sections_created.append(section)
 
@@ -1649,7 +1715,30 @@ async def rebuild_hub(
 
         for target_id, label in desired[section]:
             if target_id in existing_by_target:
-                kept.append(f"{section}/{existing_by_target[target_id][0].get('name')}")
+                shortcut = existing_by_target[target_id][0]
+                current_name = shortcut.get("name") or ""
+                # The registry is the source of truth for the label too. A row
+                # renamed in the registry would otherwise leave the hub showing
+                # the old navigation label forever, which is precisely the
+                # drift this tool promises not to have.
+                if label and label != current_name:
+                    if dry_run:
+                        renamed.append(f"{section}/{current_name} → {label}")
+                    else:
+                        await execute_with_backoff(
+                            lambda sid=shortcut.get("id"), n=label: (
+                                service.files().update(
+                                    fileId=sid,
+                                    body={"name": n},
+                                    fields="id, name",
+                                    supportsAllDrives=True,
+                                )
+                            ),
+                            label="files.update(hub shortcut rename)",
+                        )
+                        renamed.append(f"{section}/{current_name} → {label}")
+                else:
+                    kept.append(f"{section}/{current_name}")
                 continue
             if dry_run:
                 created.append(f"{section}/{label or target_id}")
@@ -1680,6 +1769,7 @@ async def rebuild_hub(
                     )
                 ),
                 label="files.create(hub shortcut)",
+                idempotent=False,
             )
             created.append(f"{section}/{shortcut_name}")
 
@@ -1744,6 +1834,7 @@ async def rebuild_hub(
         "stale_sections_scanned": stale_sections,
         "shortcuts_to_create" if dry_run else "shortcuts_created": len(created),
         "shortcuts_already_correct": len(kept),
+        "shortcuts_to_rename" if dry_run else "shortcuts_renamed": len(renamed),
         "orphan_shortcuts": len(orphans),
         "orphans_removed": len(removed),
     }
@@ -1759,6 +1850,11 @@ async def rebuild_hub(
         lines.extend(f"   + {item}" for item in created[:30])
         if len(created) > 30:
             lines.append(f"   … and {len(created) - 30} more")
+    if renamed:
+        lines.append("Shortcut labels " + ("to update:" if dry_run else "updated:"))
+        lines.extend(f"   ~ {item}" for item in renamed[:20])
+        if len(renamed) > 20:
+            lines.append(f"   … and {len(renamed) - 20} more")
     if orphans and not remove_orphans:
         lines.append(
             f"ℹ️ {len(orphans)} shortcut(s) in the hub do not match the registry. "

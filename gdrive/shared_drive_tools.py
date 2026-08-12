@@ -169,8 +169,6 @@ async def create_shared_drive(
     body: Dict[str, Any] = {"name": drive_name}
     if theme_id:
         body["themeId"] = theme_id
-    if hidden:
-        body["hidden"] = True
 
     # requestId makes drives.create idempotent across our own retries: a
     # replayed request with the same ID returns the drive created the first
@@ -184,6 +182,29 @@ async def create_shared_drive(
     )
 
     drive_id = created.get("id", "")
+
+    # Hiding is a per-user view preference with its own endpoint. Drive's
+    # discovery document flags `restrictions` as unsettable at create time but
+    # says nothing either way about `hidden`, so rather than rely on
+    # create-time behaviour we cannot verify, use the dedicated call and report
+    # honestly if it fails — the drive itself already exists by then.
+    hide_note = ""
+    if hidden:
+        try:
+            await execute_with_backoff(
+                lambda: service.drives().hide(driveId=drive_id),
+                label="drives.hide",
+            )
+        except Exception as exc:  # noqa: BLE001 - the drive was still created
+            logger.warning(
+                "[create_shared_drive] drives.hide failed for %s: %s", drive_id, exc
+            )
+            hide_note = (
+                f"\n   ⚠️ The drive was created but hiding it failed "
+                f"({type(exc).__name__}: {exc}). Hide it from the Drive UI, or "
+                "ignore if visibility does not matter."
+            )
+
     logger.info(
         "[create_shared_drive] created '%s' (%s) for %s",
         drive_name,
@@ -197,6 +218,7 @@ async def create_shared_drive(
         f"   Link: https://drive.google.com/drive/folders/{drive_id}\n"
         "   Next: grant group access with set_drive_permission; OU placement "
         "is an Admin console step."
+        f"{hide_note}"
     )
 
 
@@ -502,6 +524,7 @@ async def set_drive_permission(
                 fields="id, type, role, emailAddress, expirationTime",
             ),
             label="permissions.create",
+            idempotent=False,
         )
         verb = "Granted"
 
@@ -557,25 +580,41 @@ async def revoke_drive_permission(
     """
     if not file_or_drive_id or not file_or_drive_id.strip():
         raise UserInputError("file_or_drive_id is required.")
-    if not principal and not permission_id:
+
+    wanted = (principal or "").strip().lower()
+    wanted_permission_id = (permission_id or "").strip()
+    # Blank-but-supplied is checked first: it is a distinct mistake from
+    # supplying neither, and the caller should be told which one they made.
+    if principal is not None and not wanted:
+        raise UserInputError("principal cannot be blank or whitespace.")
+    if not wanted and not wanted_permission_id:
         raise UserInputError("Pass principal or permission_id.")
+    if wanted and "@" not in wanted:
+        # Without this, a malformed principal normalises to something that can
+        # match a permission carrying no emailAddress — i.e. an existing
+        # `anyone` or `domain` grant — and revoke the wrong one entirely.
+        raise UserInputError(
+            f"principal must be an email address; got {principal!r}. To remove "
+            "a non-email permission (anyone/domain), pass its permission_id."
+        )
 
     target = await _describe_target(service, file_or_drive_id)
     permissions = await _list_permissions(service, file_or_drive_id)
 
-    if permission_id:
-        match = next((p for p in permissions if p.get("id") == permission_id), None)
+    if wanted_permission_id:
+        match = next(
+            (p for p in permissions if p.get("id") == wanted_permission_id), None
+        )
     else:
-        wanted = (principal or "").strip().lower()
         match = next(
             (p for p in permissions if (p.get("emailAddress") or "").lower() == wanted),
             None,
         )
 
     if match is None:
-        wanted = permission_id or principal
         return (
-            f"ℹ️ No matching permission for '{wanted}' on {target['kind']} "
+            f"ℹ️ No matching permission for "
+            f"'{wanted_permission_id or wanted}' on {target['kind']} "
             f"'{target['name']}' ({file_or_drive_id}); nothing to revoke."
         )
 
@@ -745,6 +784,7 @@ async def create_shortcut(
             supportsAllDrives=True,
         ),
         label="files.create(shortcut)",
+        idempotent=False,
     )
 
     details = created.get("shortcutDetails") or {}
