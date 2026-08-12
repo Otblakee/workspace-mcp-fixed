@@ -161,3 +161,30 @@ structural estimates only.
 - **OU placement of new shared drives** stays an Admin console step — there
   is no reliable public API for moving shared drives between OUs. Verify the
   API state before building anything here.
+
+## Restore parallelism in `batch_copy_from_manifest`
+
+Copy rows are issued sequentially. The reason is transport safety, not
+preference: every request is built from the single `service` object injected by
+`@require_google_service`, and `execute_with_backoff` dispatches each request to
+a worker thread via `asyncio.to_thread`. googleapiclient's underlying httplib2
+`Http` object is not thread-safe, so running rows concurrently shared one
+connection across threads and could interleave or corrupt HTTP activity on a
+real run — invisible in the mocked tests, ugly in a live migration.
+
+`batch_size` is now the progress-logging interval rather than a concurrency
+knob.
+
+To restore real parallelism safely, give each concurrent worker its own
+transport. The cleanest route with only public repo APIs is to call a
+`@require_google_service("drive", "drive_full")` helper N times (as
+`_hub_registry_service` does for Sheets) to obtain N independent service
+objects, then pin one per worker slot. `build()` is local when the discovery
+document is bundled — as it is for drive v3 — so the setup cost is small.
+Worth doing only if a live pilot shows sequential throughput is the actual
+bottleneck; Drive's per-user write quota is expected to bind first.
+
+The same caveat applies to the pre-existing concurrent `asyncio.gather` calls in
+`gchat/chat_tools.py` and `gappsscript/apps_script_tools.py`. Those fan out over
+two or a handful of requests rather than thousands of rows, so the exposure is
+much smaller, but the hazard is identical and they were not touched here.
