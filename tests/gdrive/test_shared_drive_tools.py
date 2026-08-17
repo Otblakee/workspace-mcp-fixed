@@ -1243,6 +1243,9 @@ class TestAssertPrincipalIsGroup:
         forbidden = HttpError(resp, b'{"error": {"message": "not an admin"}}')
         directory = MagicMock()
         directory.groups.return_value.get.return_value = _request(forbidden)
+        # A non-admin caller cannot read users either, so the disambiguation
+        # lookup is just as unanswered as the group lookup.
+        directory.users.return_value.get.return_value = _request(forbidden)
 
         with patch.object(
             shared_drive_tools,
@@ -1263,6 +1266,66 @@ class TestAssertPrincipalIsGroup:
             )
         assert "Could not verify" in note
         assert "403" in note
+
+    @pytest.mark.asyncio
+    async def test_403_for_a_user_address_is_a_definitive_refusal(self):
+        """Found live: the Directory answers groups.get with 403, not 404, when
+        the key belongs to a person — with credentials that resolve real groups
+        fine. Reporting that as 'lookup failed, try allow_unverified_group'
+        pointed the operator at the override in exactly the case where the
+        override creates the individual grant we are preventing."""
+        resp = MagicMock()
+        resp.status = 403
+        forbidden = HttpError(resp, b'{"error": {"message": "Not Authorized"}}')
+        directory = MagicMock()
+        directory.groups.return_value.get.return_value = _request(forbidden)
+        # The same address DOES resolve as a user.
+        directory.users.return_value.get.return_value = _request(
+            {"id": "u1", "primaryEmail": "katie@otbgroup.co.uk"}
+        )
+
+        with patch.object(
+            shared_drive_tools,
+            "_directory_service",
+            new=AsyncMock(return_value=directory),
+        ):
+            with pytest.raises(UserInputError, match="is a user account"):
+                await shared_drive_tools.assert_principal_is_group(
+                    "katie@otbgroup.co.uk",
+                    user_google_email=USER,
+                    allow_unverified_group=False,
+                )
+
+            # And the override must NOT rescue it: this is a definite answer.
+            with pytest.raises(UserInputError, match="is a user account"):
+                await shared_drive_tools.assert_principal_is_group(
+                    "katie@otbgroup.co.uk",
+                    user_google_email=USER,
+                    allow_unverified_group=True,
+                )
+
+    @pytest.mark.asyncio
+    async def test_403_that_is_not_a_user_stays_overridable(self):
+        """A genuine authorisation failure is still 'unanswered', so the escape
+        hatch must keep working for the deployments it exists for."""
+        resp = MagicMock()
+        resp.status = 403
+        forbidden = HttpError(resp, b'{"error": {"message": "Not Authorized"}}')
+        directory = MagicMock()
+        directory.groups.return_value.get.return_value = _request(forbidden)
+        directory.users.return_value.get.return_value = _request(forbidden)
+
+        with patch.object(
+            shared_drive_tools,
+            "_directory_service",
+            new=AsyncMock(return_value=directory),
+        ):
+            note = await shared_drive_tools.assert_principal_is_group(
+                "team@otbgroup.co.uk",
+                user_google_email=USER,
+                allow_unverified_group=True,
+            )
+        assert "Could not verify" in note
 
     def test_helper_requests_the_scope_groups_get_actually_needs(self):
         """groups.get needs the group-read scope. Declaring only the

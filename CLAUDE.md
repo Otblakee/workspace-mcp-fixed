@@ -472,12 +472,36 @@ Renaming the new tool was the lower-risk option. The legacy sharing tools
 `update_drive_permission`, `remove_drive_permission`, `transfer_drive_ownership`)
 all stay blocked — the guarded tools are additive, not a relaxation.
 
-**Groups-only guardrail** (`drive_batch.resolve_principal`). The declared
-permission `type` is what makes it fail closed: default `type=group` means
-Drive itself rejects a personal address, so an individual grant cannot happen
-by accident. `allow_individual=True` switches the type to `user` explicitly.
+**Groups-only guardrail** (`shared_drive_tools.assert_principal_is_group`,
+called before `drive_batch.resolve_principal` builds the body). Enforcement is
+a **positive Admin Directory lookup**, not the declared permission `type`.
+
+The original design declared `type=group` and assumed Drive would reject a
+personal address. Live testing disproved that: Drive silently coerces the type
+and creates an individual grant. Never restore that assumption — see the
+2026-08-12 findings in `FOLLOWUPS.md`.
+
+So the address is resolved against `admin.directory.groups.get` first:
+
+- Resolves as a group → grant proceeds.
+- 404/400, or a 403 that `users.get` resolves as a person → refused outright,
+  **no override**. The message names `allow_individual=True` as the explicit,
+  audited way to grant to an individual on purpose. (The Directory answers
+  `groups.get` with 403, not 404, for a personal address — hence the
+  `users.get` disambiguation.)
+- Directory genuinely unreachable or unresolved → refused, unless
+  `allow_unverified_group=True` is passed, which logs loudly and annotates the
+  result.
+
+`allow_individual=True` skips the check and switches the type to `user`.
 `anyone` / `domain` principals are refused in-tool and have no escape hatch —
 no tool on this server can create a public link.
+
+Operational consequence: group grants need a reachable Admin Directory service.
+The OTB deployment has the `gadmin` read tools enabled, so the required scopes
+(`admin.directory.group.readonly`, `.group.member.readonly`,
+`.user.readonly`) are already granted. A drive-only deployment must enable
+`gadmin` or pass `allow_unverified_group=True`.
 
 ### P2/P3 — migration engine
 

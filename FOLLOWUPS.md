@@ -312,3 +312,38 @@ parents.
   loose in the hub root is neither reported nor removed. That matches the
   intended hub shape (sections contain shortcuts), but it means stray items at
   the root are invisible to the drift check.
+
+### Live retest of the guardrail fix (2026-08-12, deploy `cb5d122`)
+
+The fix behaved correctly but **diagnosed the cause wrongly**, in a way that
+pointed the operator at the one override that would have undone it.
+
+- `set_drive_permission(katie.newton@otbgroup.co.uk, reader)` → refused,
+  nothing created. Correct outcome.
+- But the message read *"Could not determine whether … is a Google Group: the
+  directory lookup failed with HTTP 403 … Check the caller's admin privileges,
+  or pass … allow_unverified_group=True to accept the risk explicitly."*
+- `set_drive_permission(bir-hs@otbgroup.co.uk, fileOrganizer)` → *"No change:
+  group … already has role 'fileOrganizer'"*, on the same credentials.
+
+The second call proves the 403 was not a privilege problem. **The Admin
+Directory answers `groups.get` with 403, not 404, when the key belongs to a
+person.** So the branch that treats "unresolved" as overridable was being
+reached in exactly the case where the override creates the individual grant
+the guardrail exists to prevent.
+
+**The fix.** On a 403, `assert_principal_is_group` now asks
+`users.get(userKey=principal)`. A positive resolution is a definite "not a
+group" and is refused outright with no override — the caller is told to pass
+`allow_individual=True` if an individual grant is genuinely intended, so the
+choice is explicit and auditable. A 403 that does *not* resolve as a user stays
+"unanswered" and keeps honouring `allow_unverified_group=True`, so the escape
+hatch still works for the deployments it exists for.
+
+`_principal_is_a_user` is deliberately one-directional: `False` means "could
+not establish that it is a user", never "it is a group", so the surrounding
+code keeps failing closed on it.
+
+**Scope note:** this needs `admin.directory.user.readonly`, which is already in
+`ADMIN_SCOPES` alongside the group-read scopes the check was using. **No
+consent-screen change and no Render env change.**
