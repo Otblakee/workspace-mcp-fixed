@@ -347,3 +347,18 @@ code keeps failing closed on it.
 **Scope note:** this needs `admin.directory.user.readonly`, which is already in
 `ADMIN_SCOPES` alongside the group-read scopes the check was using. **No
 consent-screen change and no Render env change.**
+
+### Guardrail retest confirmed live (2026-08-17, deploy `b29162a`)
+
+All against the scratch drive `0APbe2x9PvdJhUk9PVA`.
+
+| Check | Result |
+| --- | --- |
+| `set_drive_permission(katie.newton@…, reader)` | Refused: *"is a user account, not a Google Group … pass `allow_individual=True`"*. The misleading "check the caller's admin privileges" wording is gone. |
+| Same call with `allow_unverified_group=True` | **Still refused, identically.** The override does not rescue a definite answer — this is the core property the fix adds. |
+| `set_drive_permission(bir-hs@…, fileOrganizer)` | *"No change: group … already has role"*. Group grants unaffected; no outage. |
+| Same personal address with `allow_individual=True` | Granted, and reported as **`User:`** not `Group:`. The deliberate path still works and labels itself honestly. |
+| `revoke_drive_permission` of that grant | Removed cleanly; `get_drive_file_permissions` shows only the group and the owner left. |
+| `create_folder_tree` dry run, 6 nested paths | `folders_to_create: 7, paths_failed: 0` — the #28 dry-run bug is fixed. The 7th is the implicit `91_Second` intermediate, correctly counted. |
+
+The second and third rows together are the whole point: the same credentials that cannot resolve a personal address as a group *can* resolve a real group, so the 403 was never a privilege problem — it was the Directory's answer for "not a group".
