@@ -351,10 +351,12 @@ consent-screen change and no Render env change.**
 ## Parked out of the group-based access policy branch
 
 - **Cache invalidation on group change.** A user removed from `mcp-staff`
-  keeps their tools for up to `MCP_GROUP_POLICY_CACHE_TTL_S` (300 s). Good
-  enough for leavers whose Google account is suspended at the same time
-  (Google refuses the token immediately). If faster revocation matters, add
-  an authenticated `POST /policy/invalidate` route, or shorten the TTL.
+  keeps their tools for up to `MCP_GROUP_POLICY_CACHE_TTL_S` (300 s)
+  normally, and up to `MCP_GROUP_POLICY_STALE_TTL_S` (3600 s) if the
+  Directory API is unreachable when the cache expires. Good enough for
+  leavers whose Google account is suspended at the same time (Google refuses
+  the token on the next request). If faster revocation matters, add an
+  authenticated `POST /policy/invalidate` route, or shorten both TTLs.
 - **Per-group audit dashboard.** Denied calls now land in the audit sheet as
   `status=denied` with the user's groups in `params_summary`. A weekly
   "who was refused what" pivot would show whether the policy is too tight

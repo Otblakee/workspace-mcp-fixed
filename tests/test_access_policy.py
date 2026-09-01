@@ -268,6 +268,30 @@ class TestDirectorySource:
         with pytest.raises(ap.MembershipLookupError):
             await src.is_member("a@otbgroup.co.uk", STAFF)
 
+    @pytest.mark.asyncio
+    async def test_client_build_failure_is_a_lookup_error_not_a_crash(self):
+        def broken_build():
+            raise ValueError("No key could be detected.")
+
+        src = ap.DirectoryMembershipSource(
+            {"type": "service_account"}, build_service=broken_build
+        )
+        with pytest.raises(ap.MembershipLookupError) as excinfo:
+            await src.is_member("a@otbgroup.co.uk", STAFF)
+        assert excinfo.value.public == "Directory client error"
+
+    def test_public_reason_is_short(self):
+        src, _ = self._source(_http_error(403))
+        with pytest.raises(ap.MembershipLookupError) as excinfo:
+            src._has_member_sync("a@otbgroup.co.uk", STAFF)
+        assert excinfo.value.public == "HTTP 403"
+        assert "googleapis" not in excinfo.value.public
+
+    def test_eager_key_validation(self):
+        with pytest.raises(ap.PolicyError, match="unusable"):
+            ap.DirectoryMembershipSource(BAD_SA_KEY)
+        ap.DirectoryMembershipSource(SA_KEY)  # valid key: no error
+
     def test_default_build_uses_member_readonly_scope_and_subject(self, monkeypatch):
         from google.oauth2 import service_account
         import googleapiclient.discovery as discovery
@@ -294,6 +318,8 @@ class TestDirectorySource:
             {"type": "service_account", "client_email": "sa@x.iam"},
             subject="Oliver@OTBGroup.co.uk",
         )
+        # Construction validated the key once already; measure the build alone.
+        creds.with_subject.reset_mock()
         assert src._default_build() == "service"
         assert captured["scopes"] == [ap.DIRECTORY_MEMBER_READ_SCOPE]
         creds.with_subject.assert_called_once_with("oliver@otbgroup.co.uk")
@@ -393,6 +419,35 @@ class TestResolver:
         assert src.calls == 2
 
     @pytest.mark.asyncio
+    async def test_one_failing_group_fails_the_lookup_and_logs_it(self, caplog):
+        class Mixed(ap.MembershipSource):
+            async def is_member(self, email, group):
+                if group == ADMINS:
+                    raise ap.MembershipLookupError(
+                        "HTTP 403 on admins", public="HTTP 403"
+                    )
+                return True
+
+        r = ap.MembershipResolver(Mixed(), [STAFF, ADMINS])
+        with caplog.at_level("WARNING", logger="core.access_policy"):
+            with pytest.raises(ap.MembershipLookupError) as excinfo:
+                await r.groups_for("a@otbgroup.co.uk")
+        assert excinfo.value.public == "HTTP 403"
+        assert any(
+            ADMINS in rec.message and "failed" in rec.message for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_in_source_is_wrapped(self):
+        class Broken(ap.MembershipSource):
+            async def is_member(self, email, group):
+                raise KeyError("isMember")
+
+        r = ap.MembershipResolver(Broken(), [STAFF])
+        with pytest.raises(ap.MembershipLookupError):
+            await r.groups_for("a@otbgroup.co.uk")
+
+    @pytest.mark.asyncio
     async def test_no_policy_groups_means_no_lookup(self):
         src = _CountingSource()
         r = ap.MembershipResolver(src, [])
@@ -490,6 +545,7 @@ class TestEngineDecide:
             d = await _engine(source=src).decide("k@otbgroup.co.uk", CANDS)
         assert d.source == "lookup_failed"
         assert d.allowed == {"get_my_access"}
+        assert d.reason == "membership lookup unavailable"
         assert any("failing closed" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
@@ -503,13 +559,37 @@ class TestEngineDecide:
 # ---------------------------------------------------------------------------
 
 
-SA_KEY = {"type": "service_account", "client_email": "policy-reader@x.iam"}
+def _generate_sa_key(client_email="policy-reader@x.iam") -> dict:
+    """A structurally valid service-account key (fresh RSA key) so eager
+    credential validation in DirectoryMembershipSource passes."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    return {
+        "type": "service_account",
+        "project_id": "otb-test",
+        "private_key_id": "abc123",
+        "private_key": pem,
+        "client_email": client_email,
+        "client_id": "1234567890",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+
+
+SA_KEY = _generate_sa_key()
+BAD_SA_KEY = {"type": "service_account", "client_email": "truncated@x.iam"}
 
 
 class TestFromEnv:
     def test_default_is_off(self):
         eng = ap.AccessPolicyEngine.from_env({})
-        assert not eng.enabled and eng.policy is None
+        assert not eng.enabled and eng.resolver is None
 
     def test_invalid_mode_rejected(self):
         with pytest.raises(ap.PolicyError):
@@ -576,6 +656,62 @@ class TestFromEnv:
         with pytest.raises(ap.PolicyError):
             ap.AccessPolicyEngine.from_env({ap.MODE_ENV: "enforce", **extra})
 
+    def test_malformed_service_account_key_fails_at_engine_build(self):
+        env = {
+            ap.MODE_ENV: "enforce",
+            ap.SA_JSON_B64_ENV: base64.b64encode(
+                json.dumps(BAD_SA_KEY).encode()
+            ).decode(),
+        }
+        with pytest.raises(ap.PolicyError, match="unusable"):
+            ap.AccessPolicyEngine.from_env(env)
+
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+    def test_non_finite_ttl_rejected(self, value):
+        with pytest.raises(ap.PolicyError, match="finite"):
+            ap.AccessPolicyEngine.from_env(
+                {
+                    ap.MODE_ENV: "enforce",
+                    ap.CACHE_TTL_ENV: value,
+                    ap.STATIC_MEMBERS_ENV: "{}",
+                }
+            )
+
+    def test_policy_path_that_is_a_directory_is_a_policy_error(self, tmp_path):
+        with pytest.raises(ap.PolicyError, match="not a file"):
+            ap.AccessPolicyEngine.from_env(
+                {ap.MODE_ENV: "enforce", ap.FILE_ENV: str(tmp_path)}
+            )
+
+    def test_off_mode_with_broken_policy_records_error_but_stays_off(
+        self, tmp_path, caplog
+    ):
+        with caplog.at_level("ERROR", logger="core.access_policy"):
+            eng = ap.AccessPolicyEngine.from_env(
+                {ap.FILE_ENV: str(tmp_path / "missing.yaml")}
+            )
+        assert not eng.enabled
+        assert eng.policy is None
+        assert "not found" in (eng.policy_error or "")
+        assert any("gadmin_write will refuse" in r.message for r in caplog.records)
+
+    def test_off_mode_loads_policy_for_the_guard(self):
+        eng = ap.AccessPolicyEngine.from_env({})
+        assert not eng.enabled
+        assert eng.policy is not None and eng.policy.is_policy_group(ADMINS)
+
+    def test_validate_at_startup_raises_under_enforce_with_bad_policy(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv(ap.MODE_ENV, "enforce")
+        monkeypatch.setenv(ap.FILE_ENV, str(tmp_path / "missing.yaml"))
+        ap.set_engine(None)
+        try:
+            with pytest.raises(ap.PolicyError):
+                ap.validate_at_startup()
+        finally:
+            ap.set_engine(None)
+
     def test_custom_policy_file(self, tmp_path):
         f = tmp_path / "p.yaml"
         f.write_text(f"groups:\n  {STAFF}:\n    allow: [gmail.core]\n")
@@ -606,6 +742,25 @@ class TestIsPolicyGroup:
         try:
             assert ap.is_policy_group("ops-acl@otbgroup.co.uk")
             assert not ap.is_policy_group(ADMINS)
+        finally:
+            ap.set_engine(None)
+
+    def test_unloadable_policy_fails_closed_in_off_mode(self, monkeypatch, tmp_path):
+        monkeypatch.delenv(ap.MODE_ENV, raising=False)
+        monkeypatch.setenv(ap.FILE_ENV, str(tmp_path / "missing.yaml"))
+        ap.set_engine(None)
+        try:
+            assert ap.is_policy_group("anything@otbgroup.co.uk") is True
+            assert ap.policy_group_emails() == frozenset()
+        finally:
+            ap.set_engine(None)
+
+    def test_policy_group_emails_from_shipped_file(self, monkeypatch):
+        monkeypatch.delenv(ap.MODE_ENV, raising=False)
+        monkeypatch.delenv(ap.FILE_ENV, raising=False)
+        ap.set_engine(None)
+        try:
+            assert {ADMINS, STAFF} <= ap.policy_group_emails()
         finally:
             ap.set_engine(None)
 

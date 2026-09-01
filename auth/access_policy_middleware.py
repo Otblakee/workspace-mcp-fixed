@@ -39,7 +39,17 @@ from core.access_policy import (
 logger = logging.getLogger(__name__)
 
 
-def _transport_is_stdio() -> bool:
+def _transport_is_stdio(context: MiddlewareContext) -> bool:
+    """stdio has no OAuth identity, so the policy is skipped there.
+
+    Prefer the request's own transport (FastMCP stamps it on the Context);
+    fall back to the process-wide mode only when the context does not carry
+    one. Anything unknown counts as *not* stdio, so the policy applies.
+    """
+    ctx = getattr(context, "fastmcp_context", None)
+    transport = getattr(ctx, "transport", None) if ctx is not None else None
+    if isinstance(transport, str):
+        return transport == "stdio"
     from core.config import get_transport_mode
 
     return get_transport_mode() == "stdio"
@@ -114,19 +124,24 @@ class AccessPolicyMiddleware(Middleware):
             return self._engine_override
         try:
             return get_engine()
-        except PolicyError as exc:
-            if self._engine_error != str(exc):
-                self._engine_error = str(exc)
+        except Exception as exc:
+            # PolicyError carries a message written for the operator (a
+            # selector typo, a missing file); anything else is an unexpected
+            # crash whose text may embed paths, so only its type is shown.
+            shown = str(exc) if isinstance(exc, PolicyError) else type(exc).__name__
+            if self._engine_error != shown:
+                self._engine_error = shown
                 logger.error(
                     "access policy: policy failed to load, denying all tool "
                     "access until it is fixed: %s",
                     exc,
+                    exc_info=not isinstance(exc, PolicyError),
                 )
             return None
 
     async def on_list_tools(self, context: MiddlewareContext, call_next) -> Sequence:
         tools = await call_next(context)
-        if _transport_is_stdio():
+        if _transport_is_stdio(context):
             return tools
         engine = self._engine()
         if engine is None:
@@ -147,7 +162,7 @@ class AccessPolicyMiddleware(Middleware):
         return kept
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
-        if _transport_is_stdio():
+        if _transport_is_stdio(context):
             return await call_next(context)
         started = time.perf_counter()
         tool_name = getattr(context.message, "name", None) or ""

@@ -101,6 +101,13 @@ async def _record_rejection(
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug(f"Could not record auth rejection on context: {exc}")
+    # A rejected request must not inherit an identity an earlier request in
+    # the same MCP session left in session-scoped state.
+    for key in ("authenticated_user_email", "authenticated_via", "access_token"):
+        try:
+            await context.fastmcp_context.delete_state(key)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Could not clear stale auth state {key}: {exc}")
 
 
 async def _raise_if_rejected(context: MiddlewareContext) -> None:
@@ -135,6 +142,7 @@ class AuthInfoMiddleware(Middleware):
 
         authenticated_user = None
         auth_via = None
+        rejected = False
 
         # First check if FastMCP has already validated an access token
         try:
@@ -154,6 +162,7 @@ class AuthInfoMiddleware(Middleware):
                             f"Rejecting FastMCP-validated token for {user_email}: {reason}"
                         )
                         access_token = None
+                        rejected = True
                         await _record_rejection(context, user_email, reason)
                     else:
                         logger.info(
@@ -177,8 +186,10 @@ class AuthInfoMiddleware(Middleware):
         except Exception as e:
             logger.debug(f"Could not get FastMCP access_token: {e}")
 
-        # Try to get the HTTP request to extract Authorization header
-        if not authenticated_user:
+        # Try to get the HTTP request to extract Authorization header.
+        # A verified-but-rejected identity never falls through to weaker
+        # sources (bearer header, stdio session, MCP-session binding).
+        if not authenticated_user and not rejected:
             try:
                 # Use the new FastMCP method to get HTTP headers
                 headers = get_http_headers()
@@ -230,6 +241,7 @@ class AuthInfoMiddleware(Middleware):
                                                 f"{user_email or '<no-email>'}: {reason}"
                                             )
                                             verified_auth = None
+                                            rejected = True
                                             await _record_rejection(
                                                 context, user_email, reason
                                             )
@@ -336,7 +348,7 @@ class AuthInfoMiddleware(Middleware):
 
         # After trying HTTP headers, check for other authentication methods
         # This consolidates all authentication logic in the middleware
-        if not authenticated_user:
+        if not authenticated_user and not rejected:
             logger.debug(
                 "No authentication found via bearer token, checking other methods"
             )
@@ -495,6 +507,7 @@ class AuthInfoMiddleware(Middleware):
             await self._process_request_for_auth(context)
         except Exception as e:
             logger.error(f"Error resolving identity for tools/list: {e}", exc_info=True)
+        await _raise_if_rejected(context)
         return await call_next(context)
 
     async def on_get_prompt(self, context: MiddlewareContext, call_next):
@@ -503,6 +516,7 @@ class AuthInfoMiddleware(Middleware):
 
         try:
             await self._process_request_for_auth(context)
+            await _raise_if_rejected(context)
 
             logger.debug("Passing prompt to next handler")
             result = await call_next(context)
@@ -511,9 +525,11 @@ class AuthInfoMiddleware(Middleware):
 
         except Exception as e:
             # Check if this is an authentication error - don't log traceback for these
-            if "GoogleAuthenticationError" in str(
-                type(e)
-            ) or "Access denied: Cannot retrieve credentials" in str(e):
+            if (
+                isinstance(e, AuthorizationError)
+                or "GoogleAuthenticationError" in str(type(e))
+                or "Access denied: Cannot retrieve credentials" in str(e)
+            ):
                 logger.info(f"Authentication check failed in prompt: {e}")
             else:
                 logger.error(f"Error in on_get_prompt middleware: {e}", exc_info=True)

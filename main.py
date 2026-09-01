@@ -485,6 +485,21 @@ def main():
         # Set transport mode for OAuth callback handling
         set_transport_mode(args.transport)
 
+        # Group access policy: fail the boot, not the first request, if the
+        # policy or its configuration is unusable under enforce mode.
+        from core.access_policy import PolicyError, validate_at_startup
+
+        try:
+            validate_at_startup()
+        except PolicyError as e:
+            safe_print(f"❌ Group access policy failed to load: {e}")
+            safe_print(
+                "   Fix core/group_policy.yaml / MCP_GROUP_POLICY_* or set "
+                "MCP_GROUP_POLICY_MODE=off, then redeploy."
+            )
+            logger.error(f"Group access policy failed to load: {e}")
+            sys.exit(1)
+
         # Configure auth initialization for FastMCP lifecycle events
         if args.transport == "streamable-http":
             configure_server_for_http()

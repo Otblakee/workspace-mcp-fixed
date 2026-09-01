@@ -294,7 +294,43 @@ class AttachmentStorage:
             for file_id in expired_ids:
                 self._cleanup_file(file_id)
 
-        return len(expired_ids)
+            # Metadata lives in memory only, so every file written before the
+            # last restart is invisible to the loop above and would sit on
+            # disk forever. Sweep untracked files by mtime with the same
+            # expiry, so the store can never accumulate other users' downloads.
+            tracked = {Path(m["file_path"]).resolve() for m in self._metadata.values()}
+            orphans_removed = self._remove_untracked_expired(now, tracked)
+
+        return len(expired_ids) + orphans_removed
+
+    def _remove_untracked_expired(self, now: datetime, tracked: set) -> int:
+        """Unlink files in STORAGE_DIR that no metadata entry references and
+        whose mtime is older than the expiry window. Caller holds the lock."""
+        removed = 0
+        try:
+            if not STORAGE_DIR.is_dir():
+                return 0
+            cutoff = now - timedelta(seconds=self.expiration_seconds)
+            for entry in STORAGE_DIR.iterdir():
+                try:
+                    if not entry.is_file() or entry.resolve() in tracked:
+                        continue
+                    if datetime.fromtimestamp(entry.stat().st_mtime) > cutoff:
+                        continue
+                    entry.unlink()
+                    removed += 1
+                    logger.debug(f"Deleted untracked expired attachment: {entry}")
+                except FileNotFoundError:
+                    continue
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to delete untracked attachment {entry}: {e}"
+                    )
+        except Exception as e:
+            logger.warning(f"Untracked attachment sweep failed: {e}")
+        if removed:
+            logger.info(f"Removed {removed} untracked expired attachment file(s)")
+        return removed
 
 
 # Global instance

@@ -28,6 +28,9 @@ class FakeCtx:
     async def get_state(self, key):
         return self.state.get(key)
 
+    async def delete_state(self, key):
+        self.state.pop(key, None)
+
 
 def _context():
     return SimpleNamespace(fastmcp_context=FakeCtx(), message=SimpleNamespace(name="x"))
@@ -72,6 +75,37 @@ class TestListToolsHook:
         monkeypatch.setattr(mw, "_process_request_for_auth", boom)
         call_next = AsyncMock(return_value=["tools"])
         assert await mw.on_list_tools(_context(), call_next) == ["tools"]
+
+
+class TestListToolsRejection:
+    @pytest.mark.asyncio
+    async def test_rejected_identity_gets_no_listing(self, monkeypatch, http_mode):
+        monkeypatch.setenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "otbgroup.co.uk")
+        monkeypatch.setattr(
+            aim, "get_access_token", lambda: _Token("mallory@evil.example")
+        )
+        call_next = AsyncMock(return_value=["tools"])
+        with pytest.raises(AuthorizationError):
+            await aim.AuthInfoMiddleware().on_list_tools(_context(), call_next)
+        call_next.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejection_clears_identity_left_by_an_earlier_request(
+        self, monkeypatch, http_mode
+    ):
+        monkeypatch.setenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "otbgroup.co.uk")
+        monkeypatch.setattr(
+            aim, "get_access_token", lambda: _Token("mallory@evil.example")
+        )
+        ctx = _context()
+        # Session-scoped state from a previous, legitimate request.
+        ctx.fastmcp_context.state["authenticated_user_email"] = "alice@otbgroup.co.uk"
+        ctx.fastmcp_context.state["authenticated_via"] = "fastmcp_oauth"
+        ctx.fastmcp_context.session_id = "session-1"
+        with pytest.raises(AuthorizationError):
+            await aim.AuthInfoMiddleware().on_call_tool(ctx, AsyncMock())
+        assert "authenticated_user_email" not in ctx.fastmcp_context.state
+        assert "authenticated_via" not in ctx.fastmcp_context.state
 
 
 class TestDomainRejectionIsExplicit:

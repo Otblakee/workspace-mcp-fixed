@@ -2086,6 +2086,19 @@ async def restore_drive_file(
             "update_drive_file to move an active file."
         )
 
+    # The holding folder is shared by every user who can soft-delete, so
+    # without this check any of them could pull another user's soft-deleted
+    # file out of it and drop it into a folder of their choosing. Only the
+    # account that soft-deleted a file restores it through this server.
+    deleted_by = (app_props.get("mcp_deleted_by") or "").strip().lower()
+    caller = (user_google_email or "").strip().lower()
+    if deleted_by and deleted_by != caller:
+        raise Exception(
+            f"'{current.get('name')}' was soft-deleted by {deleted_by}; only that "
+            "account can restore it through this server. Ask them to restore "
+            "it, or have a Drive admin move it back directly."
+        )
+
     if target_folder_id:
         destinations = [await resolve_folder_id(service, target_folder_id)]
     else:

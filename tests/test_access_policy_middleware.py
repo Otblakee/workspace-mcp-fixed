@@ -73,7 +73,7 @@ def _engine(members, mode="enforce"):
 
 @pytest.fixture
 def http_transport(monkeypatch):
-    monkeypatch.setattr(apm, "_transport_is_stdio", lambda: False)
+    monkeypatch.setattr(apm, "_transport_is_stdio", lambda ctx: False)
 
 
 @pytest.fixture
@@ -96,7 +96,7 @@ TOOLS = (
 class TestListTools:
     @pytest.mark.asyncio
     async def test_stdio_passthrough(self, monkeypatch):
-        monkeypatch.setattr(apm, "_transport_is_stdio", lambda: True)
+        monkeypatch.setattr(apm, "_transport_is_stdio", lambda ctx: True)
         mw = apm.AccessPolicyMiddleware(_engine({}))
         call_next = AsyncMock(return_value=_tools(*TOOLS))
         out = await mw.on_list_tools(_mw_context(), call_next)
@@ -140,7 +140,7 @@ class TestListTools:
 class TestCallTool:
     @pytest.mark.asyncio
     async def test_stdio_passthrough(self, monkeypatch):
-        monkeypatch.setattr(apm, "_transport_is_stdio", lambda: True)
+        monkeypatch.setattr(apm, "_transport_is_stdio", lambda ctx: True)
         mw = apm.AccessPolicyMiddleware(_engine({}))
         call_next = AsyncMock(return_value="ok")
         assert await mw.on_call_tool(_mw_context(), call_next) == "ok"
@@ -234,6 +234,43 @@ class TestCallTool:
         mw = apm.AccessPolicyMiddleware(_engine({}, mode="off"))
         call_next = AsyncMock(return_value="ok")
         assert await mw.on_call_tool(_mw_context(None), call_next) == "ok"
+
+
+class TestTransportDetection:
+    def test_context_transport_wins_over_process_mode(self, monkeypatch):
+        import core.config as cfg
+
+        monkeypatch.setattr(cfg, "get_transport_mode", lambda: "stdio")
+        ctx = _mw_context("k@otbgroup.co.uk")
+        ctx.fastmcp_context.transport = "http"
+        assert apm._transport_is_stdio(ctx) is False
+        ctx.fastmcp_context.transport = "stdio"
+        assert apm._transport_is_stdio(ctx) is True
+
+    def test_falls_back_to_process_mode_without_context_transport(self, monkeypatch):
+        import core.config as cfg
+
+        monkeypatch.setattr(cfg, "get_transport_mode", lambda: "streamable-http")
+        assert apm._transport_is_stdio(_mw_context("k@otbgroup.co.uk")) is False
+        assert apm._transport_is_stdio(_mw_context(with_ctx=False)) is False
+        monkeypatch.setattr(cfg, "get_transport_mode", lambda: "stdio")
+        assert apm._transport_is_stdio(_mw_context("k@otbgroup.co.uk")) is True
+
+
+class TestUnexpectedLoadErrors:
+    @pytest.mark.asyncio
+    async def test_non_policy_exception_denies_without_leaking_text(
+        self, http_transport, audit_submit, monkeypatch
+    ):
+        def boom():
+            raise IsADirectoryError("/etc/secrets")
+
+        monkeypatch.setattr(apm, "get_engine", boom)
+        mw = apm.AccessPolicyMiddleware()
+        with pytest.raises(AuthorizationError) as excinfo:
+            await mw.on_call_tool(_mw_context("k@otbgroup.co.uk"), AsyncMock())
+        assert "IsADirectoryError" in str(excinfo.value)
+        assert "/etc/secrets" not in str(excinfo.value)
 
 
 class TestServerWiring:

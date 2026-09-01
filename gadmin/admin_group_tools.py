@@ -51,7 +51,9 @@ logger = logging.getLogger(__name__)
 # the group itself, not just its membership.
 VALID_MEMBER_ROLES = ("MEMBER", "MANAGER", "OWNER")
 
-_GROUP_FIELDS = "id, email, name, description, directMembersCount, adminCreated"
+_GROUP_FIELDS = (
+    "id, email, name, description, directMembersCount, adminCreated, aliases"
+)
 
 
 def _normalise_email(value: str, *, field: str) -> str:
@@ -78,6 +80,73 @@ def _refuse_if_policy_group(group_key: str) -> None:
             "group (core/group_policy.yaml). Membership of policy groups is "
             "managed in the Google Admin console only, never through this "
             "server."
+        )
+
+
+# Nested groups are honoured by the access policy (members.hasMember reports
+# transitive membership), so a group nested inside a policy group is, for
+# access purposes, part of it. Walk that far and no further.
+_NESTING_MAX_DEPTH = 6
+
+
+async def _groups_nested_in_policy_groups(service) -> set[str]:
+    """Emails of every group that is a direct or nested member of any policy
+    group. Raises UserInputError (fail closed) if the Directory cannot be
+    read for a policy group that exists."""
+    from core.access_policy import policy_group_emails
+
+    seen: set[str] = set()
+    frontier = sorted(policy_group_emails())
+    depth = 0
+    while frontier and depth < _NESTING_MAX_DEPTH:
+        next_frontier: List[str] = []
+        for parent in frontier:
+            try:
+                members: List[Dict[str, Any]] = await paginate(
+                    lambda token, parent=parent: service.members().list(
+                        groupKey=parent, maxResults=200, pageToken=token
+                    ),
+                    items_key="members",
+                    label="directory.members.list",
+                )
+            except HttpError as error:
+                status = getattr(getattr(error, "resp", None), "status", None)
+                if status == 404:
+                    continue  # policy group not created yet: nothing nested
+                raise UserInputError(
+                    f"Refusing the group edit: could not read the members of "
+                    f"access-policy group '{parent}' to check for nesting "
+                    f"(HTTP {status}). Retry once the Directory is reachable."
+                ) from error
+            for member in members:
+                if (member.get("type") or "").upper() != "GROUP":
+                    continue
+                email = (member.get("email") or "").strip().lower()
+                if email and email not in seen:
+                    seen.add(email)
+                    next_frontier.append(email)
+        frontier = next_frontier
+        depth += 1
+    return seen
+
+
+async def _refuse_if_resolves_to_policy_group(service, group: Dict[str, Any]) -> None:
+    """Second layer of the policy-group guard, on the Directory's view.
+
+    The first layer checks the literal address the caller typed. This one
+    checks what that address *resolves to*: the group's primary email, every
+    alias it carries, and whether it is nested inside a policy group (which
+    would confer that group's access via transitive membership).
+    """
+    for candidate in [group.get("email"), *(group.get("aliases") or [])]:
+        if candidate:
+            _refuse_if_policy_group(str(candidate))
+    primary = (group.get("email") or "").strip().lower()
+    if primary and primary in await _groups_nested_in_policy_groups(service):
+        raise UserInputError(
+            f"Refusing to modify '{primary}': it is nested inside an MCP "
+            "access-policy group, so its members inherit that group's tool "
+            "access. Manage it in the Google Admin console only."
         )
 
 
@@ -285,6 +354,9 @@ async def add_group_member(
         raise UserInputError(
             f"Group '{group_key}' does not exist. Create it first with create_group."
         )
+    await _refuse_if_resolves_to_policy_group(service, group)
+    # Mutate by the canonical address, never by an alias the caller supplied.
+    group_key = (group.get("email") or group_key).strip().lower()
 
     existing = await _get_member(service, group_key, member_key)
     existing_role = (existing.get("role") or "").upper() if existing else ""
@@ -400,6 +472,8 @@ async def remove_group_member(
     group = await _get_group(service, group_key)
     if group is None:
         raise UserInputError(f"Group '{group_key}' does not exist.")
+    await _refuse_if_resolves_to_policy_group(service, group)
+    group_key = (group.get("email") or group_key).strip().lower()
 
     existing = await _get_member(service, group_key, member_key)
     if existing is None:

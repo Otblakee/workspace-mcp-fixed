@@ -48,12 +48,15 @@ account (``MCP_GROUP_POLICY_SA_JSON_FILE`` or ``..._SA_JSON_B64``) that holds
 only the Groups Reader admin role, never a user's token: a user's own
 credentials must not be the thing that decides that user's permissions.
 
-Failure behaviour is fail-closed: if the Directory cannot be reached and
+Failure behaviour is fail-closed. If any policy group cannot be checked and
 there is no cached answer (or it is older than
 ``MCP_GROUP_POLICY_STALE_TTL_S``), the user gets ``ALWAYS_ALLOWED_TOOLS``
-only. ``MCP_GROUP_POLICY_BREAKGLASS_EMAILS`` names accounts that bypass the
-lookup entirely (full access, loudly logged) so an outage of the Directory
-API cannot lock the owner out of their own server.
+only. A cached answer is served for up to ``MCP_GROUP_POLICY_CACHE_TTL_S``
+normally and up to ``MCP_GROUP_POLICY_STALE_TTL_S`` while the Directory is
+unreachable, so a user removed from a group keeps their tools for at most
+that long. ``MCP_GROUP_POLICY_BREAKGLASS_EMAILS`` names accounts that bypass
+the lookup entirely (full access, loudly logged) so an outage of the
+Directory API cannot lock the owner out of their own server.
 """
 
 from __future__ import annotations
@@ -61,6 +64,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -68,6 +72,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Set
 
 import yaml
+from googleapiclient.errors import HttpError
 
 from core.tool_policy import BLOCKED_TOOLS
 from core.tool_tier_loader import ToolTierLoader
@@ -107,11 +112,20 @@ TIER_ORDER = ("core", "extended", "complete")
 
 
 class PolicyError(ValueError):
-    """The policy file is malformed or references something that does not exist."""
+    """The policy or its configuration is malformed or references something
+    that does not exist."""
 
 
 class MembershipLookupError(RuntimeError):
-    """The membership source could not answer (privilege, network, quota)."""
+    """The membership source could not answer (privilege, network, quota).
+
+    ``public`` is the short, safe-to-show reason (e.g. ``"HTTP 403"``); the
+    full message, which may embed Google's error text and URLs, is for logs.
+    """
+
+    def __init__(self, message: str, public: str = "membership lookup unavailable"):
+        super().__init__(message)
+        self.public = public
 
 
 def _norm_email(value: Any) -> str:
@@ -130,7 +144,12 @@ class ToolCatalogue:
 
     def _load(self) -> Dict[str, Dict[str, List[str]]]:
         if self._by_service is None:
-            raw = self._loader._load_config()
+            try:
+                raw = self._loader._load_config()
+            except Exception as exc:  # missing/invalid tool_tiers.yaml
+                raise PolicyError(f"cannot load tool catalogue: {exc}") from exc
+            if not isinstance(raw, dict):
+                raise PolicyError("tool catalogue is not a mapping")
             self._by_service = {
                 svc: {tier: list(tools or []) for tier, tools in (cfg or {}).items()}
                 for svc, cfg in raw.items()
@@ -298,10 +317,14 @@ def load_policy_file(
     catalogue: Optional[ToolCatalogue] = None,
 ) -> GroupPolicy:
     resolved = Path(path or os.getenv(FILE_ENV) or DEFAULT_POLICY_PATH)
-    if not resolved.exists():
-        raise PolicyError(f"policy file not found: {resolved}")
+    if not resolved.is_file():
+        raise PolicyError(f"policy file not found (or not a file): {resolved}")
     try:
-        data = yaml.safe_load(resolved.read_text(encoding="utf-8"))
+        text = resolved.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PolicyError(f"{resolved}: cannot read policy file: {exc}") from exc
+    try:
+        data = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise PolicyError(f"{resolved}: invalid YAML: {exc}") from exc
     return parse_policy(data, source=str(resolved), catalogue=catalogue)
@@ -394,6 +417,9 @@ class DirectoryMembershipSource(MembershipSource):
     * Domain-wide delegation impersonating ``subject`` (an admin user). Only
       if the first option is unavailable; the DWD grant in the Admin console
       must list exactly ``LOOKUP_SCOPES``.
+
+    The key is validated when the source is constructed, so a malformed key
+    fails at startup (under ``enforce``) rather than on the first request.
     """
 
     name = "directory"
@@ -409,29 +435,41 @@ class DirectoryMembershipSource(MembershipSource):
         self._subject = _norm_email(subject) or None
         self._build_service = build_service or self._default_build
         self._missing_groups_reported: Set[str] = set()
+        if build_service is None:
+            # Eager validation: from_service_account_info parses the private
+            # key and raises on a truncated or non-key payload.
+            try:
+                self._credentials()
+            except Exception as exc:
+                raise PolicyError(
+                    f"group policy service-account key is unusable: {exc}"
+                ) from exc
 
-    def _default_build(self):
+    def _credentials(self):
         from google.oauth2 import service_account
-        from googleapiclient.discovery import build
 
         creds = service_account.Credentials.from_service_account_info(
             self._info, scopes=LOOKUP_SCOPES
         )
         if self._subject:
             creds = creds.with_subject(self._subject)
+        return creds
+
+    def _default_build(self):
+        from googleapiclient.discovery import build
+
         return build(
             "admin",
             "directory_v1",
-            credentials=creds,
+            credentials=self._credentials(),
             cache_discovery=False,
             static_discovery=True,
         )
 
     def _has_member_sync(self, email: str, group: str) -> bool:
-        from googleapiclient.errors import HttpError
-
-        service = self._build_service()
+        service = None
         try:
+            service = self._build_service()
             resp = (
                 service.members().hasMember(groupKey=group, memberKey=email).execute()
             )
@@ -453,14 +491,18 @@ class DirectoryMembershipSource(MembershipSource):
                 # a definite "not a member", not an outage.
                 return False
             raise MembershipLookupError(
-                f"Directory hasMember({group}, {email}) failed with HTTP {status}: {error}"
+                f"Directory hasMember({group}, {email}) failed with HTTP {status}: {error}",
+                public=f"HTTP {status if status is not None else 'error'}",
             ) from error
-        except Exception as error:  # network, TLS, auth
+        except MembershipLookupError:
+            raise
+        except Exception as error:  # client build, network, TLS, auth
             raise MembershipLookupError(
-                f"Directory hasMember({group}, {email}) failed: {error}"
+                f"Directory hasMember({group}, {email}) failed: {error}",
+                public="Directory client error",
             ) from error
         finally:
-            close = getattr(service, "close", None)
+            close = getattr(service, "close", None) if service is not None else None
             if callable(close):
                 try:
                     close()
@@ -481,7 +523,13 @@ class _CacheEntry:
 
 
 class MembershipResolver:
-    """Resolves a user's policy-group memberships, with TTL + stale fallback."""
+    """Resolves a user's policy-group memberships, with TTL + stale fallback.
+
+    Any single policy group that cannot be checked fails the whole lookup
+    (fail-closed: a partial answer could grant less *or* more than the truth,
+    depending on which group failed, so none is trusted). The stale-cache
+    fallback then applies.
+    """
 
     def __init__(
         self,
@@ -517,9 +565,32 @@ class MembershipResolver:
         if not self.policy_groups:
             return frozenset()
         results = await asyncio.gather(
-            *(self.source.is_member(email, g) for g in self.policy_groups)
+            *(self.source.is_member(email, g) for g in self.policy_groups),
+            return_exceptions=True,
         )
-        return frozenset(g for g, is_in in zip(self.policy_groups, results) if is_in)
+        failures = [
+            (g, r)
+            for g, r in zip(self.policy_groups, results)
+            if isinstance(r, BaseException)
+        ]
+        if failures:
+            for g, err in failures:
+                logger.warning(
+                    "group policy: membership check of %s in %s failed: %s",
+                    email,
+                    g,
+                    err,
+                )
+            first = failures[0][1]
+            if isinstance(first, MembershipLookupError):
+                raise first
+            raise MembershipLookupError(
+                f"membership check failed for {len(failures)} of "
+                f"{len(self.policy_groups)} policy groups: {first!r}"
+            ) from (first if isinstance(first, Exception) else None)
+        return frozenset(
+            g for g, is_in in zip(self.policy_groups, results) if is_in is True
+        )
 
     async def groups_for(self, email: str) -> FrozenSet[str]:
         """Policy groups ``email`` belongs to. Raises MembershipLookupError
@@ -562,7 +633,7 @@ class AccessDecision:
     groups: FrozenSet[str]
     allowed: FrozenSet[str]
     source: str  # disabled | policy | breakglass | unauthenticated | lookup_failed
-    reason: str = ""
+    reason: str = ""  # short and safe to show to the caller
 
     def permits(self, tool_name: str) -> bool:
         return tool_name in self.allowed
@@ -578,6 +649,10 @@ class AccessPolicyEngine:
     breakglass: FrozenSet[str] = frozenset()
     catalogue: ToolCatalogue = field(default_factory=ToolCatalogue)
     source_name: str = "none"
+    # Set when the policy file could not be loaded in ``off`` mode. Tool
+    # access is unaffected (off is a pass-through) but the gadmin_write guard
+    # must then fail closed, so it is recorded rather than swallowed.
+    policy_error: Optional[str] = None
 
     @property
     def enabled(self) -> bool:
@@ -643,7 +718,7 @@ class AccessPolicyEngine:
                 groups=frozenset(),
                 allowed=ALWAYS_ALLOWED_TOOLS & cand,
                 source="lookup_failed",
-                reason=str(exc),
+                reason=exc.public,
             )
         allowed = allowed_tools(self.policy, groups, cand, catalogue=self.catalogue)
         return AccessDecision(
@@ -669,15 +744,39 @@ class AccessPolicyEngine:
             if _norm_email(e)
         )
 
+        catalogue = ToolCatalogue()
+
         if mode == "off":
             logger.info(
                 "group policy: %s=off; every authenticated user gets every "
                 "registered tool (single-user behaviour)",
                 MODE_ENV,
             )
-            return cls(mode="off", breakglass=breakglass, source_name="none")
+            # Best-effort load so the gadmin_write guard still knows which
+            # groups are policy groups. A load failure is recorded, not
+            # raised: off mode must stay a pass-through for tool access.
+            policy: Optional[GroupPolicy] = None
+            policy_error: Optional[str] = None
+            try:
+                policy = load_policy_file(env.get(FILE_ENV), catalogue=catalogue)
+            except PolicyError as exc:
+                policy_error = str(exc)
+                logger.error(
+                    "group policy: policy file failed to load (%s). Tool access "
+                    "is unaffected while %s=off, but gadmin_write will refuse "
+                    "every group edit until it is fixed.",
+                    exc,
+                    MODE_ENV,
+                )
+            return cls(
+                mode="off",
+                policy=policy,
+                breakglass=breakglass,
+                catalogue=catalogue,
+                source_name="none",
+                policy_error=policy_error,
+            )
 
-        catalogue = ToolCatalogue()
         policy = load_policy_file(env.get(FILE_ENV), catalogue=catalogue)
         # Validate the tunables up front so a typo fails at startup rather
         # than the first time a membership source happens to be configured.
@@ -756,8 +855,8 @@ def _float_env(env: Dict[str, str], key: str, default: float) -> float:
         value = float(raw)
     except ValueError as exc:
         raise PolicyError(f"{key} must be a number, got {raw!r}") from exc
-    if value < 0:
-        raise PolicyError(f"{key} must be >= 0")
+    if not math.isfinite(value) or value < 0:
+        raise PolicyError(f"{key} must be a finite number >= 0, got {raw!r}")
     return value
 
 
@@ -779,7 +878,11 @@ _engine: Optional[AccessPolicyEngine] = None
 
 
 def get_engine() -> AccessPolicyEngine:
-    """Lazily build the engine from the environment (once per process)."""
+    """Lazily build the engine from the environment (once per process).
+
+    Raises PolicyError (under ``enforce``) when the policy or its
+    configuration is unusable; the middleware turns that into deny-all.
+    """
     global _engine
     if _engine is None:
         _engine = AccessPolicyEngine.from_env()
@@ -792,27 +895,51 @@ def set_engine(engine: Optional[AccessPolicyEngine]) -> None:
     _engine = engine
 
 
+def validate_at_startup() -> AccessPolicyEngine:
+    """Build the engine once at boot so a broken configuration fails the
+    deploy instead of the first user's request. Raises PolicyError."""
+    engine = get_engine()
+    if engine.enabled and engine.resolver is None:
+        logger.error(
+            "group policy: enforce mode without a membership source; only "
+            "break-glass accounts (%d configured) will be able to use tools",
+            len(engine.breakglass),
+        )
+    return engine
+
+
+def policy_group_emails() -> FrozenSet[str]:
+    """Emails of the groups named in the loaded policy; empty when the policy
+    could not be loaded (callers must treat that as "refuse", see
+    ``is_policy_group``)."""
+    try:
+        engine = get_engine()
+    except Exception:
+        return frozenset()
+    if engine.policy is None:
+        return frozenset()
+    return engine.policy.group_emails
+
+
 def is_policy_group(email: str) -> bool:
-    """True when ``email`` is a group named in the loaded policy.
+    """True when ``email`` is a group named in the policy, **or when the
+    policy cannot be loaded at all** (fail closed).
 
     Used by the ``gadmin_write`` tools to refuse membership edits on the
     groups that decide MCP access: those are managed in the Admin console
     only, so a user who can add group members cannot add themselves to the
-    admin group through this server.
+    admin group through this server. The guard is active in every mode.
     """
     try:
         engine = get_engine()
-    except PolicyError as exc:
+    except Exception as exc:
         logger.error("group policy: cannot load policy to check %s: %s", email, exc)
-        # Fail closed for the guard: an unloadable policy must not become a
-        # way to edit policy groups.
         return True
-    policy = engine.policy
-    if policy is None:
-        # Mode off: still protect the groups named in the shipped file so the
-        # guard holds before enforcement is switched on.
-        try:
-            policy = load_policy_file(catalogue=engine.catalogue)
-        except PolicyError:
-            return False
-    return policy.is_policy_group(email)
+    if engine.policy is None:
+        logger.error(
+            "group policy: policy unavailable (%s); refusing group edit on %s",
+            engine.policy_error or "not loaded",
+            email,
+        )
+        return True
+    return engine.policy.is_policy_group(email)
