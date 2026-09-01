@@ -727,3 +727,104 @@ through Google Groups itself.
 **Rollback.** `MCP_GROUP_POLICY_MODE=off` (or unset) makes the middleware a
 pass-through; nothing else changes. The `gadmin_write` guard stays active in
 either mode by design.
+
+## Security review fixes (claude/multi-account-workspace-groups-2dnyhi)
+
+Findings from the multi-user security review that were clear-cut enough to
+fix in the same branch. Each has unit coverage (`tests/test_deploy_config.py`,
+`tests/test_hardening_round2.py`, `tests/test_hardening_round3.py`,
+`tests/test_audit_service_account.py`, `tests/test_policy_group_guard.py`).
+
+- **OAuth proxy state never reached the persistent disk.** `render.yaml`
+  selects the `disk` backend, but the `DiskStore` import needs the
+  `py-key-value-aio[disk]` extra, which was never declared. The import failed
+  on every boot and FastMCP fell back to its own store under `~/.fastmcp`
+  (ephemeral), so every redeploy wiped client registrations and upstream
+  tokens and forced every user to re-authenticate. Fixed in `pyproject.toml`;
+  `FASTMCP_HOME=/data/fastmcp` pins even the fallback store to the disk.
+- **Debug log file.** `mcp_server_debug.log` was an unbounded DEBUG file
+  inside the container holding query strings, identities and API error
+  bodies. It now rotates (10 MiB × 3) and `WORKSPACE_MCP_FILE_LOGGING=false`
+  (set in `render.yaml`) disables it where stdout is already retained.
+- **Audit `error` column leaked query strings.** Google `HttpError` text
+  embeds the request URL, whose query carries the Gmail/Drive search
+  expression. URL query strings are stripped before the row is queued.
+- **Gmail `attachments[].path` over streamable-http** could name any file
+  under the server's home, including other users' relayed downloads. Refused
+  for remote clients (base64 `content` still works), matching the existing
+  gate on `import_to_google_doc` / `create_drive_file`.
+- **Audit sheet readable and editable by every staff user.** See the audit
+  section above: the service-account writer mode removes the need for staff
+  to hold Editor on the Sheet.
+- **Shared soft-delete holding folder.** `restore_drive_file` now refuses a
+  file soft-deleted by another account; the holding folder otherwise let any
+  user who can soft-delete pull another user's file out of it into a folder
+  of their choosing.
+- **Orphaned attachment relay files.** Metadata is in-memory, so files
+  written before a restart were never swept. `cleanup_expired` now also
+  unlinks untracked files older than the expiry.
+- **Explicit domain rejection.** A verified token outside
+  `OAUTH_ALLOWED_EMAIL_DOMAINS` is refused with an `AuthorizationError` on
+  `tools/list`, `tools/call` and `prompts/get`, never falls through to the
+  weaker identity fallbacks, and clears any identity left in session state by
+  an earlier request.
+- **Dynamic client registration allowlist.** `MCP_ALLOWED_CLIENT_REDIRECT_URIS`
+  (see the access-policy section). Until it is set, any party can register
+  an MCP client against this server and phish a consent click.
+
+Findings deliberately **not** fixed in code, with the recommended control:
+
+- **`/attachments/{file_id}` is an unauthenticated capability URL.** Anyone
+  holding the UUID can fetch the file for an hour, which turns a Drive file a
+  user may read into a shareable link outside Google's controls. Mitigation
+  today: unguessable UUID, 1-hour expiry, `Cache-Control: no-store`. Proper
+  fix: retire the relay for Drive downloads in favour of the stateless
+  pattern `get_gmail_attachment_content` already uses (parked in
+  `FOLLOWUPS.md`).
+- **Every registered MCP client gets the full scope set by default**
+  (`valid_scopes` doubles as the DCR default scope). Narrowing it would
+  break clients that do not request scopes explicitly; the per-tool scope
+  check and the group policy are the effective controls.
+- **JWT signing key derived from the OAuth client secret** when
+  `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY` is unset. Set it (it is already
+  in `render.yaml` as a secret placeholder); rotating the client secret then
+  no longer invalidates every session.
+- **Revocation.** There is no revoke endpoint, but FastMCP validates the
+  upstream Google token against `tokeninfo` on every request, so suspending
+  the Google account or revoking the app's access in the Admin console takes
+  effect on the user's next call. That is the leaver procedure.
+- **Attribution fallback `DEFAULT_USER=oli`.** With the service-account
+  writer those rows now reach the Sheet; treat any row carrying
+  `DEFAULT_USER` as an attribution failure to investigate, not as the owner's
+  activity.
+
+### Multi-user rollout checklist (do in this order)
+
+1. Merge this branch; let Render redeploy. Confirm in the logs that the
+   OAuth proxy reports `Using DiskStore` (not a fallback warning) and that
+   `mcp_server_debug.log` is no longer written.
+2. In the GCP project: set the OAuth consent screen **User type to
+   Internal** (removes the 100-test-user cap and the 7-day refresh-token
+   expiry of External+Testing). Set `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY`
+   on Render to a long random secret.
+3. Confirm `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk` and
+   `TOOL_TIER=extended` are set (now in `render.yaml`).
+4. Read the redirect URIs registered by the real clients from the Render
+   logs, then set `MCP_ALLOWED_CLIENT_REDIRECT_URIS` to exactly those
+   patterns.
+5. Create a service account in the GCP project, download its key, share the
+   audit Sheet with it as **Editor** (remove Editor from everyone else, keep
+   Viewer for the owner only), set `AUDIT_SA_JSON_B64`, redeploy, confirm new
+   rows arrive with the correct `user` column.
+6. In the Admin console: create `mcp-admins@`, `mcp-managers@` and
+   `mcp-staff@otbgroup.co.uk` as admin-managed, closed groups (nobody can
+   join; only admins add members). Put the owner in `mcp-admins`. Assign the
+   service account a custom admin role with **Groups → Read** only.
+7. Set `MCP_GROUP_POLICY_SA_JSON_B64` (same or a second key),
+   `MCP_GROUP_POLICY_BREAKGLASS_EMAILS=oliver@otbgroup.co.uk`, then
+   `MCP_GROUP_POLICY_MODE=enforce`; redeploy.
+8. Verify with `get_my_access` as the owner (full set), as a staff test
+   account (staff list), and as an account in no group (`get_my_access`
+   only); make one denied call and confirm the `status=denied` audit row.
+9. Only then add real staff to `mcp-staff@`. Add managers to
+   `mcp-managers@` deliberately: that group can send email.
