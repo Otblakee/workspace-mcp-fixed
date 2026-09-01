@@ -347,3 +347,23 @@ code keeps failing closed on it.
 **Scope note:** this needs `admin.directory.user.readonly`, which is already in
 `ADMIN_SCOPES` alongside the group-read scopes the check was using. **No
 consent-screen change and no Render env change.**
+
+## Parked out of the group-based access policy branch
+
+- **Cache invalidation on group change.** A user removed from `mcp-staff`
+  keeps their tools for up to `MCP_GROUP_POLICY_CACHE_TTL_S` (300 s). Good
+  enough for leavers whose Google account is suspended at the same time
+  (Google refuses the token immediately). If faster revocation matters, add
+  an authenticated `POST /policy/invalidate` route, or shorten the TTL.
+- **Per-group audit dashboard.** Denied calls now land in the audit sheet as
+  `status=denied` with the user's groups in `params_summary`. A weekly
+  "who was refused what" pivot would show whether the policy is too tight
+  before anyone complains.
+- **Google Groups settings check.** The policy groups must be admin-managed
+  and closed (nobody can join, only admins can add members). `gadmin`'s read
+  tools could verify this at startup via `groupssettings.get` if that API is
+  ever enabled; today it is a manual Admin-console check.
+- **Live verification.** Unit scope only. Before `enforce`: `get_my_access` as
+  the owner (expect `*` minus blocked), as a staff test account (expect the
+  staff list), as a user in no group (expect `get_my_access` only), then a
+  denied call to confirm the `status=denied` audit row appears.
