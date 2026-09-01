@@ -2,11 +2,19 @@
 
 Async, buffered, fail-soft. Logger errors never break tool calls.
 
-Auth model: writes use the SAME OAuth credentials each calling user already
-provided to the MCP. No service-account key. The user must hold Sheets write
-scope (every Workspace user enabled here already does, since `sheets` is one
-of the live services) and Editor on the audit Sheet. Trade-offs documented
-in CLAUDE.md."""
+Auth model — two modes:
+
+* **Service-account writer** (``AUDIT_SA_JSON_FILE`` or ``AUDIT_SA_JSON_B64``
+  set): every row is appended by one dedicated service account that is the
+  only Editor on the audit Sheet. Users need no access to the Sheet at all,
+  so no staff member can read, edit, delete or forge another user's rows.
+  Rows attributed to ``DEFAULT_USER`` (identity could not be resolved) are
+  written too, instead of being dropped to stdout. This is the multi-user
+  mode.
+* **Per-user writer** (no service account configured): rows are appended
+  with the calling user's own OAuth credentials, so every user must hold
+  Sheets write scope and Editor on the Sheet. Adequate for a single user;
+  every Editor can read and alter every row. Trade-offs in CLAUDE.md."""
 
 import asyncio
 import functools
@@ -34,6 +42,11 @@ BATCH = int(os.environ.get("AUDIT_BATCH_SIZE", "50"))
 SHUTDOWN_TIMEOUT_S = float(os.environ.get("AUDIT_SHUTDOWN_FLUSH_TIMEOUT_S", "10"))
 DEFAULT_USER = os.environ.get("DEFAULT_USER", "oli")
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+
+# Optional dedicated writer identity (see module docstring). Read lazily so
+# tests and late-set environments are honoured; the parsed key is cached.
+AUDIT_SA_JSON_FILE_ENV = "AUDIT_SA_JSON_FILE"
+AUDIT_SA_JSON_B64_ENV = "AUDIT_SA_JSON_B64"
 
 ENABLED = bool(AUDIT_SHEET_ID)
 
@@ -580,6 +593,48 @@ class AuditLogger:
                 log.error("AUDIT_FALLBACK %s", json.dumps(entry))
 
     async def _flush(self, batch) -> list:
+        sa_sheets = await asyncio.to_thread(self._build_sheets_for_service_account)
+        if sa_sheets is not None:
+            return await self._flush_with_client(sa_sheets, batch)
+        return await self._flush_per_user(batch)
+
+    async def _flush_with_client(self, sheets, batch) -> list:
+        """Write the whole batch through one (service-account) client."""
+        tab = datetime.now(timezone.utc).strftime("%Y-%m")
+        try:
+            if tab != self._current_tab:
+                await asyncio.to_thread(self._ensure_tab, sheets, tab)
+                self._current_tab = tab
+            rows = [
+                [
+                    e.get(h, "") if h != "user" else (e.get("user") or DEFAULT_USER)
+                    for h in HEADERS
+                ]
+                for e in batch
+            ]
+            await asyncio.to_thread(
+                sheets.spreadsheets()
+                .values()
+                .append(
+                    spreadsheetId=AUDIT_SHEET_ID,
+                    range=f"'{tab}'!{_SHEET_RANGE_ALL_COLS}",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": rows},
+                )
+                .execute
+            )
+            return []
+        except Exception as e:
+            log.warning(
+                "Audit append via service account failed (%d rows): %s", len(batch), e
+            )
+            return list(batch)
+        finally:
+            await asyncio.to_thread(sheets.close)
+            gc.collect()
+
+    async def _flush_per_user(self, batch) -> list:
         # Group entries by attributed user. Each user's rows are written with
         # that user's own OAuth credentials so Sheets revision history matches
         # the actor recorded in the row, and so one teammate's audit data is
@@ -642,6 +697,52 @@ class AuditLogger:
                 len(batch),
             )
         return unwritten
+
+    _sa_info_cache = None  # None = not loaded yet; False = not configured/invalid
+
+    def _service_account_info(self):
+        """Parsed writer key, or ``None``. Invalid config is logged once and
+        treated as "not configured" so the per-user path still runs."""
+        if self._sa_info_cache is None:
+            from core.service_account import (
+                ServiceAccountConfigError,
+                load_service_account_info,
+                service_account_email,
+            )
+
+            try:
+                info = load_service_account_info(
+                    AUDIT_SA_JSON_FILE_ENV, AUDIT_SA_JSON_B64_ENV
+                )
+            except ServiceAccountConfigError as e:
+                log.error(
+                    "Audit service-account key invalid (%s); falling back to "
+                    "per-user credentials",
+                    e,
+                )
+                info = None
+            if info:
+                log.info(
+                    "Audit writer: service account %s", service_account_email(info)
+                )
+            self._sa_info_cache = info or False
+        return self._sa_info_cache or None
+
+    def _build_sheets_for_service_account(self):
+        """Sheets client for the dedicated writer, or ``None`` if not configured."""
+        info = self._service_account_info()
+        if not info:
+            return None
+        try:
+            from google.oauth2 import service_account
+
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=[SHEETS_SCOPE]
+            )
+            return build("sheets", "v4", credentials=creds, cache_discovery=False)
+        except Exception as e:
+            log.error("Audit service-account client build failed: %s", e)
+            return None
 
     def _build_sheets_for_user(self, email: str):
         """Fresh Sheets client built from the named user's OAuth credentials.

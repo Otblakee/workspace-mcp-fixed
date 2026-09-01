@@ -26,13 +26,21 @@ Every MCP tool call is logged to a Google Sheet via `core/audit.py`.
 - `AUDIT_BATCH_SIZE` — default 50
 - `DEFAULT_USER` — fallback when OAuth identity isn't resolvable; default "oli"
 
-**Auth model:** the audit logger writes via the same OAuth credentials
-that the calling user already provided to the MCP. No separate service
-account. This means audit writes inherit the user's Sheets scope and
-Editor permission on the audit Sheet. Trade-off: at single-user phase,
-the user technically has Edit access on their own audit entries.
-Acceptable risk during Phase 1; revisit before Team rollout (consider
-Workload Identity Federation or a Render Postgres immutable mirror).
+**Auth model:** two modes, selected by whether `AUDIT_SA_JSON_FILE` /
+`AUDIT_SA_JSON_B64` is set (see `core/audit.py` docstring).
+
+- *Service-account writer* (multi-user mode, added on
+  `claude/multi-account-workspace-groups-2dnyhi`): one dedicated service
+  account, shared with the Sheet as its only Editor, appends every row.
+  Users need no access to the Sheet, so nobody can read, edit, delete or
+  forge another user's rows, and rows attributed to `DEFAULT_USER` are
+  written instead of dropped to stdout. Set this before adding a second
+  user. Loader shared with the group policy in `core/service_account.py`.
+- *Per-user writer* (original single-user mode, still the fallback): rows
+  are written with the calling user's own OAuth credentials, so every user
+  needs Sheets scope and Editor on the Sheet, and every Editor can read and
+  alter every row. Acceptable for one user only. A Render Postgres immutable
+  mirror remains the Phase-3 answer for evidence-grade audit.
 
 **Architecture:** decorator + monkey-patch on FastMCP `tool` decorator at server init.
 Async queue, buffered flush every 30s. Each row's `user` is captured from

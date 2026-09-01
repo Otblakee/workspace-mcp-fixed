@@ -118,6 +118,12 @@ services:
         sync: false
 
       # ---- audit logger tunables (see CLAUDE.md) ----
+      # Dedicated audit writer (base64 service-account key). When set, every
+      # row is written by this identity and users need no access to the
+      # audit Sheet. Required before a second user is added: without it every
+      # user must hold Editor on the Sheet and can read/alter every row.
+      - key: AUDIT_SA_JSON_B64
+        sync: false
       - key: AUDIT_FLUSH_INTERVAL_S
         value: "30"
       - key: AUDIT_BATCH_SIZE

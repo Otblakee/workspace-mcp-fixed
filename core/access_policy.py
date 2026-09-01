@@ -59,7 +59,6 @@ API cannot lock the owner out of their own server.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -763,27 +762,15 @@ def _float_env(env: Dict[str, str], key: str, default: float) -> float:
 
 
 def _load_service_account_info(env: Dict[str, str]) -> Optional[Dict[str, Any]]:
-    path = (env.get(SA_JSON_FILE_ENV) or "").strip()
-    raw: Optional[str] = None
-    if path:
-        p = Path(path).expanduser()
-        if not p.exists():
-            raise PolicyError(f"{SA_JSON_FILE_ENV} points to a missing file: {p}")
-        raw = p.read_text(encoding="utf-8")
-    elif (env.get(SA_JSON_B64_ENV) or "").strip():
-        try:
-            raw = base64.b64decode(env[SA_JSON_B64_ENV].strip()).decode("utf-8")
-        except Exception as exc:
-            raise PolicyError(f"{SA_JSON_B64_ENV} is not valid base64") from exc
-    if raw is None:
-        return None
+    from core.service_account import (
+        ServiceAccountConfigError,
+        load_service_account_info,
+    )
+
     try:
-        info = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise PolicyError("service account JSON is not valid JSON") from exc
-    if not isinstance(info, dict) or info.get("type") != "service_account":
-        raise PolicyError("service account JSON must be a Google service_account key")
-    return info
+        return load_service_account_info(SA_JSON_FILE_ENV, SA_JSON_B64_ENV, env)
+    except ServiceAccountConfigError as exc:
+        raise PolicyError(str(exc)) from exc
 
 
 # --- process-wide engine ---------------------------------------------------
