@@ -129,3 +129,41 @@ class TestDeclaredDependencies:
 class TestGmailTestPackage:
     def test_init_exists(self):
         assert (REPO_ROOT / "tests" / "gmail" / "__init__.py").is_file()
+
+
+# ---------------------------------------------------------------------------
+# OAuth 2.1 proxy state must be able to reach the persistent disk
+# ---------------------------------------------------------------------------
+
+
+class TestOAuthProxyDiskStore:
+    """render.yaml selects WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=disk so
+    client registrations and encrypted upstream tokens survive a redeploy.
+    core/server.py imports ``key_value.aio.stores.disk.DiskStore`` for that
+    branch and, on ImportError, silently falls back to FastMCP's default
+    store under ~/.fastmcp (ephemeral on Render). The ``[disk]`` extra of
+    py-key-value-aio is therefore a hard dependency, not an optional one."""
+
+    def test_disk_extra_is_declared(self):
+        assert tomllib is not None
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        deps = pyproject["project"]["dependencies"]
+        assert any(dep.startswith("py-key-value-aio[disk]") for dep in deps), (
+            "py-key-value-aio must be declared with the [disk] extra or the "
+            "OAuth proxy DiskStore backend cannot load"
+        )
+
+    def test_disk_store_importable(self):
+        from key_value.aio.stores.disk import DiskStore  # noqa: F401
+
+    def test_render_blueprint_pins_fastmcp_home_to_persistent_disk(self):
+        import yaml
+
+        blueprint = yaml.safe_load((REPO_ROOT / "render.yaml").read_text())
+        env = {e["key"]: e.get("value") for e in blueprint["services"][0]["envVars"]}
+        assert env.get("WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND") == "disk"
+        assert str(env.get("WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY", "")).startswith(
+            "/data/"
+        )
+        # Safety net: even FastMCP's own fallback store must land on /data.
+        assert str(env.get("FASTMCP_HOME", "")).startswith("/data/")

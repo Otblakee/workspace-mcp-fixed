@@ -45,6 +45,12 @@ services:
         value: /data/oauth-proxy
       - key: WORKSPACE_ATTACHMENT_DIR
         value: /data/attachments
+      # FastMCP's own fallback OAuth-proxy store (used only if the DiskStore
+      # backend above fails to load) lives under FASTMCP_HOME/oauth-proxy.
+      # Pin it to the disk too so no code path can leave OAuth state on the
+      # ephemeral container filesystem.
+      - key: FASTMCP_HOME
+        value: /data/fastmcp
 
       # ---- explicitly NOT stateless: tokens must be persisted ----
       - key: WORKSPACE_MCP_STATELESS_MODE
