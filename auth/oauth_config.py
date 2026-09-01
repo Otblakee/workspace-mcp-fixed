@@ -14,6 +14,15 @@ from urllib.parse import urlparse
 from typing import List, Optional, Dict, Any
 
 
+def get_external_url() -> Optional[str]:
+    """Public base URL: WORKSPACE_EXTERNAL_URL, else Render's RENDER_EXTERNAL_URL."""
+    for key in ("WORKSPACE_EXTERNAL_URL", "RENDER_EXTERNAL_URL"):
+        value = (os.getenv(key) or "").strip()
+        if value:
+            return value.rstrip("/")
+    return None
+
+
 class OAuthConfig:
     """
     Centralized OAuth configuration management.
@@ -29,8 +38,11 @@ class OAuthConfig:
         self.port = int(os.getenv("PORT", os.getenv("WORKSPACE_MCP_PORT", "8000")))
         self.base_url = f"{self.base_uri}:{self.port}"
 
-        # External URL for reverse proxy scenarios
-        self.external_url = os.getenv("WORKSPACE_EXTERNAL_URL")
+        # External URL for reverse proxy scenarios. Render injects
+        # RENDER_EXTERNAL_URL for every web service; fall back to it so a
+        # re-created service never advertises http://localhost as its OAuth
+        # issuer / attachment base.
+        self.external_url = get_external_url()
 
         # OAuth client configuration
         self.client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID")

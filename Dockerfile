@@ -13,7 +13,9 @@ RUN pip install --no-cache-dir uv
 COPY . .
 
 # Install Python dependencies using uv sync
-RUN uv sync --no-dev
+# --locked: the build must match uv.lock exactly; a stale lock fails the
+# build instead of silently resolving something newer at deploy time.
+RUN uv sync --no-dev --locked
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app \

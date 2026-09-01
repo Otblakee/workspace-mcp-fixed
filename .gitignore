@@ -23,6 +23,11 @@ venv/
 
 # ---- Secrets -----------------------------------------------------------
 client_secret.json
+.mcpregistry_*
+
+# ---- Desktop-extension bundles (contain the upstream author's caches) ----
+*.dxt
+.ruff_cache/
 
 # ---- Logs --------------------------------------------------------------
 mcp_server_debug.log

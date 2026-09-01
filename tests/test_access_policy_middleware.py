@@ -269,8 +269,9 @@ class TestUnexpectedLoadErrors:
         mw = apm.AccessPolicyMiddleware()
         with pytest.raises(AuthorizationError) as excinfo:
             await mw.on_call_tool(_mw_context("k@otbgroup.co.uk"), AsyncMock())
-        assert "IsADirectoryError" in str(excinfo.value)
+        assert "failed to load" in str(excinfo.value)
         assert "/etc/secrets" not in str(excinfo.value)
+        assert "IsADirectoryError" not in str(excinfo.value)
 
 
 class TestServerWiring:

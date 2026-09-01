@@ -435,11 +435,14 @@ class DirectoryMembershipSource(MembershipSource):
         self._subject = _norm_email(subject) or None
         self._build_service = build_service or self._default_build
         self._missing_groups_reported: Set[str] = set()
+        self._creds = None
         if build_service is None:
             # Eager validation: from_service_account_info parses the private
-            # key and raises on a truncated or non-key payload.
+            # key and raises on a truncated or non-key payload. The object is
+            # kept: google-auth caches the access token on it and refreshes
+            # in place, so one token grant serves many hasMember calls.
             try:
-                self._credentials()
+                self._creds = self._credentials()
             except Exception as exc:
                 raise PolicyError(
                     f"group policy service-account key is unusable: {exc}"
@@ -461,7 +464,7 @@ class DirectoryMembershipSource(MembershipSource):
         return build(
             "admin",
             "directory_v1",
-            credentials=self._credentials(),
+            credentials=self._creds if self._creds is not None else self._credentials(),
             cache_discovery=False,
             static_discovery=True,
         )

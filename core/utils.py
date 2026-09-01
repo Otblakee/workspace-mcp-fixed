@@ -12,6 +12,7 @@ from typing import List, Optional
 
 from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
+from .redaction import scrub_url_queries
 from auth.google_auth import GoogleAuthenticationError
 from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
 
@@ -240,6 +241,34 @@ def check_credentials_directory_permissions(credentials_dir: str = None) -> None
         )
 
 
+# Zip-inflation guard for Office documents. A ~450 KB .docx whose
+# word/document.xml inflates to gigabytes would be read fully into memory by
+# zf.read() and OOM-kill the single 512 MB worker. Refuse members that are
+# large or suspiciously compressible before inflating them.
+ZIP_MEMBER_MAX_BYTES = 32 * 1024 * 1024
+ZIP_MAX_INFLATION_RATIO = 200
+
+
+class OfficeMemberTooLarge(ValueError):
+    pass
+
+
+def _read_zip_member(zf: zipfile.ZipFile, name: str) -> bytes:
+    info = zf.getinfo(name)
+    if info.file_size > ZIP_MEMBER_MAX_BYTES:
+        raise OfficeMemberTooLarge(
+            f"refusing to inflate '{name}': {info.file_size} bytes exceeds "
+            f"{ZIP_MEMBER_MAX_BYTES}"
+        )
+    ratio = info.file_size / max(info.compress_size, 1)
+    if ratio > ZIP_MAX_INFLATION_RATIO:
+        raise OfficeMemberTooLarge(
+            f"refusing to inflate '{name}': inflation ratio {ratio:.0f}:1 exceeds "
+            f"{ZIP_MAX_INFLATION_RATIO}:1"
+        )
+    return zf.read(name)
+
+
 def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
     """
     Very light-weight XML scraper for Word, Excel, PowerPoint files.
@@ -274,7 +303,7 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
                 ]
                 # Attempt to parse sharedStrings.xml for Excel files
                 try:
-                    shared_strings_xml = zf.read("xl/sharedStrings.xml")
+                    shared_strings_xml = _read_zip_member(zf, "xl/sharedStrings.xml")
                     shared_strings_root = ET.fromstring(shared_strings_xml)
                     for si_element in shared_strings_root.findall(
                         f"{{{ns_excel_main}}}si"
@@ -304,7 +333,7 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
             pieces: List[str] = []
             for member in targets:
                 try:
-                    xml_content = zf.read(member)
+                    xml_content = _read_zip_member(zf, member)
                     xml_root = ET.fromstring(xml_content)
                     member_texts: List[str] = []
 
@@ -378,6 +407,9 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
     except zipfile.BadZipFile:
         logger.warning(f"File is not a valid ZIP archive (mime_type: {mime_type}).")
         return None
+    except OfficeMemberTooLarge as e:
+        logger.warning(f"Office document rejected for {mime_type}: {e}")
+        return None
     except (
         ET.ParseError
     ) as e:  # Catch parsing errors at the top level if zipfile itself is XML-like
@@ -439,7 +471,10 @@ def handle_http_errors(
                     raise e
                 except HttpError as error:
                     user_google_email = kwargs.get("user_google_email", "N/A")
-                    error_details = str(error)
+                    # HttpError text embeds the request URL; strip query
+                    # strings (Gmail/Drive ``q=`` search expressions) before
+                    # the text reaches logs, the caller, or the audit sheet.
+                    error_details = scrub_url_queries(str(error))
 
                     # Check if this is an API not enabled error
                     if (
@@ -457,7 +492,7 @@ def handle_http_errors(
                             )
                         else:
                             message = (
-                                f"API error in {tool_name}: {error}. "
+                                f"API error in {tool_name}: {error_details}. "
                                 f"The required API is not enabled for your project. "
                                 f"Please check the Google Cloud Console to enable it."
                             )
@@ -480,15 +515,17 @@ def handle_http_errors(
                                 "and the appropriate service_name."
                             )
                         message = (
-                            f"API error in {tool_name}: {error}. "
+                            f"API error in {tool_name}: {error_details}. "
                             f"You might need to re-authenticate for user '{user_google_email}'. "
                             f"{auth_hint}"
                         )
                     else:
                         # Other HTTP errors (400 Bad Request, etc.) - don't suggest re-auth
-                        message = f"API error in {tool_name}: {error}"
+                        message = f"API error in {tool_name}: {error_details}"
 
-                    logger.error(f"API error in {tool_name}: {error}", exc_info=True)
+                    # No exc_info: the traceback would re-print HttpError's
+                    # unscrubbed text (request URL with its query string).
+                    logger.error(f"API error in {tool_name}: {error_details}")
                     raise Exception(message) from error
                 except TransientNetworkError:
                     # Re-raise without wrapping to preserve the specific error type

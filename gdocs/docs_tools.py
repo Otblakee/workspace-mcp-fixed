@@ -121,7 +121,7 @@ async def search_docs(
     Returns:
         str: A formatted list of Google Docs matching the search query.
     """
-    logger.info(f"[search_docs] Email={user_google_email}, Query='{query}'")
+    logger.debug(f"[search_docs] Email={user_google_email}, Query='{query}'")
 
     escaped_query = query.replace("'", "\\'")
 

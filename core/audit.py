@@ -22,7 +22,6 @@ import gc
 import json
 import logging
 import os
-import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -350,15 +349,26 @@ def _inspect_result_for_error(result: Any) -> tuple[bool, str]:
     return False, ""
 
 
-# Google's HttpError.__str__ embeds the failing request URL, and Drive/Gmail
-# list URLs carry the search expression in the query string (``?q=...``).
-# Strip every URL query string before the text reaches the audit sheet so the
-# ``error`` column cannot leak what ``params_summary`` already redacts.
-_URL_QUERY_RE = re.compile(r"(https?://[^\s\"'<>]+?)\?[^\s\"'<>]*")
+from core.redaction import scrub_url_queries as _scrub_error_text  # noqa: E402
+
+# Fields of an audit row that may be echoed to stdout when the Sheet write
+# fails (AUDIT_FALLBACK / AUDIT_DROP). params_summary and error are left out:
+# stdout (Render logs) has a wider readership than the audit Sheet, and the
+# fact of the call is what must never be lost, not its arguments.
+_FALLBACK_FIELDS = (
+    "timestamp_utc",
+    "user",
+    "service",
+    "tool",
+    "resource_id",
+    "status",
+    "latency_ms",
+    "client",
+)
 
 
-def _scrub_error_text(text: str) -> str:
-    return _URL_QUERY_RE.sub(r"\1?<redacted-query>", text or "")
+def _fallback_row(entry: dict) -> dict:
+    return {k: entry.get(k, "") for k in _FALLBACK_FIELDS}
 
 
 def _origin_error_type(e: BaseException) -> str:
@@ -461,7 +471,7 @@ class AuditLogger:
         try:
             self.q.put_nowait(entry)
         except asyncio.QueueFull:
-            log.error("AUDIT_DROP %s", json.dumps(entry))
+            log.error("AUDIT_DROP %s", json.dumps(_fallback_row(entry)))
 
     async def stop(self):
         """Graceful shutdown: signal the flusher to exit, then drain the queue.
@@ -554,7 +564,9 @@ class AuditLogger:
         """Dump every still-queued entry to stdout as AUDIT_FALLBACK."""
         while not self.q.empty():
             try:
-                log.error("AUDIT_FALLBACK %s", json.dumps(self.q.get_nowait()))
+                log.error(
+                    "AUDIT_FALLBACK %s", json.dumps(_fallback_row(self.q.get_nowait()))
+                )
             except asyncio.QueueEmpty:
                 break
 
@@ -582,15 +594,15 @@ class AuditLogger:
                 # batch is no longer in the queue, so dump it here before
                 # propagating — otherwise these rows would vanish.
                 for entry in batch:
-                    log.error("AUDIT_FALLBACK %s", json.dumps(entry))
+                    log.error("AUDIT_FALLBACK %s", json.dumps(_fallback_row(entry)))
                 raise
             except Exception as e:
                 log.error("Audit flush failed (%s) — falling back to stdout", e)
                 for entry in batch:
-                    log.error("AUDIT_FALLBACK %s", json.dumps(entry))
+                    log.error("AUDIT_FALLBACK %s", json.dumps(_fallback_row(entry)))
                 return
             for entry in unwritten:
-                log.error("AUDIT_FALLBACK %s", json.dumps(entry))
+                log.error("AUDIT_FALLBACK %s", json.dumps(_fallback_row(entry)))
 
     async def _flush(self, batch) -> list:
         sa_sheets = await asyncio.to_thread(self._build_sheets_for_service_account)

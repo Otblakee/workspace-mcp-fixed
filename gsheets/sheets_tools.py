@@ -7,6 +7,7 @@ This module provides MCP tools for interacting with Google Sheets API.
 import logging
 import asyncio
 import json
+import re
 import copy
 from typing import List, Optional, Union
 
@@ -280,6 +281,24 @@ async def read_sheet_values(
     return text_output + hyperlink_section + detailed_errors_section
 
 
+# Google Sheets evaluates a cell as a formula when it starts with "=", or
+# with "+" immediately followed by a function call ("+IMPORTDATA(...)").
+# A bare "+44 7700 900000" (a phone number) is left alone.
+_FORMULA_CELL_RE = re.compile(r"^\s*(=|\+\s*[A-Za-z_][A-Za-z0-9_.]*\s*\()")
+
+
+def _find_formula_cells(values) -> List[str]:
+    """Return A1-style-ish coordinates (row,col) of cells that look like formulas."""
+    found: List[str] = []
+    for r, row in enumerate(values or []):
+        if not isinstance(row, list):
+            continue
+        for c, cell in enumerate(row):
+            if isinstance(cell, str) and _FORMULA_CELL_RE.match(cell):
+                found.append(f"row {r + 1} col {c + 1}")
+    return found
+
+
 @server.tool()
 @handle_http_errors("modify_sheet_values", service_type="sheets")
 @require_google_service("sheets", "sheets_write")
@@ -291,9 +310,17 @@ async def modify_sheet_values(
     values: Optional[Union[str, List[List[str]]]] = None,
     value_input_option: str = "USER_ENTERED",
     clear_values: bool = False,
+    allow_formulas: bool = False,
 ) -> str:
     """
     Modifies values in a specific range of a Google Sheet - can write, update, or clear values.
+
+    Formula safety: with the default USER_ENTERED option Google evaluates any
+    cell that starts with "=" (or "+FUNCTION(") as a formula. Text copied from
+    an email or a document can therefore become a live IMPORTDATA / IMPORTXML /
+    IMAGE call that sends the sheet's contents to an outside URL. Such cells
+    are refused unless allow_formulas=True is passed explicitly (an audited
+    choice), or value_input_option is RAW (stored as literal text).
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -302,6 +329,7 @@ async def modify_sheet_values(
         values (Optional[Union[str, List[List[str]]]]): 2D array of values to write/update. Can be a JSON string or Python list. Required unless clear_values=True.
         value_input_option (str): How to interpret input values ("RAW" or "USER_ENTERED"). Defaults to "USER_ENTERED".
         clear_values (bool): If True, clears the range instead of writing values. Defaults to False.
+        allow_formulas (bool): Permit cells that Google would evaluate as formulas under USER_ENTERED. Defaults to False.
 
     Returns:
         str: Confirmation message of the successful modification operation.
@@ -338,6 +366,23 @@ async def modify_sheet_values(
         raise UserInputError(
             "Either 'values' must be provided or 'clear_values' must be True."
         )
+
+    if (
+        not clear_values
+        and values
+        and (value_input_option or "").upper() == "USER_ENTERED"
+        and not allow_formulas
+    ):
+        offending = _find_formula_cells(values)
+        if offending:
+            raise UserInputError(
+                "Refusing to write cells that Google Sheets would evaluate as "
+                f"formulas ({', '.join(offending[:5])}"
+                f"{', …' if len(offending) > 5 else ''}). Untrusted text pasted "
+                "as a formula can exfiltrate the sheet via IMPORTDATA/IMPORTXML/"
+                "IMAGE. Pass value_input_option='RAW' to store it as text, or "
+                "allow_formulas=True if these formulas are intended."
+            )
 
     if clear_values:
         result = await asyncio.to_thread(

@@ -52,6 +52,14 @@ services:
       - key: FASTMCP_HOME
         value: /data/fastmcp
 
+      # ---- public URL ----
+      # OAuth issuer / callback and attachment URLs are built from this.
+      # Render injects RENDER_EXTERNAL_URL automatically and the code falls
+      # back to it, but set it explicitly if a custom domain fronts the
+      # service.
+      - key: WORKSPACE_EXTERNAL_URL
+        sync: false
+
       # ---- explicitly NOT stateless: tokens must be persisted ----
       - key: WORKSPACE_MCP_STATELESS_MODE
         value: "false"
@@ -63,18 +71,17 @@ services:
       - key: WORKSPACE_MCP_FILE_LOGGING
         value: "false"
 
-      # ---- tool surface: the six live services only ----
-      # appscript is additionally opt-in-gated in main.py (OPT_IN_TOOLS);
-      # per CLAUDE.md it must not be enabled until audit logging has been
-      # live and reviewed for 30 days. If the dashboard already defines
-      # TOOLS, reconcile it with this value before syncing the blueprint.
+      # ---- tool surface ----
+      # The six Workspace services plus the read-only Admin SDK (gadmin),
+      # which the live deployment already enables: set_drive_permission's
+      # groups-only guardrail resolves principals against the Directory.
+      # No TOOL_TIER: all tiers of these services load, and the group access
+      # policy (core/group_policy.yaml) narrows the surface per user instead.
+      # appscript and gadmin_write stay opt-in (OPT_IN_TOOLS in main.py); per
+      # CLAUDE.md appscript must not be enabled until audit logging has been
+      # live and reviewed for 30 days.
       - key: TOOLS
-        value: gmail drive calendar docs sheets contacts
-
-      # ---- tool tier: CLAUDE.md requires "extended" so the Drive
-      #      architecture tools and delete_gmail_draft replacement load ----
-      - key: TOOL_TIER
-        value: extended
+        value: gmail drive calendar docs sheets contacts gadmin
 
       # ---- OAuth 2.1 mode (FastMCP GoogleProvider proxy) ----
       - key: MCP_ENABLE_OAUTH21

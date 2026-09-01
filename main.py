@@ -14,7 +14,11 @@ if _CLI_MODE:
     os.environ["WORKSPACE_MCP_STATELESS_MODE"] = "false"
 
 from auth.oauth_config import reload_oauth_config, is_stateless_mode  # noqa: E402
-from core.log_formatter import EnhancedLogFormatter, configure_file_logging  # noqa: E402
+from core.log_formatter import (  # noqa: E402
+    EnhancedLogFormatter,
+    QueryStringFilter,
+    configure_file_logging,
+)
 from core.utils import check_credentials_directory_permissions  # noqa: E402
 from core.server import (  # noqa: E402
     server,
@@ -220,7 +224,9 @@ def main():
     port = int(os.getenv("PORT", os.getenv("WORKSPACE_MCP_PORT", 8000)))
     base_uri = os.getenv("WORKSPACE_MCP_BASE_URI", "http://localhost")
     host = os.getenv("WORKSPACE_MCP_HOST", "0.0.0.0")
-    external_url = os.getenv("WORKSPACE_EXTERNAL_URL")
+    from auth.oauth_config import get_external_url
+
+    external_url = get_external_url()
     display_url = external_url if external_url else f"{base_uri}:{port}"
 
     safe_print("🔧 Google Workspace MCP Server")
@@ -241,12 +247,11 @@ def main():
     # Active Configuration
     safe_print("⚙️ Active Configuration:")
 
-    # Redact client secret for security
-    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "Not Set")
+    # Never print any part of the secret (or the client ID) to the log
+    # stream: "set" / "not set" is all an operator needs from the banner.
+    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
     redacted_secret = (
-        f"{client_secret[:4]}...{client_secret[-4:]}"
-        if len(client_secret) > 8
-        else "Invalid or too short"
+        f"Set ({len(client_secret)} chars)" if client_secret else "Not Set"
     )
 
     # Determine credentials directory (same logic as credential_store.py)
@@ -265,7 +270,9 @@ def main():
         creds_dir_source = "default"
 
     config_vars = {
-        "GOOGLE_OAUTH_CLIENT_ID": os.getenv("GOOGLE_OAUTH_CLIENT_ID", "Not Set"),
+        "GOOGLE_OAUTH_CLIENT_ID": "Set"
+        if os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+        else "Not Set",
         "GOOGLE_OAUTH_CLIENT_SECRET": redacted_secret,
         "USER_GOOGLE_EMAIL": os.getenv("USER_GOOGLE_EMAIL", "Not Set"),
         "CREDENTIALS_DIR": f"{creds_dir_display} ({creds_dir_source})",
@@ -488,6 +495,25 @@ def main():
         # Group access policy: fail the boot, not the first request, if the
         # policy or its configuration is unusable under enforce mode.
         from core.access_policy import PolicyError, validate_at_startup
+
+        if args.transport == "streamable-http":
+            oauth21_on = os.getenv("MCP_ENABLE_OAUTH21", "false").lower() == "true"
+            if oauth21_on and not os.getenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "").strip():
+                safe_print(
+                    "⚠️  OAUTH_ALLOWED_EMAIL_DOMAINS is unset: any Google account "
+                    "that completes the OAuth flow gets a session on this server. "
+                    "Set it before adding users."
+                )
+                logger.warning("OAUTH_ALLOWED_EMAIL_DOMAINS is unset under OAuth 2.1")
+            if args.tools is None and args.tool_tier is None:
+                safe_print(
+                    "⚠️  Neither --tools nor --tool-tier given: every non-opt-in "
+                    "service loads at every tier and its scopes are requested "
+                    "from every user."
+                )
+            # uvicorn's access log would otherwise record the OAuth callback
+            # query string (authorization code, state) on every sign-in.
+            logging.getLogger("uvicorn.access").addFilter(QueryStringFilter())
 
         try:
             validate_at_startup()

@@ -396,8 +396,11 @@ async def start_auth_flow(
             oauth_state, session_id=session_id, code_verifier=code_verifier
         )
 
+        # The URL carries state/client_id/redirect_uri; it is returned to the
+        # client below and must not also sit in the server log.
         logger.info(
-            f"Auth flow started for {user_display_name}. Advise user to visit: {auth_url}"
+            f"Auth flow started for {user_display_name} (state {oauth_state[:8]}…); "
+            "authorization URL returned to the client."
         )
 
         message_lines = [

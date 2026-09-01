@@ -148,7 +148,7 @@ class AuthInfoMiddleware(Middleware):
         try:
             access_token = get_access_token()
             if access_token:
-                logger.info("[AuthInfoMiddleware] FastMCP access_token found")
+                logger.debug("[AuthInfoMiddleware] FastMCP access_token found")
                 user_email = getattr(access_token, "email", None)
                 if not user_email and hasattr(access_token, "claims"):
                     user_email = access_token.claims.get("email")
@@ -165,7 +165,7 @@ class AuthInfoMiddleware(Middleware):
                         rejected = True
                         await _record_rejection(context, user_email, reason)
                     else:
-                        logger.info(
+                        logger.debug(
                             f"✓ Using FastMCP validated token for user: {user_email}"
                         )
                         await context.fastmcp_context.set_state(
@@ -193,7 +193,7 @@ class AuthInfoMiddleware(Middleware):
             try:
                 # Use the new FastMCP method to get HTTP headers
                 headers = get_http_headers()
-                logger.info(
+                logger.debug(
                     f"[AuthInfoMiddleware] get_http_headers() returned: {headers is not None}, keys: {list(headers.keys()) if headers else 'None'}"
                 )
                 if headers:

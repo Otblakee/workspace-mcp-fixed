@@ -156,6 +156,26 @@ def setup_enhanced_logging(
         root_logger.addHandler(console_handler)
 
 
+class QueryStringFilter(logging.Filter):
+    """Strip query strings from uvicorn access-log lines.
+
+    uvicorn formats access records as ``'%s - "%s %s HTTP/%s" %d'`` with the
+    full request target as the third argument, so ``/oauth2callback?code=…``
+    and ``/authorize?…state=…`` would land in the retained log stream on
+    every sign-in. The path is kept; everything after ``?`` is dropped.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            from core.redaction import strip_query_string
+
+            args = list(args)
+            args[2] = strip_query_string(args[2])
+            record.args = tuple(args)
+        return True
+
+
 FILE_LOGGING_ENV = "WORKSPACE_MCP_FILE_LOGGING"
 FILE_LOG_MAX_BYTES = 10 * 1024 * 1024
 FILE_LOG_BACKUP_COUNT = 3

@@ -66,6 +66,33 @@ async def _identity(context: MiddlewareContext) -> Optional[str]:
         return None
 
 
+# Sentinel for rows with no verified identity. Never empty: an empty user is
+# rewritten to DEFAULT_USER by the writers, which would attribute an
+# anonymous refused call to the owner.
+UNAUTHENTICATED_USER = "<unauthenticated>"
+
+
+def _service_for(tool_name: str) -> str:
+    """Service label for a denied row, resolved the same way the audited
+    wrapper does for success rows (by the tool's source module) so the two
+    never disagree in a per-service pivot."""
+    from core.audit import _service
+
+    module = ""
+    try:
+        from core.server import server
+        from core.tool_registry import get_tool_components
+
+        component = get_tool_components(server).get(tool_name)
+        fn = getattr(component, "fn", component)
+        while hasattr(fn, "__wrapped__"):
+            fn = fn.__wrapped__
+        module = getattr(fn, "__module__", "") or ""
+    except Exception:  # pragma: no cover - defensive
+        module = ""
+    return _service(tool_name, module)
+
+
 def _audit_denied(
     tool_name: str, decision: AccessDecision, started: float, reason: str
 ) -> None:
@@ -75,7 +102,7 @@ def _audit_denied(
         from core.audit import (
             _redact,
             _resolve_client,
-            _service,
+            _scrub_error_text,
             logger as audit_logger,
         )
 
@@ -84,8 +111,8 @@ def _audit_denied(
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(
                     timespec="seconds"
                 ),
-                "user": decision.email or "",
-                "service": _service(tool_name),
+                "user": decision.email or UNAUTHENTICATED_USER,
+                "service": _service_for(tool_name),
                 "tool": tool_name,
                 "params_summary": _redact(
                     {
@@ -95,7 +122,7 @@ def _audit_denied(
                 ),
                 "resource_id": "",
                 "status": "denied",
-                "error": f"policy: {reason}"[:300],
+                "error": _scrub_error_text(f"policy: {reason}")[:300],
                 "latency_ms": int((time.perf_counter() - started) * 1000),
                 "client": _resolve_client(),
             }
@@ -180,9 +207,9 @@ class AccessPolicyMiddleware(Middleware):
             )
             _audit_denied(tool_name, decision, started, decision.reason)
             raise AuthorizationError(
-                f"Tool '{tool_name}' refused: the access policy failed to load "
-                f"({decision.reason}). An administrator must fix "
-                "core/group_policy.yaml before any tool can run."
+                f"Tool '{tool_name}' refused: the access policy failed to load. "
+                "An administrator must fix core/group_policy.yaml (details are "
+                "in the server log) before any tool can run."
             )
         if not engine.enabled:
             return await call_next(context)

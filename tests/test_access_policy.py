@@ -318,11 +318,13 @@ class TestDirectorySource:
             {"type": "service_account", "client_email": "sa@x.iam"},
             subject="Oliver@OTBGroup.co.uk",
         )
-        # Construction validated the key once already; measure the build alone.
-        creds.with_subject.reset_mock()
-        assert src._default_build() == "service"
-        assert captured["scopes"] == [ap.DIRECTORY_MEMBER_READ_SCOPE]
+        # Credentials are built (and the subject applied) once at construction
+        # and reused by every build, so a token grant is not repeated per call.
         creds.with_subject.assert_called_once_with("oliver@otbgroup.co.uk")
+        assert captured["scopes"] == [ap.DIRECTORY_MEMBER_READ_SCOPE]
+        assert src._default_build() == "service"
+        assert src._default_build() == "service"
+        creds.with_subject.assert_called_once()
         name, version, kwargs = captured["build"]
         assert (name, version) == ("admin", "directory_v1")
         assert kwargs["credentials"] == "delegated-creds"

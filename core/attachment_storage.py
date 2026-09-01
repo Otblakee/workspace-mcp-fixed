@@ -358,7 +358,9 @@ def get_attachment_url(file_id: str) -> str:
     from core.config import WORKSPACE_MCP_PORT, WORKSPACE_MCP_BASE_URI
 
     # Use external URL if set (for reverse proxy scenarios)
-    external_url = os.getenv("WORKSPACE_EXTERNAL_URL")
+    from auth.oauth_config import get_external_url
+
+    external_url = get_external_url()
     if external_url:
         base_url = external_url.rstrip("/")
     else:

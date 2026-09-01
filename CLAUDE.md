@@ -719,10 +719,10 @@ through Google Groups itself.
   FastMCP's `GoogleProvider` as `allowed_client_redirect_uris`. Unset keeps
   FastMCP's default, which accepts *any* redirect URI at dynamic client
   registration; a WARNING is logged at startup until it is set.
-- `render.yaml` now carries `TOOL_TIER=extended`,
-  `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk`, `MCP_GROUP_POLICY_MODE=off`
-  and `sync: false` placeholders for the new secrets and
-  `DRIVE_HOLDING_FOLDER_ID`.
+- `render.yaml` now carries `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk`,
+  `MCP_GROUP_POLICY_MODE=off`, `gadmin` in `TOOLS` (matching the live
+  deployment) and `sync: false` placeholders for the new secrets,
+  `WORKSPACE_EXTERNAL_URL` and `DRIVE_HOLDING_FOLDER_ID`.
 
 **Rollback.** `MCP_GROUP_POLICY_MODE=off` (or unset) makes the middleware a
 pass-through; nothing else changes. The `gadmin_write` guard stays active in
@@ -768,6 +768,33 @@ fix in the same branch. Each has unit coverage (`tests/test_deploy_config.py`,
   `tools/list`, `tools/call` and `prompts/get`, never falls through to the
   weaker identity fallbacks, and clears any identity left in session state by
   an earlier request.
+- **Committed `google_workspace_mcp.dxt` removed.** The upstream desktop
+  extension bundle checked into this fork contained the upstream author's
+  `.mcpregistry_github_token` and `.mcpregistry_registry_token` files, their
+  mypy/pytest/ruff caches and private review notes, and was copied into the
+  public Docker image by `COPY . .`. Removed from the tree; `*.dxt` and
+  `.mcpregistry_*` are now ignored by git and Docker. The files remain in
+  git history (a public fork of a public repo); the upstream author should be
+  told so they can rotate those tokens if they have not already.
+- **Zip inflation cap on Office text extraction.** A small `.docx`/`.xlsx`
+  whose XML member inflates to gigabytes would be read whole into memory.
+  Members over 32 MiB or with an inflation ratio above 200:1 are refused.
+- **Formula injection into Sheets.** `modify_sheet_values` defaults to
+  `USER_ENTERED`, so text that starts with `=` (or `+FUNCTION(`) copied from
+  an email became a live formula (`IMPORTDATA` / `IMPORTXML` exfiltrate the
+  sheet). Such cells are now refused unless `allow_formulas=True` or
+  `value_input_option='RAW'`.
+- **Query strings out of the logs.** `handle_http_errors` scrubs URL query
+  strings from Google error text before logging or returning it; the
+  uvicorn access log drops query strings (OAuth callback codes and state);
+  the startup banner no longer prints part of the client secret or the
+  client ID; the OAuth 2.0 authorization URL is no longer logged; the
+  `AUDIT_FALLBACK` / `AUDIT_DROP` stdout rows carry identity, tool and status
+  but not `params_summary` or `error`.
+- **`RENDER_EXTERNAL_URL` fallback.** A service re-created from the
+  blueprint without `WORKSPACE_EXTERNAL_URL` used `http://localhost` as its
+  OAuth issuer and attachment base; Render's injected `RENDER_EXTERNAL_URL`
+  is now the fallback.
 - **Dynamic client registration allowlist.** `MCP_ALLOWED_CLIENT_REDIRECT_URIS`
   (see the access-policy section). Until it is set, any party can register
   an MCP client against this server and phish a consent click.
@@ -807,8 +834,12 @@ Findings deliberately **not** fixed in code, with the recommended control:
    Internal** (removes the 100-test-user cap and the 7-day refresh-token
    expiry of External+Testing). Set `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY`
    on Render to a long random secret.
-3. Confirm `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk` and
-   `TOOL_TIER=extended` are set (now in `render.yaml`).
+3. Confirm `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk` is set (now in
+   `render.yaml`). Leave `TOOL_TIER` unset: the live deployment runs every
+   tier of `gmail drive calendar docs sheets contacts gadmin` (visible from
+   the connected tool list, which includes complete-tier and gadmin tools),
+   and the group policy narrows the surface per user. Earlier notes in this
+   file saying `TOOL_TIER=extended` is set on Render are out of date.
 4. Read the redirect URIs registered by the real clients from the Render
    logs, then set `MCP_ALLOWED_CLIENT_REDIRECT_URIS` to exactly those
    patterns.

@@ -48,3 +48,11 @@ client_secrets.json
 service_account.json
 service-account.json
 *.credentials.json
+
+# Never ship these into the image
+*.dxt
+.mcpregistry_*
+.beads/
+.venv/
+.ruff_cache/
+.mypy_cache/
