@@ -472,9 +472,11 @@ class AuthInfoMiddleware(Middleware):
 
         except Exception as e:
             # Check if this is an authentication error - don't log traceback for these
-            if "GoogleAuthenticationError" in str(
-                type(e)
-            ) or "Access denied: Cannot retrieve credentials" in str(e):
+            if (
+                isinstance(e, AuthorizationError)
+                or "GoogleAuthenticationError" in str(type(e))
+                or "Access denied: Cannot retrieve credentials" in str(e)
+            ):
                 logger.info(f"Authentication check failed: {e}")
             else:
                 logger.error(f"Error in on_call_tool middleware: {e}", exc_info=True)

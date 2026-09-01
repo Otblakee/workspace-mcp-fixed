@@ -89,6 +89,21 @@ class TestDomainRejectionIsExplicit:
         assert "authenticated_user_email" not in ctx.fastmcp_context.state
 
     @pytest.mark.asyncio
+    async def test_rejection_is_logged_without_traceback(
+        self, monkeypatch, http_mode, caplog
+    ):
+        monkeypatch.setenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "otbgroup.co.uk")
+        monkeypatch.setattr(
+            aim, "get_access_token", lambda: _Token("mallory@evil.example")
+        )
+        with caplog.at_level("INFO", logger="auth.auth_info_middleware"):
+            with pytest.raises(AuthorizationError):
+                await aim.AuthInfoMiddleware().on_call_tool(_context(), AsyncMock())
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert errors == []
+        assert any("Authentication check failed" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
     async def test_call_tool_passes_for_allowed_domain(self, monkeypatch, http_mode):
         monkeypatch.setenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "otbgroup.co.uk")
         monkeypatch.setattr(
