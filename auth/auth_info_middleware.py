@@ -144,6 +144,14 @@ class AuthInfoMiddleware(Middleware):
         auth_via = None
         rejected = False
 
+        # Never inherit a rejection (or a stale identity) from an earlier
+        # request in the same MCP session: every request is judged on its
+        # own token. Cheap, and independent of how FastMCP scopes state.
+        try:
+            await context.fastmcp_context.delete_state(REJECTION_STATE_KEY)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Could not clear stale rejection marker: {exc}")
+
         # First check if FastMCP has already validated an access token
         try:
             access_token = get_access_token()

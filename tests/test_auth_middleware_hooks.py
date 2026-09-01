@@ -108,6 +108,25 @@ class TestListToolsRejection:
         assert "authenticated_via" not in ctx.fastmcp_context.state
 
 
+class TestRejectionMarkerIsPerRequest:
+    @pytest.mark.asyncio
+    async def test_marker_from_an_earlier_request_does_not_block_a_valid_one(
+        self, monkeypatch, http_mode
+    ):
+        monkeypatch.setenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "otbgroup.co.uk")
+        monkeypatch.setattr(
+            aim,
+            "get_access_token",
+            lambda: _Token("k@otbgroup.co.uk", hd="otbgroup.co.uk"),
+        )
+        ctx = _context()
+        # Simulate FastMCP keeping request state alive across requests.
+        ctx.fastmcp_context.state[aim.REJECTION_STATE_KEY] = "mallory@evil.example: hd"
+        call_next = AsyncMock(return_value="ran")
+        assert await aim.AuthInfoMiddleware().on_call_tool(ctx, call_next) == "ran"
+        assert aim.REJECTION_STATE_KEY not in ctx.fastmcp_context.state
+
+
 class TestDomainRejectionIsExplicit:
     @pytest.mark.asyncio
     async def test_call_tool_raises_for_foreign_domain(self, monkeypatch, http_mode):

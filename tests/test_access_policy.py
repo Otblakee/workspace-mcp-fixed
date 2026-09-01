@@ -395,6 +395,34 @@ class TestResolver:
             await r.groups_for("a@otbgroup.co.uk")
 
     @pytest.mark.asyncio
+    async def test_stale_window_measured_after_the_failed_lookup(self):
+        """A lookup that takes long enough to cross the stale boundary and
+        then fails must not serve the entry it just outlived."""
+        now = [0.0]
+
+        class SlowThenFail(ap.MembershipSource):
+            calls = 0
+
+            async def is_member(self, email, group):
+                self.calls += 1
+                if self.calls == 1:
+                    return True
+                now[0] = 150  # the clock moves while the lookup is in flight
+                raise ap.MembershipLookupError("timeout")
+
+        r = ap.MembershipResolver(
+            SlowThenFail(),
+            [STAFF],
+            cache_ttl_s=10,
+            stale_ttl_s=100,
+            clock=lambda: now[0],
+        )
+        assert await r.groups_for("a@otbgroup.co.uk") == {STAFF}
+        now[0] = 50  # cache expired, entry still within the stale window at call time
+        with pytest.raises(ap.MembershipLookupError):
+            await r.groups_for("a@otbgroup.co.uk")
+
+    @pytest.mark.asyncio
     async def test_error_with_no_cache_raises(self):
         src = _CountingSource(error=ap.MembershipLookupError("403"))
         r = ap.MembershipResolver(src, [STAFF])

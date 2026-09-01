@@ -681,6 +681,9 @@ class MembershipResolver:
             try:
                 groups = await self._lookup(email)
             except MembershipLookupError as exc:
+                # Re-read the clock: a slow, failing lookup must not extend
+                # the stale window by its own duration.
+                now = self._clock()
                 if entry is not None and now - entry.fetched_at < self.stale_ttl_s:
                     logger.warning(
                         "group policy: membership lookup for %s failed (%s); "
