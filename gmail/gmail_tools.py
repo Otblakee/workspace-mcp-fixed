@@ -244,6 +244,28 @@ def _sanitize_header_value(value: Optional[str]) -> Optional[str]:
     return value.replace("\r", "").replace("\n", "").replace("\x00", "")
 
 
+def _reject_local_path_for_remote_clients(file_path: str) -> None:
+    """Refuse ``attachments[].path`` when the server runs over streamable-http.
+
+    A remote MCP client (Claude.ai, Cowork, the Cockpit) has no view of this
+    server's filesystem, so a ``path`` from it can only ever name a file on
+    the server itself: the attachment relay directory holding other users'
+    downloaded files, the fallback OAuth store, logs. ``validate_file_path``
+    blocks the credential stores but not the rest. Mirrors the gate
+    ``import_to_google_doc`` / ``create_drive_file`` already apply to
+    ``file_path`` and ``file://``. stdio (local) clients are unaffected.
+    """
+    from core.config import get_transport_mode
+
+    if get_transport_mode() == "streamable-http":
+        raise ValueError(
+            f"Attachment path '{file_path}' rejected: local file paths are not "
+            "supported for remote MCP clients because the server cannot see "
+            "the caller's filesystem. Supply the attachment as base64 "
+            "'content' with a 'filename' instead."
+        )
+
+
 def _prepare_gmail_message(
     subject: str,
     body: str,
@@ -306,6 +328,7 @@ def _prepare_gmail_message(
             try:
                 # If path is provided, read and encode the file
                 if file_path:
+                    _reject_local_path_for_remote_clients(file_path)
                     path_obj = validate_file_path(file_path)
                     if not path_obj.exists():
                         logger.error(f"File not found: {file_path}")

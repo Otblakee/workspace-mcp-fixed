@@ -6,6 +6,7 @@ to match the safe_print output format.
 """
 
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import sys
@@ -155,6 +156,11 @@ def setup_enhanced_logging(
         root_logger.addHandler(console_handler)
 
 
+FILE_LOGGING_ENV = "WORKSPACE_MCP_FILE_LOGGING"
+FILE_LOG_MAX_BYTES = 10 * 1024 * 1024
+FILE_LOG_BACKUP_COUNT = 3
+
+
 def configure_file_logging(logger_name: str = None) -> bool:
     """
     Configure file logging based on stateless mode setting.
@@ -178,6 +184,23 @@ def configure_file_logging(logger_name: str = None) -> bool:
         logger.debug("File logging disabled in stateless mode")
         return False
 
+    # Explicit opt-out. The debug file captures DEBUG-level output, which
+    # includes Gmail/Drive query strings, identities and Google API error
+    # bodies. On a hosted deployment (Render) stdout is already retained by
+    # the platform, so the on-container file is pure liability: set
+    # WORKSPACE_MCP_FILE_LOGGING=false there. Local stdio development keeps
+    # the file by default.
+    if os.getenv(FILE_LOGGING_ENV, "true").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        logging.getLogger(logger_name).debug(
+            "File logging disabled via %s", FILE_LOGGING_ENV
+        )
+        return False
+
     # Configure file logging for normal mode
     try:
         target_logger = logging.getLogger(logger_name)
@@ -186,7 +209,15 @@ def configure_file_logging(logger_name: str = None) -> bool:
         log_file_dir = os.path.dirname(log_file_dir)
         log_file_path = os.path.join(log_file_dir, "mcp_server_debug.log")
 
-        file_handler = logging.FileHandler(log_file_path, mode="a")
+        # Rotate so an always-on DEBUG log can never fill the filesystem:
+        # 10 MiB x 3 backups, ~40 MiB worst case.
+        file_handler = RotatingFileHandler(
+            log_file_path,
+            mode="a",
+            maxBytes=FILE_LOG_MAX_BYTES,
+            backupCount=FILE_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
         file_handler.setLevel(logging.DEBUG)
 
         file_formatter = logging.Formatter(

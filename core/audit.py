@@ -14,6 +14,7 @@ import gc
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -334,6 +335,17 @@ def _inspect_result_for_error(result: Any) -> tuple[bool, str]:
                     )
                     return True, f"replies[{i}].error: {msg}"[:300]
     return False, ""
+
+
+# Google's HttpError.__str__ embeds the failing request URL, and Drive/Gmail
+# list URLs carry the search expression in the query string (``?q=...``).
+# Strip every URL query string before the text reaches the audit sheet so the
+# ``error`` column cannot leak what ``params_summary`` already redacts.
+_URL_QUERY_RE = re.compile(r"(https?://[^\s\"'<>]+?)\?[^\s\"'<>]*")
+
+
+def _scrub_error_text(text: str) -> str:
+    return _URL_QUERY_RE.sub(r"\1?<redacted-query>", text or "")
 
 
 def _origin_error_type(e: BaseException) -> str:
@@ -790,7 +802,7 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                 return result
             except Exception as e:
                 status = "error"
-                err = f"{_origin_error_type(e)}: {str(e)[:300]}"
+                err = f"{_origin_error_type(e)}: {_scrub_error_text(str(e))[:300]}"
                 raise
             finally:
                 try:
@@ -802,7 +814,7 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                         is_err, detail = _inspect_result_for_error(result)
                         if is_err:
                             status = "error"
-                            err = detail
+                            err = _scrub_error_text(detail)
                     # Extract resource_id eagerly so we can drop the full
                     # response body before yielding to the queue submit.
                     # Sheets calls with includeValuesInResponse=True can echo
