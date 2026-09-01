@@ -9,6 +9,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
 from fastmcp.server.auth.providers.google import GoogleProvider
 
 from auth.oauth21_session_store import get_oauth21_session_store, set_auth_provider
@@ -20,6 +21,7 @@ from auth.oauth_responses import (
     create_server_error_response,
 )
 from auth.auth_info_middleware import AuthInfoMiddleware
+from auth.access_policy_middleware import AccessPolicyMiddleware
 from auth.scopes import SCOPES, get_current_scopes  # noqa
 from core.config import (
     USER_GOOGLE_EMAIL,
@@ -165,10 +167,30 @@ logger.info("Audit logging: server.tool patched")
 auth_info_middleware = AuthInfoMiddleware()
 server.add_middleware(auth_info_middleware)
 
+# Group-based tool access policy. Must be added AFTER AuthInfoMiddleware:
+# FastMCP runs middleware in registration order (first added = outermost),
+# and this one reads the identity the auth middleware puts on the context.
+# Inert until MCP_GROUP_POLICY_MODE=enforce; see core/access_policy.py.
+access_policy_middleware = AccessPolicyMiddleware()
+server.add_middleware(access_policy_middleware)
+
 
 def _parse_bool_env(value: str) -> bool:
     """Parse environment variable string to boolean."""
     return value.lower() in ("1", "true", "yes", "on")
+
+
+ALLOWED_CLIENT_REDIRECT_URIS_ENV = "MCP_ALLOWED_CLIENT_REDIRECT_URIS"
+
+
+def _allowed_client_redirect_uris() -> Optional[List[str]]:
+    """Comma-separated redirect URI patterns for dynamic client registration.
+
+    Unset or blank -> ``None`` (FastMCP default: every redirect URI accepted).
+    """
+    raw = os.getenv(ALLOWED_CLIENT_REDIRECT_URIS_ENV, "")
+    patterns = [p.strip() for p in raw.split(",") if p.strip()]
+    return patterns or None
 
 
 def set_transport_mode(mode: str):
@@ -502,6 +524,16 @@ def configure_server_for_http():
                 from auth.scopes import BASE_SCOPES
 
                 identity_gate_scopes = sorted(set(BASE_SCOPES))
+                provider_kwargs = {}
+                allowed_redirects = _allowed_client_redirect_uris()
+                if allowed_redirects is not None:
+                    # Restrict dynamic client registration to known MCP
+                    # clients. FastMCP's default (None) accepts ANY redirect
+                    # URI, so an attacker could register their own "client"
+                    # against this server and phish a staff member into
+                    # authorising it. Patterns support wildcards, e.g.
+                    # "http://localhost:*" for Claude Desktop / Claude Code.
+                    provider_kwargs["allowed_client_redirect_uris"] = allowed_redirects
                 provider = GoogleProvider(
                     client_id=config.client_id,
                     client_secret=config.client_secret,
@@ -511,6 +543,7 @@ def configure_server_for_http():
                     valid_scopes=required_scopes,
                     client_storage=client_storage,
                     jwt_signing_key=jwt_signing_key,
+                    **provider_kwargs,
                 )
                 # Enable protocol-level auth
                 server.auth = provider
@@ -522,6 +555,17 @@ def configure_server_for_http():
                     identity_gate_scopes,
                     len(required_scopes),
                 )
+                if allowed_redirects is None:
+                    logger.warning(
+                        "OAuth 2.1: MCP_ALLOWED_CLIENT_REDIRECT_URIS is unset, so "
+                        "dynamic client registration accepts any redirect URI. "
+                        "Set it before adding more users."
+                    )
+                else:
+                    logger.info(
+                        "OAuth 2.1: client redirect URIs restricted to %s",
+                        allowed_redirects,
+                    )
 
                 # Explicitly mount well-known routes from the OAuth provider
                 # These should be auto-mounted but we ensure they're available
@@ -685,6 +729,57 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
     except Exception as e:
         logger.error(f"Error processing OAuth callback: {str(e)}", exc_info=True)
         return create_server_error_response(str(e))
+
+
+@server.tool()
+async def get_my_access() -> str:
+    """Show which tools the group access policy allows for the signed-in user.
+
+    Reports the caller's verified email, the policy groups they belong to,
+    where the decision came from (policy, break-glass, lookup failure, or
+    policy disabled) and the resulting tool list. Reads nothing from Google
+    Workspace and is always callable, so a user who has been denied a tool
+    can find out why without an administrator.
+    """
+    from core.access_policy import get_engine
+    from core.tool_registry import get_tool_components
+
+    email = None
+    try:
+        ctx = get_context()
+        if ctx is not None:
+            email = await ctx.get_state("authenticated_user_email")
+    except Exception as exc:
+        logger.debug(f"[get_my_access] could not read identity: {exc}")
+
+    registered = sorted(get_tool_components(server).keys())
+    try:
+        engine = get_engine()
+    except Exception as exc:
+        return (
+            f"Signed in as: {email or '<unknown>'}\n"
+            f"Access policy: FAILED TO LOAD ({exc}). No tools are permitted "
+            "until an administrator fixes core/group_policy.yaml."
+        )
+
+    decision = await engine.decide(email, registered)
+    lines = [f"Signed in as: {decision.email or '<unknown>'}"]
+    if not engine.enabled:
+        lines.append(
+            "Access policy: off (MCP_GROUP_POLICY_MODE is not 'enforce'); every "
+            "registered tool is available."
+        )
+    else:
+        lines.append(
+            f"Access policy: enforce (membership via {engine.source_name}); "
+            f"decision source: {decision.source}"
+        )
+        if decision.reason:
+            lines.append(f"Reason: {decision.reason}")
+        lines.append("Policy groups: " + (", ".join(sorted(decision.groups)) or "none"))
+    lines.append(f"Allowed tools ({len(decision.allowed)} of {len(registered)}):")
+    lines.extend(f"  - {name}" for name in sorted(decision.allowed))
+    return "\n".join(lines)
 
 
 @server.tool()

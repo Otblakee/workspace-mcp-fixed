@@ -61,6 +61,26 @@ def _normalise_email(value: str, *, field: str) -> str:
     return email
 
 
+def _refuse_if_policy_group(group_key: str) -> None:
+    """Refuse to touch a group that decides MCP tool access.
+
+    The groups named in ``core/group_policy.yaml`` are the access-control
+    list for this server. If they could be edited through this server, any
+    caller allowed ``add_group_member`` could add themselves to the admin
+    group and escalate. Their membership is managed in the Admin console
+    only. Checked before any Directory call is made.
+    """
+    from core.access_policy import is_policy_group
+
+    if is_policy_group(group_key):
+        raise UserInputError(
+            f"Refusing to modify '{group_key}': it is an MCP access-policy "
+            "group (core/group_policy.yaml). Membership of policy groups is "
+            "managed in the Google Admin console only, never through this "
+            "server."
+        )
+
+
 async def _get_group(service, group_key: str) -> Optional[Dict[str, Any]]:
     """Fetch a group by email or ID; None when it does not exist."""
     try:
@@ -177,6 +197,7 @@ async def create_group(
         CLI / the Admin Console.
     """
     group_email = _normalise_email(email, field="email")
+    _refuse_if_policy_group(group_email)
 
     existing = await _get_group(service, group_email)
     if existing is not None:
@@ -252,6 +273,7 @@ async def add_group_member(
     """
     group_key = _normalise_email(group_email, field="group_email")
     member_key = _normalise_email(member_email, field="member_email")
+    _refuse_if_policy_group(group_key)
     member_role = (role or "MEMBER").strip().upper()
     if member_role not in VALID_MEMBER_ROLES:
         raise UserInputError(
@@ -373,6 +395,7 @@ async def remove_group_member(
     """
     group_key = _normalise_email(group_email, field="group_email")
     member_key = _normalise_email(member_email, field="member_email")
+    _refuse_if_policy_group(group_key)
 
     group = await _get_group(service, group_key)
     if group is None:

@@ -16,6 +16,12 @@ logger = logging.getLogger(__name__)
 # Global registry of enabled tools
 _enabled_tools: Optional[Set[str]] = None
 
+# Tools that stay registered under every --tool-tier / --tools combination.
+# They belong to no Google service (so no tier lists them) and carry no
+# Google scope. ``get_my_access`` reports the caller's own access decision;
+# see core/access_policy.py.
+ALWAYS_ENABLED_TOOLS = frozenset({"get_my_access"})
+
 
 def set_enabled_tools(tool_names: Optional[Set[str]]):
     """Set the globally enabled tools."""
@@ -30,6 +36,8 @@ def get_enabled_tools() -> Optional[Set[str]]:
 
 def is_tool_enabled(tool_name: str) -> bool:
     """Check if a specific tool is enabled."""
+    if tool_name in ALWAYS_ENABLED_TOOLS:
+        return True
     if _enabled_tools is None:
         return True  # All tools enabled by default
     return tool_name in _enabled_tools

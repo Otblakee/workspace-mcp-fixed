@@ -58,9 +58,51 @@ services:
       - key: TOOLS
         value: gmail drive calendar docs sheets contacts
 
-      # ---- OAuth 2.1 mode (per CLAUDE.md, single-user oliver@otbgroup.co.uk) ----
+      # ---- tool tier: CLAUDE.md requires "extended" so the Drive
+      #      architecture tools and delete_gmail_draft replacement load ----
+      - key: TOOL_TIER
+        value: extended
+
+      # ---- OAuth 2.1 mode (FastMCP GoogleProvider proxy) ----
       - key: MCP_ENABLE_OAUTH21
         value: "true"
+
+      # ---- identity boundary ----
+      # Only Google accounts on these domains may complete authentication.
+      # Without it any Google account that finishes the OAuth flow gets a
+      # session (with its own data, but on our server and our quota).
+      - key: OAUTH_ALLOWED_EMAIL_DOMAINS
+        value: otbgroup.co.uk
+
+      # ---- dynamic client registration allowlist ----
+      # Comma-separated redirect URI patterns MCP clients may register with.
+      # Unset = FastMCP default = any URI (a phishable "register your own
+      # client" surface). Set in the dashboard once the real client URIs are
+      # confirmed from the Render logs, e.g.
+      #   https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback,http://localhost:*
+      - key: MCP_ALLOWED_CLIENT_REDIRECT_URIS
+        sync: false
+
+      # ---- group-based tool access policy (core/access_policy.py) ----
+      # "off" keeps today's behaviour (every otbgroup.co.uk user gets every
+      # tool). Flip to "enforce" only after the CLAUDE.md multi-user rollout
+      # checklist is complete: groups created, service account granted the
+      # Groups Reader role, secrets below set, get_my_access verified.
+      - key: MCP_GROUP_POLICY_MODE
+        value: "off"
+      # Service account key (base64 of the JSON key file) used ONLY for
+      # Directory members.hasMember. Prefer a Render Secret File plus
+      # MCP_GROUP_POLICY_SA_JSON_FILE=/etc/secrets/<name> if available.
+      - key: MCP_GROUP_POLICY_SA_JSON_B64
+        sync: false
+      # Accounts that bypass the group lookup with full access (loudly logged).
+      # Owner only; this is the "Directory API is down" escape hatch.
+      - key: MCP_GROUP_POLICY_BREAKGLASS_EMAILS
+        sync: false
+
+      # ---- Drive soft-delete holding folder (CLAUDE.md destructive-tool trim) ----
+      - key: DRIVE_HOLDING_FOLDER_ID
+        sync: false
 
       # ---- audit logger tunables (see CLAUDE.md) ----
       - key: AUDIT_FLUSH_INTERVAL_S

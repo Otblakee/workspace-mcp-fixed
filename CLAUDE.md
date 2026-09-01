@@ -613,3 +613,109 @@ Record real numbers in `FOLLOWUPS.md` after the first live pilot.
 The suite is unit-scope with mocked Google services. Before the architecture
 build runs for real, execute the scratch-shared-drive checks listed in
 `FOLLOWUPS.md` under "Live scratch-drive verification".
+
+## Group-based tool access policy (claude/multi-account-workspace-groups-2dnyhi)
+
+Google Workspace group membership decides which MCP tools each signed-in user
+can see and call. Two sources of truth, deliberately separated:
+
+- **Who** is in a group: the Google Admin console. Joiners, leavers and role
+  changes are a group edit there, with Google's audit trail.
+- **What** a group may do: `core/group_policy.yaml`, version-controlled and
+  changed by PR.
+
+This narrows what the assistant may *do* on a user's behalf. It never widens
+what a user can *see*: every tool still runs with the caller's own OAuth token,
+so Google's permissions remain the outer boundary.
+
+**Files**
+
+- `core/access_policy.py` — policy model, selector expansion, membership
+  sources, TTL cache, decision engine. No FastMCP dependency; fully unit-tested.
+- `core/group_policy.yaml` — the shipped OTB policy (three groups: admins,
+  managers, staff).
+- `auth/access_policy_middleware.py` — `AccessPolicyMiddleware`: filters
+  `tools/list`, refuses disallowed `tools/call` with an `AuthorizationError`
+  and writes a `status=denied` row to the audit sheet.
+- `get_my_access` tool (`core/server.py`) — always callable; reports the
+  caller's email, policy groups, decision source and allowed tool list.
+- Tests: `tests/test_access_policy.py`, `tests/test_access_policy_middleware.py`,
+  `tests/test_policy_group_guard.py`, `tests/test_auth_middleware_hooks.py`.
+
+**Policy grammar.** `allow` / `deny` lists per group take `"*"`, `"<service>.*"`,
+`"<service>.<tier>"` (cumulative like `--tool-tier`) or a bare tool name. A
+tool name that does not exist in `core/tool_tiers.yaml`, or that is in
+`BLOCKED_TOOLS`, makes the policy fail to load (typos must not silently grant
+nothing). A user's allowed set is the union over matched groups of
+`(allow − deny)`, plus `default`, plus `get_my_access`. A `deny` subtracts only
+from its own group; the hard global stop for a tool is still `BLOCKED_TOOLS`.
+
+**Membership lookup.** `members.hasMember` on the Directory API, once per
+policy group per user, cached for `MCP_GROUP_POLICY_CACHE_TTL_S` (300 s).
+`hasMember` reports direct *and nested* membership within the domain (per the
+Directory API discovery document), so groups can contain groups. Cloud
+Identity's transitive-membership API was rejected: it needs Enterprise or
+Cloud Identity Premium. The lookup identity is a dedicated service account:
+either holding a Workspace admin role with the Groups > Read privilege (assign
+under Admin console → Account → Admin roles → role → *Assign service accounts*;
+no domain-wide delegation), or, if that is unavailable, domain-wide delegation
+impersonating `MCP_GROUP_POLICY_SUBJECT` with exactly the scope
+`admin.directory.group.member.readonly`. A user's own token is never used to
+decide that user's permissions.
+
+**Failure behaviour (fail-closed).** Lookup error with no cached answer, or a
+cached answer older than `MCP_GROUP_POLICY_STALE_TTL_S` (3600 s), means the
+user gets `get_my_access` only. A policy file that does not parse means *every*
+user gets `get_my_access` only, with the parse error in the log and in the
+denial message. `MCP_GROUP_POLICY_BREAKGLASS_EMAILS` names accounts that skip
+the lookup and get the full registered set (minus `BLOCKED_TOOLS`), logged at
+WARNING on every decision: the owner's escape hatch if the Directory API is
+down. Keep it to one address.
+
+**Enforcement points.** `AuthInfoMiddleware` now also runs on `tools/list`, so
+the policy middleware (added directly after it; FastMCP runs middleware in
+registration order) can filter the listing per user. A refused call is audited
+with `status=denied`, `error=policy: …` and the user's groups in
+`params_summary`, because the audited tool wrapper never runs for a refused
+call. stdio transport skips the policy (no OAuth identity there), matching
+FastMCP's own `AuthMiddleware`.
+
+**`gadmin_write` guard.** `create_group`, `add_group_member` and
+`remove_group_member` refuse any group named in the policy file, before any
+Directory call. Otherwise a user allowed `add_group_member` could add
+themselves to `mcp-admins`. Policy-group membership is Admin-console-only.
+Make the policy groups admin-managed and closed in Groups settings (nobody can
+join, nobody but admins can add members) so the same escalation is impossible
+through Google Groups itself.
+
+**Env vars (all optional; defaults keep today's behaviour)**
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `MCP_GROUP_POLICY_MODE` | `off` | `enforce` switches the policy on. |
+| `MCP_GROUP_POLICY_FILE` | `core/group_policy.yaml` | Policy path override. |
+| `MCP_GROUP_POLICY_SA_JSON_FILE` | unset | Path to the service-account key (Render Secret File). Preferred. |
+| `MCP_GROUP_POLICY_SA_JSON_B64` | unset | Base64 of the key JSON; used if the file var is unset. |
+| `MCP_GROUP_POLICY_SUBJECT` | unset | Admin to impersonate via DWD. Leave unset when the SA holds the Groups Reader role itself. |
+| `MCP_GROUP_POLICY_BREAKGLASS_EMAILS` | unset | Comma-separated full-access accounts. |
+| `MCP_GROUP_POLICY_CACHE_TTL_S` | `300` | Fresh-cache window per user. |
+| `MCP_GROUP_POLICY_STALE_TTL_S` | `3600` | How long a stale answer may be served during a Directory outage. |
+| `MCP_GROUP_POLICY_STATIC_MEMBERS` | unset | JSON `{group: [emails]}`; dev/test only, ignored when a service account is set. |
+
+**Also in this branch**
+
+- `OAUTH_ALLOWED_EMAIL_DOMAINS` rejection is now explicit: a verified token
+  from a foreign domain gets an `AuthorizationError` on `tools/call` instead
+  of a confusing "no authenticated user" failure inside the tool.
+- `MCP_ALLOWED_CLIENT_REDIRECT_URIS` (comma-separated patterns) is passed to
+  FastMCP's `GoogleProvider` as `allowed_client_redirect_uris`. Unset keeps
+  FastMCP's default, which accepts *any* redirect URI at dynamic client
+  registration; a WARNING is logged at startup until it is set.
+- `render.yaml` now carries `TOOL_TIER=extended`,
+  `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk`, `MCP_GROUP_POLICY_MODE=off`
+  and `sync: false` placeholders for the new secrets and
+  `DRIVE_HOLDING_FOLDER_ID`.
+
+**Rollback.** `MCP_GROUP_POLICY_MODE=off` (or unset) makes the middleware a
+pass-through; nothing else changes. The `gadmin_write` guard stays active in
+either mode by design.

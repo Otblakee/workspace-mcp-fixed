@@ -7,6 +7,7 @@ import os
 import time
 from typing import Any, Optional, Tuple
 
+from fastmcp.exceptions import AuthorizationError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.dependencies import get_http_headers
@@ -81,6 +82,41 @@ def _claims_of(token: Any) -> dict:
     return {}
 
 
+REJECTION_STATE_KEY = "auth_rejected_reason"
+
+
+async def _record_rejection(
+    context: MiddlewareContext, email: Optional[str], reason: str
+) -> None:
+    """Remember, for this request only, that a *verified* token was refused
+    by the domain policy. ``on_call_tool`` turns that into an explicit
+    AuthorizationError instead of letting the tool fail later with a
+    confusing "no authenticated user" message. Request-scoped
+    (``serializable=False``) so it can never leak into a later request."""
+    try:
+        await context.fastmcp_context.set_state(
+            REJECTION_STATE_KEY,
+            f"{email or '<no-email>'}: {reason}",
+            serializable=False,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(f"Could not record auth rejection on context: {exc}")
+
+
+async def _raise_if_rejected(context: MiddlewareContext) -> None:
+    if not context.fastmcp_context:
+        return
+    try:
+        rejected = await context.fastmcp_context.get_state(REJECTION_STATE_KEY)
+    except Exception:  # pragma: no cover - defensive
+        rejected = None
+    if rejected:
+        raise AuthorizationError(
+            "This Google account is not permitted to use this server "
+            f"({rejected}). Sign in with an account on an allowed domain."
+        )
+
+
 class AuthInfoMiddleware(Middleware):
     """
     Middleware to extract authentication information from JWT tokens
@@ -118,6 +154,7 @@ class AuthInfoMiddleware(Middleware):
                             f"Rejecting FastMCP-validated token for {user_email}: {reason}"
                         )
                         access_token = None
+                        await _record_rejection(context, user_email, reason)
                     else:
                         logger.info(
                             f"✓ Using FastMCP validated token for user: {user_email}"
@@ -193,6 +230,9 @@ class AuthInfoMiddleware(Middleware):
                                                 f"{user_email or '<no-email>'}: {reason}"
                                             )
                                             verified_auth = None
+                                            await _record_rejection(
+                                                context, user_email, reason
+                                            )
 
                                     if verified_auth:
                                         if isinstance(
@@ -423,6 +463,7 @@ class AuthInfoMiddleware(Middleware):
 
         try:
             await self._process_request_for_auth(context)
+            await _raise_if_rejected(context)
 
             logger.debug("Passing to next handler")
             result = await call_next(context)
@@ -438,6 +479,21 @@ class AuthInfoMiddleware(Middleware):
             else:
                 logger.error(f"Error in on_call_tool middleware: {e}", exc_info=True)
             raise
+
+    async def on_list_tools(self, context: MiddlewareContext, call_next):
+        """Populate identity state for tools/list as well.
+
+        The listing itself needs no Google credentials, but the group access
+        policy (auth/access_policy_middleware.py) filters the list per user
+        and must know who is asking. Failures here are logged and the
+        request continues unauthenticated, which the policy middleware then
+        treats as "no tools" under enforcement.
+        """
+        try:
+            await self._process_request_for_auth(context)
+        except Exception as e:
+            logger.error(f"Error resolving identity for tools/list: {e}", exc_info=True)
+        return await call_next(context)
 
     async def on_get_prompt(self, context: MiddlewareContext, call_next):
         """Extract auth info for prompt requests too"""

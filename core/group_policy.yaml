@@ -1,0 +1,93 @@
+# Group-based tool access policy for the OTB Workspace MCP.
+#
+# WHO is in each group is managed in the Google Admin console (one place).
+# WHAT each group may do is this file (one file, version-controlled).
+# See core/access_policy.py for the selector grammar and the fail-closed rules.
+#
+# Enforcement is switched on with MCP_GROUP_POLICY_MODE=enforce on Render.
+# Until then this file is only used by the gadmin_write guard, which refuses
+# to edit the groups named here through the MCP.
+#
+# Rules are additive: a user in several groups gets the union of each group's
+# (allow - deny). A deny only subtracts from its own group. The hard global
+# stop for a tool is core/tool_policy.py BLOCKED_TOOLS, not this file.
+#
+# Selector grammar:
+#   "*"                  every registered tool
+#   "<service>.*"        every tool of that service in core/tool_tiers.yaml
+#   "<service>.<tier>"   that service's tools up to and including the tier
+#                        (core < extended < complete, cumulative like --tool-tier)
+#   "<tool_name>"        one tool (must exist in core/tool_tiers.yaml)
+#
+# Group emails below are the recommended names. Create them in the Admin
+# console as admin-managed, closed groups (nobody can join or add members
+# except admins) before switching enforcement on.
+
+version: 1
+
+groups:
+
+  mcp-admins@otbgroup.co.uk:
+    description: >
+      Owner and IT. Full tool set, including Drive architecture, permission
+      grants, shared-drive management and every Admin SDK read tool.
+    allow: ["*"]
+
+  mcp-managers@otbgroup.co.uk:
+    description: >
+      Operations and finance managers. Everything staff can do, plus sending
+      email, calendar sharing and Drive sharing links. No shared-drive or
+      permission administration, no Admin SDK.
+    allow:
+      - gmail.extended
+      - drive.core
+      - list_drive_items
+      - copy_drive_file
+      - update_drive_file
+      - soft_delete_drive_file
+      - restore_drive_file
+      - get_drive_file_metadata
+      - download_drive_file
+      - calendar.extended
+      - docs.complete
+      - sheets.complete
+      - contacts.complete
+    deny:
+      - create_gmail_filter
+
+  mcp-staff@otbgroup.co.uk:
+    description: >
+      Everyone else who is enabled. Read, search, draft and create within
+      their own Google account. No outbound send, no sharing, no filters,
+      no soft-delete, no Drive administration.
+    allow:
+      - search_gmail_messages
+      - get_gmail_message_content
+      - get_gmail_messages_content_batch
+      - get_gmail_thread_content
+      - get_gmail_attachment_content
+      - list_gmail_labels
+      - draft_gmail_message
+      - search_drive_files
+      - get_drive_file_content
+      - get_drive_file_download_url
+      - create_drive_file
+      - create_drive_folder
+      - import_to_google_doc
+      - list_drive_items
+      - get_drive_file_metadata
+      - list_calendars
+      - get_events
+      - create_event
+      - modify_event
+      - query_freebusy
+      - docs.extended
+      - sheets.extended
+      - search_contacts
+      - get_contact
+      - list_contacts
+
+# Applied to every authenticated user, in or out of any group above. Empty
+# means "no group, no tools" (apart from get_my_access, which is always on).
+default:
+  allow: []
