@@ -27,10 +27,12 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
 from core.attachment_storage import get_attachment_storage, get_attachment_url
+from core.access_policy import require_capability
 from core.utils import extract_office_xml_text, handle_http_errors, validate_file_path
 from core.server import server
 from core.config import get_transport_mode
 from gdrive.drive_helpers import (
+    assert_internal_destination,
     DRIVE_QUERY_PATTERNS,
     FOLDER_MIME_TYPE,
     build_drive_list_params,
@@ -67,6 +69,16 @@ INLINE_DOWNLOAD_MAX_BYTES = int(
 CONTENT_MAX_BYTES = int(os.getenv("WORKSPACE_CONTENT_MAX_BYTES", str(25 * 1024 * 1024)))
 # Cap for import_to_google_doc's file_url branch (spooled to temp file).
 MAX_IMPORT_URL_BYTES = 50 * 1024 * 1024
+
+
+async def resolve_destination_folder_id(service, folder_id: str, *, action: str) -> str:
+    """Resolve a *destination* folder and refuse externally owned ones unless
+    the caller holds the ``external_share`` capability (see
+    ``gdrive.drive_helpers.assert_internal_destination``). Goes through this
+    module's ``resolve_folder_id`` name so tests can stub resolution."""
+    resolved = await resolve_folder_id(service, folder_id)
+    await assert_internal_destination(service, resolved, action=action)
+    return resolved
 
 
 @server.tool()
@@ -551,7 +563,9 @@ async def _create_drive_folder_impl(
     parent_folder_id: str = "root",
 ) -> str:
     """Internal implementation for create_drive_folder. Used by tests."""
-    resolved_folder_id = await resolve_folder_id(service, parent_folder_id)
+    resolved_folder_id = await resolve_destination_folder_id(
+        service, parent_folder_id, action="_create_drive_folder_impl"
+    )
     file_metadata = {
         "name": folder_name,
         "parents": [resolved_folder_id],
@@ -662,7 +676,9 @@ async def create_drive_file(
         )
 
     file_data = None
-    resolved_folder_id = await resolve_folder_id(service, folder_id)
+    resolved_folder_id = await resolve_destination_folder_id(
+        service, folder_id, action="create_drive_file"
+    )
 
     file_metadata = {
         "name": file_name,
@@ -676,6 +692,11 @@ async def create_drive_file(
 
         # Check if this is a file:// URL
         parsed_url = urlparse(fileUrl)
+        if parsed_url.scheme in ("http", "https"):
+            await require_capability(
+                "url_fetch",
+                action="Fetching a file from a URL on the server's behalf",
+            )
         if parsed_url.scheme == "file":
             # Handle file:// URL - read from local filesystem
             logger.info(
@@ -1341,7 +1362,9 @@ async def import_to_google_doc(
     doc_name = Path(file_name).stem if Path(file_name).suffix else file_name
 
     # Resolve folder
-    resolved_folder_id = await resolve_folder_id(service, folder_id)
+    resolved_folder_id = await resolve_destination_folder_id(
+        service, folder_id, action="import_to_google_doc"
+    )
 
     # File metadata - destination is Google Docs format
     file_metadata = {
@@ -1416,6 +1439,9 @@ async def import_to_google_doc(
         parsed_url = urlparse(file_url)
         if parsed_url.scheme not in ("http", "https"):
             raise ValueError(f"file_url must be http:// or https://, got: {file_url}")
+        await require_capability(
+            "url_fetch", action="Importing a file from a URL on the server's behalf"
+        )
 
         # SSRF protection: block internal/private network URLs and validate
         # redirects. Stream into a SpooledTemporaryFile with a hard byte cap
@@ -1840,7 +1866,9 @@ async def update_drive_file(
 
         resolved_ids = []
         for parent in parent_ids:
-            resolved_parent = await resolve_folder_id(service, parent)
+            resolved_parent = await resolve_destination_folder_id(
+                service, parent, action="update_drive_file"
+            )
             resolved_ids.append(resolved_parent)
         return ",".join(resolved_ids)
 
@@ -2606,7 +2634,9 @@ async def copy_drive_file(
     file_id = resolved_file_id
     original_name = file_metadata.get("name", "Unknown File")
 
-    resolved_folder_id = await resolve_folder_id(service, parent_folder_id)
+    resolved_folder_id = await resolve_destination_folder_id(
+        service, parent_folder_id, action="copy_drive_file"
+    )
 
     copy_body = {}
     if new_name:

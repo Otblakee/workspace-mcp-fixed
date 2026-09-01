@@ -12,6 +12,14 @@
 # (allow - deny). A deny only subtracts from its own group. The hard global
 # stop for a tool is core/tool_policy.py BLOCKED_TOOLS, not this file.
 #
+# Capabilities (per group, additive) gate actions a tool name cannot express:
+#   url_fetch            server-side fetch of a URL (create_drive_file fileUrl,
+#                        import_to_google_doc file_url)
+#   external_share       Drive/Calendar grants to, or writes into folders owned
+#                        by, addresses outside OAUTH_ALLOWED_EMAIL_DOMAINS;
+#                        calendar owner grants; individual Drive grants
+#   external_recipients  email and calendar invitations to outside addresses
+#
 # Selector grammar:
 #   "*"                  every registered tool
 #   "<service>.*"        every tool of that service in core/tool_tiers.yaml
@@ -32,6 +40,7 @@ groups:
       Owner and IT. Full tool set, including Drive architecture, permission
       grants, shared-drive management and every Admin SDK read tool.
     allow: ["*"]
+    capabilities: [url_fetch, external_share, external_recipients]
 
   mcp-managers@otbgroup.co.uk:
     description: >
@@ -54,6 +63,7 @@ groups:
       - contacts.complete
     deny:
       - create_gmail_filter
+    capabilities: [external_recipients]
 
   mcp-staff@otbgroup.co.uk:
     description: >

@@ -131,13 +131,91 @@ def _audit_denied(
         logger.error("access policy: audit submit for denial failed: %s", exc)
 
 
+# Per-user call caps on the tools whose repetition is itself the damage
+# (bulk soft-delete, bulk trash, mass mail, mass sharing). Applied only under
+# enforce mode; (max_calls, window_seconds). Override with MCP_TOOL_RATE_LIMITS
+# as JSON, e.g. {"soft_delete_drive_file": [50, 600]}; a limit of 0 disables.
+DEFAULT_RATE_LIMITS: dict = {
+    "soft_delete_drive_file": (20, 600),
+    "modify_gmail_message_labels": (60, 600),
+    "send_gmail_message": (30, 600),
+    "update_drive_file": (60, 600),
+    "share_calendar": (5, 600),
+    "set_drive_permission": (20, 600),
+    "create_gmail_filter": (5, 600),
+    "create_event": (60, 600),
+}
+RATE_LIMITS_ENV = "MCP_TOOL_RATE_LIMITS"
+
+
+def _load_rate_limits() -> dict:
+    import json
+    import os
+
+    limits = dict(DEFAULT_RATE_LIMITS)
+    raw = (os.getenv(RATE_LIMITS_ENV) or "").strip()
+    if not raw:
+        return limits
+    try:
+        override = json.loads(raw)
+        if not isinstance(override, dict):
+            raise ValueError("must be a JSON object")
+        for tool, spec in override.items():
+            if spec in (0, None, [], [0, 0]):
+                limits.pop(tool, None)
+                continue
+            count, window = spec
+            limits[str(tool)] = (int(count), float(window))
+    except Exception as exc:
+        logger.error("access policy: ignoring invalid %s (%s)", RATE_LIMITS_ENV, exc)
+    return limits
+
+
+class _RateLimiter:
+    """Sliding-window counter per (user, tool). Process-local."""
+
+    def __init__(self, limits: Optional[dict] = None, clock=time.monotonic):
+        self.limits = limits if limits is not None else _load_rate_limits()
+        self._clock = clock
+        self._hits: dict = {}
+
+    def check(self, user: str, tool: str) -> Optional[str]:
+        """Record a call; return a refusal reason when over the cap."""
+        spec = self.limits.get(tool)
+        if not spec:
+            return None
+        max_calls, window = spec
+        now = self._clock()
+        key = (user, tool)
+        hits = [t for t in self._hits.get(key, []) if now - t < window]
+        if len(hits) >= max_calls:
+            self._hits[key] = hits
+            return (
+                f"rate limit: {max_calls} calls of {tool} per {int(window)}s "
+                "reached; wait or ask an admin to do this in bulk"
+            )
+        hits.append(now)
+        self._hits[key] = hits
+        return None
+
+
 class AccessPolicyMiddleware(Middleware):
     """Filter ``tools/list`` and gate ``tools/call`` by group policy."""
 
-    def __init__(self, engine: Optional[AccessPolicyEngine] = None):
+    def __init__(
+        self,
+        engine: Optional[AccessPolicyEngine] = None,
+        rate_limiter: Optional[_RateLimiter] = None,
+    ):
         super().__init__()
         self._engine_override = engine
         self._engine_error: Optional[str] = None
+        self._rate_limiter = rate_limiter
+
+    def _limiter(self) -> _RateLimiter:
+        if self._rate_limiter is None:
+            self._rate_limiter = _RateLimiter()
+        return self._rate_limiter
 
     def _engine(self) -> Optional[AccessPolicyEngine]:
         """The engine, or ``None`` when the policy failed to load.
@@ -217,6 +295,16 @@ class AccessPolicyMiddleware(Middleware):
         email = await _identity(context)
         decision = await engine.decide(email, {tool_name})
         if decision.permits(tool_name):
+            if decision.source != "breakglass":
+                refusal = self._limiter().check(decision.email or "", tool_name)
+                if refusal:
+                    _audit_denied(tool_name, decision, started, refusal)
+                    logger.warning(
+                        "access policy: RATE-LIMITED %s for %s",
+                        tool_name,
+                        decision.email,
+                    )
+                    raise AuthorizationError(f"Tool '{tool_name}' refused: {refusal}.")
             return await call_next(context)
 
         if decision.source == "unauthenticated":

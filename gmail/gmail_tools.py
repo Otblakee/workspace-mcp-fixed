@@ -7,6 +7,7 @@ This module provides MCP tools for interacting with the Gmail API.
 import logging
 import asyncio
 import base64
+import email.utils as email_utils
 import os
 import ssl
 import mimetypes
@@ -22,7 +23,7 @@ from email.utils import formataddr
 from pydantic import Field
 
 from auth.service_decorator import require_google_service, require_multiple_services
-from core.utils import handle_http_errors, validate_file_path
+from core.utils import UserInputError, handle_http_errors, validate_file_path
 from core.server import server
 from auth.scopes import (
     GMAIL_SEND_SCOPE,
@@ -242,6 +243,58 @@ def _sanitize_header_value(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     return value.replace("\r", "").replace("\n", "").replace("\x00", "")
+
+
+def _addresses_in(*fields: Optional[str]) -> List[str]:
+    """Bare addresses from To/Cc/Bcc header values ("Name <a@b>", lists)."""
+    out: List[str] = []
+    for field in fields:
+        if not field:
+            continue
+        for _name, addr in email_utils.getaddresses([field]):
+            if addr:
+                out.append(addr.strip().lower())
+    return out
+
+
+async def _require_internal_recipients(*fields: Optional[str]) -> None:
+    """Sending outside the organisation needs the external_recipients capability."""
+    from core.access_policy import external_addresses, require_capability
+
+    outside = external_addresses(_addresses_in(*fields))
+    if outside:
+        await require_capability(
+            "external_recipients",
+            action=f"Sending email to addresses outside the organisation ({', '.join(outside[:3])})",
+        )
+
+
+_FORBIDDEN_FILTER_LABELS = {"TRASH", "SPAM"}
+
+
+def _validate_filter_action(action: Dict[str, Any]) -> None:
+    """Refuse filter actions that hide or exfiltrate mail.
+
+    ``forward`` is a persistent copy of every matching message to an outside
+    address; adding TRASH or SPAM makes matching mail vanish from the inbox.
+    Both are the classic post-compromise persistence moves, and neither is
+    something the assistant needs to do: configure them in Gmail settings.
+    """
+    if not isinstance(action, dict):
+        raise UserInputError("action must be an object")
+    if action.get("forward"):
+        raise UserInputError(
+            "Filter actions that forward mail are not permitted through this "
+            "server. Configure forwarding in Gmail settings if it is intended."
+        )
+    bad = _FORBIDDEN_FILTER_LABELS & {
+        str(label).upper() for label in (action.get("addLabelIds") or [])
+    }
+    if bad:
+        raise UserInputError(
+            f"Filter actions that add {', '.join(sorted(bad))} are not permitted "
+            "through this server (they make matching mail disappear)."
+        )
 
 
 def _reject_local_path_for_remote_clients(file_path: str) -> None:
@@ -1302,6 +1355,7 @@ async def send_gmail_message(
     # Prepare the email message
     # Use from_email (Send As alias) if provided, otherwise default to authenticated user
     sender_email = from_email or user_google_email
+    await _require_internal_recipients(to, cc, bcc)
     raw_message, thread_id_final = _prepare_gmail_message(
         subject=subject,
         body=body,
@@ -2011,6 +2065,7 @@ async def create_gmail_filter(
     """
     logger.info("[create_gmail_filter] Invoked")
 
+    _validate_filter_action(action)
     filter_body = {"criteria": criteria, "action": action}
 
     created_filter = await asyncio.to_thread(

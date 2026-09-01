@@ -50,6 +50,7 @@ from googleapiclient.errors import HttpError
 
 from auth.service_decorator import require_google_service
 from core.server import server
+from core.access_policy import external_addresses, require_capability
 from core.utils import UserInputError, handle_http_errors
 from gdrive.drive_batch import (
     SHORTCUT_MIME_TYPE,
@@ -710,6 +711,18 @@ async def set_drive_permission(
     Returns:
         str: Confirmation including the resulting permission ID.
     """
+    if allow_individual or external_addresses([principal]):
+        await require_capability(
+            "external_share",
+            action=(
+                f"Granting Drive access to {principal}"
+                + (
+                    " as an individual"
+                    if allow_individual
+                    else " (outside the organisation)"
+                )
+            ),
+        )
     if not file_or_drive_id or not file_or_drive_id.strip():
         raise UserInputError("file_or_drive_id is required.")
 

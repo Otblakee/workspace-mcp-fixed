@@ -103,6 +103,21 @@ DIRECTORY_MEMBER_READ_SCOPE = (
 )
 LOOKUP_SCOPES = [DIRECTORY_MEMBER_READ_SCOPE]
 
+# Parameter-level permissions a group can carry in addition to tools. Tools
+# consult these for actions that a tool name alone cannot express:
+#   url_fetch            create_drive_file(fileUrl=http…) / import_to_google_doc(file_url=…):
+#                        the server fetches an arbitrary URL on the caller's behalf
+#   external_share       granting access, or writing into a folder, outside the
+#                        organisation's domains (set_drive_permission, share_calendar,
+#                        externally owned destination folders)
+#   external_recipients  sending email or calendar invitations to addresses outside
+#                        the organisation's domains
+# "Outside the organisation" means not in OAUTH_ALLOWED_EMAIL_DOMAINS; when that
+# variable is unset nothing can be classified as external and the guards are inert.
+KNOWN_CAPABILITIES: FrozenSet[str] = frozenset(
+    {"url_fetch", "external_share", "external_recipients"}
+)
+
 # Tools every authenticated user may always call, whatever their groups.
 # ``get_my_access`` only reports the caller's own decision; it reads nothing
 # from Google.
@@ -192,6 +207,7 @@ class GroupRule:
     allow: tuple
     deny: tuple
     description: str = ""
+    capabilities: tuple = ()
 
 
 @dataclass
@@ -257,20 +273,30 @@ def _rule_from_mapping(
         raw = {}
     if not isinstance(raw, dict):
         raise PolicyError(f"{where} must be a mapping with allow/deny keys")
-    unknown = set(raw) - {"allow", "deny", "description"}
+    unknown = set(raw) - {"allow", "deny", "description", "capabilities"}
     if unknown:
         raise PolicyError(f"{where}: unknown keys {sorted(unknown)}")
     allow = _as_selector_list(raw.get("allow"), where=f"{where}.allow")
     deny = _as_selector_list(raw.get("deny"), where=f"{where}.deny")
+    capabilities = _as_selector_list(
+        raw.get("capabilities"), where=f"{where}.capabilities"
+    )
     for sel in allow:
         _validate_selector(sel, catalogue, where=f"{where}.allow")
     for sel in deny:
         _validate_selector(sel, catalogue, where=f"{where}.deny")
+    for cap in capabilities:
+        if cap not in KNOWN_CAPABILITIES:
+            raise PolicyError(
+                f"{where}.capabilities: unknown capability '{cap}' "
+                f"(expected one of {sorted(KNOWN_CAPABILITIES)})"
+            )
     return GroupRule(
         group=group,
         allow=allow,
         deny=deny,
         description=str(raw.get("description") or ""),
+        capabilities=capabilities,
     )
 
 
@@ -371,6 +397,48 @@ def allowed_tools(
     result |= ALWAYS_ALLOWED_TOOLS & cand
     result -= BLOCKED_TOOLS
     return frozenset(result)
+
+
+def capabilities_for(policy: GroupPolicy, groups: Iterable[str]) -> FrozenSet[str]:
+    """Union of the capabilities granted by ``default`` and the matched groups."""
+    rules = [policy.default] + [
+        policy.groups[g] for g in {_norm_email(g) for g in groups} if g in policy.groups
+    ]
+    out: Set[str] = set()
+    for rule in rules:
+        out.update(rule.capabilities)
+    return frozenset(out)
+
+
+# --- organisation boundary ---------------------------------------------------
+
+
+def internal_email_domains() -> FrozenSet[str]:
+    """Domains that count as "inside the organisation" (OAUTH_ALLOWED_EMAIL_DOMAINS)."""
+    raw = os.getenv("OAUTH_ALLOWED_EMAIL_DOMAINS", "")
+    return frozenset(d.strip().lower() for d in raw.split(",") if d.strip())
+
+
+def external_addresses(addresses: Iterable[Optional[str]]) -> List[str]:
+    """Addresses whose domain is outside ``internal_email_domains()``.
+
+    Empty when no internal domains are configured: without a definition of
+    "inside" nothing can be called "outside", and the guards stay inert.
+    """
+    domains = internal_email_domains()
+    if not domains:
+        return []
+    out: List[str] = []
+    for raw in addresses:
+        addr = _norm_email(raw)
+        if not addr:
+            continue
+        if "@" not in addr:
+            out.append(addr)  # cannot be inside without a domain
+            continue
+        if addr.rsplit("@", 1)[1] not in domains:
+            out.append(addr)
+    return out
 
 
 # --- membership sources ----------------------------------------------------
@@ -728,6 +796,29 @@ class AccessPolicyEngine:
             email=norm, groups=groups, allowed=allowed, source="policy"
         )
 
+    async def capabilities(self, email: Optional[str]) -> FrozenSet[str]:
+        """Capabilities the caller holds. Fail closed: no identity, no
+        policy source, or a failed lookup grants nothing."""
+        if not self.enabled:
+            return KNOWN_CAPABILITIES
+        norm = _norm_email(email)
+        if not norm:
+            return frozenset()
+        if norm in self.breakglass:
+            return KNOWN_CAPABILITIES
+        if self.policy is None or self.resolver is None:
+            return frozenset()
+        try:
+            groups = await self.resolver.groups_for(norm)
+        except MembershipLookupError as exc:
+            logger.error(
+                "group policy: capability lookup failed for %s; granting none: %s",
+                norm,
+                exc,
+            )
+            return frozenset()
+        return capabilities_for(self.policy, groups)
+
     # -- construction --------------------------------------------------------
 
     @classmethod
@@ -946,3 +1037,69 @@ def is_policy_group(email: str) -> bool:
         )
         return True
     return engine.policy.is_policy_group(email)
+
+
+# --- capability checks for tools ---------------------------------------------
+
+
+class CapabilityDenied(Exception):
+    """Raised by a tool when the caller's policy groups lack a capability.
+
+    Subclasses ``UserInputError`` when it is importable so
+    ``handle_http_errors`` re-raises it untouched (it is a policy decision,
+    not an API failure).
+    """
+
+
+try:  # pragma: no cover - import shape only
+    from core.utils import UserInputError as _UserInputError
+
+    class CapabilityDenied(_UserInputError):  # type: ignore[no-redef]
+        """See above."""
+
+except Exception:  # pragma: no cover - defensive
+    pass
+
+
+async def current_user_email() -> Optional[str]:
+    """The verified identity on the current FastMCP request, if any."""
+    try:
+        from fastmcp.server.dependencies import get_context
+
+        ctx = get_context()
+        if ctx is None:
+            return None
+        return _norm_email(await ctx.get_state("authenticated_user_email")) or None
+    except Exception:
+        return None
+
+
+async def caller_has_capability(capability: str) -> bool:
+    """True when the policy grants ``capability`` to the current caller.
+
+    Off mode grants everything (single-user behaviour). Under ``enforce``
+    an unloadable policy, a missing identity or a failed membership lookup
+    grants nothing.
+    """
+    if capability not in KNOWN_CAPABILITIES:
+        raise ValueError(f"unknown capability {capability!r}")
+    try:
+        engine = get_engine()
+    except Exception as exc:
+        logger.error("group policy: cannot load policy for capability check: %s", exc)
+        return False
+    if not engine.enabled:
+        return True
+    return capability in await engine.capabilities(await current_user_email())
+
+
+async def require_capability(capability: str, *, action: str) -> None:
+    """Raise ``CapabilityDenied`` unless the caller holds ``capability``."""
+    if await caller_has_capability(capability):
+        return
+    raise CapabilityDenied(
+        f"{action} requires the '{capability}' capability, which the access "
+        "policy does not grant to your Google Groups. Ask a Workspace admin to "
+        "add you to a group that carries it, or call get_my_access to see what "
+        "you hold."
+    )

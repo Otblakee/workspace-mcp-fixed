@@ -680,6 +680,41 @@ the lookup and get the full registered set (minus `BLOCKED_TOOLS`), logged at
 WARNING on every decision: the owner's escape hatch if the Directory API is
 down. Keep it to one address.
 
+**Capabilities (parameter-level permissions).** A tool name cannot express
+"send to an outside address" or "write into a folder someone else owns", so
+each group may also carry `capabilities`, validated against
+`KNOWN_CAPABILITIES`:
+
+| Capability | Gates |
+| --- | --- |
+| `url_fetch` | `create_drive_file(fileUrl=http…)`, `import_to_google_doc(file_url=…)`: the server fetching an arbitrary URL on the caller's behalf (a beacon / exfil channel under prompt injection). |
+| `external_share` | `set_drive_permission` to an individual or an outside address; `share_calendar` to an outside address or as `owner`; creating, copying, importing, exporting or moving anything into a folder owned outside the organisation (`gdrive.drive_helpers.assert_internal_destination`). |
+| `external_recipients` | `send_gmail_message` To/Cc/Bcc outside the organisation; `create_event` / `modify_event` attendees outside the organisation. |
+
+"Outside the organisation" means not in `OAUTH_ALLOWED_EMAIL_DOMAINS`; when
+that variable is unset nothing can be classified as external and the guards
+are inert. In `off` mode every capability is granted, so today's single-user
+behaviour is unchanged. Under `enforce` a denied capability raises
+`CapabilityDenied` (a `UserInputError`) inside the tool, which the audit
+wrapper records as an error row. The shipped policy grants all three to
+`mcp-admins`, `external_recipients` to `mcp-managers`, none to `mcp-staff`.
+
+Two tool-level rules apply regardless of mode: `create_gmail_filter` refuses
+actions that `forward` mail or add `TRASH` / `SPAM` (persistent exfiltration
+or inbox suppression: configure those in Gmail settings), and
+`modify_sheet_values` refuses formula-looking cells without
+`allow_formulas=True` (see the security review section).
+
+**Per-user rate caps (enforce mode only).** `AccessPolicyMiddleware` counts
+calls per (user, tool) in a sliding window for the tools whose repetition is
+the damage: `soft_delete_drive_file` 20, `modify_gmail_message_labels` 60,
+`send_gmail_message` 30, `update_drive_file` 60, `share_calendar` 5,
+`set_drive_permission` 20, `create_gmail_filter` 5, `create_event` 60, all per
+10 minutes. Over the cap the call is refused with an `AuthorizationError`
+and audited as `denied`. Break-glass accounts are exempt. Override with
+`MCP_TOOL_RATE_LIMITS` (JSON `{"tool": [count, seconds]}`, `0` disables a
+tool's cap). Process-local: a redeploy resets the counters.
+
 **Enforcement points.** `AuthInfoMiddleware` now also runs on `tools/list`, so
 the policy middleware (added directly after it; FastMCP runs middleware in
 registration order) can filter the listing per user. A refused call is audited
@@ -709,6 +744,7 @@ through Google Groups itself.
 | `MCP_GROUP_POLICY_CACHE_TTL_S` | `300` | Fresh-cache window per user. |
 | `MCP_GROUP_POLICY_STALE_TTL_S` | `3600` | How long a stale answer may be served during a Directory outage. |
 | `MCP_GROUP_POLICY_STATIC_MEMBERS` | unset | JSON `{group: [emails]}`; dev/test only, ignored when a service account is set. |
+| `MCP_TOOL_RATE_LIMITS` | see above | JSON override of the per-user call caps applied under `enforce`. |
 
 **Also in this branch**
 

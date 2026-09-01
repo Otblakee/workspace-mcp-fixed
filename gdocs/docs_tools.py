@@ -1404,6 +1404,11 @@ async def export_doc_to_pdf(
 
         # Add parent folder if specified
         if folder_id:
+            from gdrive.drive_helpers import assert_internal_destination
+
+            await assert_internal_destination(
+                service, folder_id, action="export_doc_to_pdf"
+            )
             file_metadata["parents"] = [folder_id]
 
         # Upload the file

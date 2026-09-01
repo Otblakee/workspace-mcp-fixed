@@ -288,6 +288,52 @@ def get_holding_folder_id() -> str:
     return folder_id
 
 
+async def assert_internal_destination(
+    service, resolved_folder_id: str, *, action: str
+) -> None:
+    """Refuse to write into a folder owned outside the organisation unless
+    the caller holds the ``external_share`` capability.
+
+    Anything created in, copied to or moved into a folder is readable by that
+    folder's owner, so an externally owned destination is a share. Shared
+    drives (``driveId`` set) have no owners and are trusted as in-tenant.
+    Inert until OAUTH_ALLOWED_EMAIL_DOMAINS defines "inside".
+    """
+    from core.access_policy import (
+        caller_has_capability,
+        external_addresses,
+        internal_email_domains,
+    )
+
+    if not internal_email_domains() or not resolved_folder_id:
+        return
+    if resolved_folder_id == "root":
+        return
+    meta = await asyncio.to_thread(
+        service.files()
+        .get(
+            fileId=resolved_folder_id,
+            fields="id, driveId, owners(emailAddress)",
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+    if meta.get("driveId"):
+        return
+    owners = [o.get("emailAddress") for o in (meta.get("owners") or [])]
+    outside = external_addresses(owners)
+    if outside and not await caller_has_capability("external_share"):
+        from core.utils import UserInputError
+
+        raise UserInputError(
+            f"{action} refused: destination folder {resolved_folder_id} is owned "
+            f"by {', '.join(outside)}, outside "
+            f"{', '.join(sorted(internal_email_domains()))}. Anything written "
+            "there is readable by its owner, so this needs the 'external_share' "
+            "capability from the access policy."
+        )
+
+
 async def resolve_folder_id(
     service,
     folder_id: str,

@@ -16,6 +16,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 
 from auth.service_decorator import require_google_service
+from core.access_policy import external_addresses, require_capability
 from core.utils import handle_http_errors
 
 from core.server import server
@@ -590,6 +591,7 @@ async def create_event(
         if "dateTime" in event_body["end"]:
             event_body["end"]["timeZone"] = timezone
     if attendees:
+        await _require_internal_attendees(attendees)
         event_body["attendees"] = [{"email": email} for email in attendees]
 
     # Handle reminders
@@ -759,6 +761,22 @@ async def create_event(
     return confirmation_message
 
 
+async def _require_internal_attendees(attendees) -> None:
+    """Inviting outside addresses needs the external_recipients capability."""
+    emails = []
+    for att in attendees or []:
+        if isinstance(att, dict):
+            emails.append(att.get("email"))
+        elif isinstance(att, str):
+            emails.append(att)
+    outside = external_addresses(emails)
+    if outside:
+        await require_capability(
+            "external_recipients",
+            action=f"Inviting addresses outside the organisation ({', '.join(outside[:3])})",
+        )
+
+
 def _normalize_attendees(
     attendees: Optional[Union[List[str], List[Dict[str, Any]]]],
 ) -> Optional[List[Dict[str, Any]]]:
@@ -866,6 +884,7 @@ async def modify_event(
         event_body["location"] = location
 
     # Normalize attendees - accepts both email strings and full attendee objects
+    await _require_internal_attendees(attendees)
     normalized_attendees = _normalize_attendees(attendees)
     if normalized_attendees is not None:
         event_body["attendees"] = normalized_attendees
@@ -1233,6 +1252,15 @@ async def share_calendar(
     if role not in valid_roles:
         return (
             f"Invalid role '{role}'. Must be one of: {', '.join(sorted(valid_roles))}"
+        )
+    if role == "owner" or external_addresses([share_with_email]):
+        await require_capability(
+            "external_share",
+            action=(
+                f"Sharing a calendar with {share_with_email} as {role}"
+                if role != "owner"
+                else "Granting calendar ownership"
+            ),
         )
 
     logger.info(

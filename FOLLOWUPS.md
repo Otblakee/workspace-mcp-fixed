@@ -365,6 +365,23 @@ consent-screen change and no Render env change.**
   and closed (nobody can join, only admins can add members). `gadmin`'s read
   tools could verify this at startup via `groupssettings.get` if that API is
   ever enabled; today it is a manual Admin-console check.
+- **Destination guard and shared drives from other tenants.**
+  `assert_internal_destination` trusts any folder with a `driveId` as
+  in-tenant, because shared-drive items carry no owners. A shared drive that
+  another organisation shared with a user would pass. `drives.get` does not
+  expose the owning tenant; the only reliable signal is the Admin Directory,
+  which the policy service account could consult if this ever matters.
+- **Content-overwrite tools on shared files.** `mcp-staff` keeps
+  `modify_doc_text` / `modify_sheet_values` for their own work, which also
+  means a prompt injection in one shared file could rewrite another file the
+  user can edit. A per-owner restriction (refuse writes to files the caller
+  does not own unless in a manager group) is the next narrowing step if
+  the audit log shows staff editing shared finance files through the
+  assistant.
+- **Contact poisoning.** `update_contact` / `create_contact` are on the
+  manager tier. A warning when a new or changed contact email is a near-match
+  (edit distance ≤ 2) to an internal domain or an existing contact's domain
+  would blunt the "change the supplier's remittance address" pattern.
 - **Live verification.** Unit scope only. Before `enforce`: `get_my_access` as
   the owner (expect `*` minus blocked), as a staff test account (expect the
   staff list), as a user in no group (expect `get_my_access` only), then a
