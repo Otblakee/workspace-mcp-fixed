@@ -693,7 +693,14 @@ each group may also carry `capabilities`, validated against
 
 "Outside the organisation" means not in `OAUTH_ALLOWED_EMAIL_DOMAINS`; when
 that variable is unset nothing can be classified as external and the guards
-are inert. In `off` mode every capability is granted, so today's single-user
+are inert. OTB is one Workspace customer with several sign-in domains, and
+in a multi-domain customer the `hd` claim and the email domain carry the
+*user's own* domain, so the variable must list every domain that hosts a
+staff sign-in account: today `otbgroup.co.uk,jit-logistics.com` (enumerated
+from the live Directory; see the render.yaml comment). A single-domain value
+locks JIT staff out with an unexplained auth failure. Re-enumerate at every
+domain cutover (Vale and BIR staff move off `otbgroup.co.uk` when
+`valeautomotive.co.uk` / `bir-d.co.uk` go live). In `off` mode every capability is granted, so today's single-user
 behaviour is unchanged. Under `enforce` a denied capability raises
 `CapabilityDenied` (a `UserInputError`) inside the tool, which the audit
 wrapper records as an error row. The shipped policy grants all three to
@@ -866,7 +873,9 @@ fix in the same branch. Each has unit coverage (`tests/test_deploy_config.py`,
   authorize request carries `hd=<domain>` so the account chooser prefers
   the Workspace account and a personal account's refresh token never lands
   in the store. It is a hint; the middleware domain policy stays the
-  control. `MCP_OAUTH_REFRESH_TOKEN_TTL_S` (seconds, positive integer) maps
+  control. With OTB's two sign-in domains the hint is not sent (it only
+  fires for exactly one domain), so on this deployment it is inactive
+  until the domain list ever shrinks to one. `MCP_OAUTH_REFRESH_TOKEN_TTL_S` (seconds, positive integer) maps
   to FastMCP's `fallback_refresh_token_expiry_seconds`: how long a client
   stays signed in without re-consent. FastMCP's default is one year;
   `render.yaml` sets 2592000 (30 days).
@@ -897,8 +906,10 @@ Findings deliberately **not** fixed in code, with the recommended control:
   policy, audit Sheet ID, holding-folder design and blueprint are readable
   by anyone, and `docker-publish.yml` pushes the image to a public GHCR
   package. Render builds from source (`dockerfilePath`), so the workflow is
-  not needed. A fork cannot be switched to private in place: detach it via
-  GitHub support or push the history to a new private repository.
+  not needed. A fork cannot be switched to private in place, so the history
+  has been pushed to the private `Otblakee/otb-workspace-mcp` (see
+  "Repository move" below); archive the fork once Render points at the new
+  repo.
 - **CI workflows.** `ruff.yml` runs with `contents: write` and auto-commits
   to same-repo PR branches (fork PRs get a read-only token, so the exposure
   is collaborators only); `publish-mcp-registry.yml` would try to publish
@@ -942,8 +953,10 @@ Findings deliberately **not** fixed in code, with the recommended control:
    Internal** (removes the 100-test-user cap and the 7-day refresh-token
    expiry of External+Testing). Set `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY`
    on Render to a long random secret.
-3. Confirm `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk` is set (now in
-   `render.yaml`). Leave `TOOL_TIER` unset: the live deployment runs every
+3. Confirm `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk,jit-logistics.com` is
+   set (now in `render.yaml`). Never a single domain: `jit-logistics.com`
+   hosts a real sign-in account and would be locked out. Re-check with
+   `list_users` at every domain cutover. Leave `TOOL_TIER` unset: the live deployment runs every
    tier of `gmail drive calendar docs sheets contacts gadmin` (visible from
    the connected tool list, which includes complete-tier and gadmin tools),
    and the group policy narrows the surface per user. Earlier notes in this
@@ -967,3 +980,48 @@ Findings deliberately **not** fixed in code, with the recommended control:
    only); make one denied call and confirm the `status=denied` audit row.
 9. Only then add real staff to `mcp-staff@`. Add managers to
    `mcp-managers@` deliberately: that group can send email.
+
+## Repository move to `Otblakee/otb-workspace-mcp` (claude/multi-account-workspace-groups-2dnyhi)
+
+Implements §7.2 of the July 2026 plan on branch
+`claude/security-audit-multiworkspace-d2nx3u`
+(`SECURITY_AUDIT_AND_ROLLOUT_PLAN.md`): re-home, do not rewrite. The full
+history and every branch of the public fork were pushed to the private repo
+(a pure move; `main` there was already an ancestor, so it fast-forwarded),
+then this branch carries the cleanup that the plan asked for as a reviewable
+diff on top:
+
+- Upstream distribution machinery removed: `publish-mcp-registry.yml`
+  (would publish this repo to PyPI and the MCP Registry on a `v*` tag),
+  `smithery.yaml`, `glama.json`, `manifest.json`, `server.json`,
+  `README_NEW.md`. The `.dxt` bundle went earlier in this branch.
+  `docker-publish.yml` and `helm-chart/` are left for a separate decision.
+- Package renamed to `otb-workspace-mcp` (`pyproject.toml`, `uv.lock`,
+  the `[project.scripts]` entry, repository URLs). `get_package_version`
+  tries the new name first and keeps the two older names as fallbacks so
+  `/health` never reports `dev` on an older environment. The Dockerfile runs
+  `uv run main.py`, so the script rename changes nothing at runtime.
+
+Still by hand, in this order:
+
+1. Transfer the repo to the OTB GitHub organisation if wanted (Settings →
+   Danger Zone → Transfer). GitHub redirects the old URL. Install the Claude
+   GitHub App on the organisation so sessions can keep working on it.
+2. Point the Render service at the new repo (Settings → Build & Deploy;
+   Render's GitHub app must be granted access to it), redeploy, check
+   `/health` reports the version.
+3. In your local clone: `git remote rename origin upstream` and
+   `git remote set-url --push upstream DISABLED`, then add the new repo as
+   `origin`. Upstream changes are reviewed and cherry-picked, never merged
+   wholesale: `BLOCKED_TOOLS` is a denylist, so a routine merge can register
+   new destructive tools silently.
+4. Archive `Otblakee/workspace-mcp-fixed` once the new deploy is proven.
+
+The July plan's Phase 0 to Phase 3 items are delivered by this branch except:
+the legacy OAuth 2.0 plaintext credential store (only used when
+`MCP_ENABLE_OAUTH21` is off), a revocation endpoint, idle/absolute TTL on the
+in-memory session store, the attachment relay, the Postgres audit mirror, and
+the Workspace-side work (new GCP project with an Internal consent screen and
+one OAuth client, revoking the six stray clients and the nine broad
+third-party grants, App access control by org unit). Those remain in
+`FOLLOWUPS.md` and the plan.

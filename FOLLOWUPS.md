@@ -395,10 +395,28 @@ consent-screen change and no Render env change.**
   those with `starlette.responses` and a Starlette app, drop `fastapi` from
   `pyproject.toml`, then `uv lock --upgrade-package starlette`. Until then
   Dependabot opens the PR when fastapi lifts the cap.
-- **Repository visibility and CI workflows.** See the "deliberately not
-  fixed" list in `CLAUDE.md`: private repo (detach the fork or push the
-  history to a new private repository), delete `docker-publish.yml` and
-  `publish-mcp-registry.yml`, read-only `ruff.yml`, pin actions by SHA.
+- **Repository move follow-ons.** History is in the private
+  `Otblakee/otb-workspace-mcp`; the publish workflow and listing files are
+  gone. Left: transfer to the OTB organisation, repoint Render, archive the
+  fork, decide `docker-publish.yml` (Render builds from source, so it can
+  go), read-only `ruff.yml`, pin actions by SHA.
+- **Domain list is a living value.** `OAUTH_ALLOWED_EMAIL_DOMAINS` is
+  enumerated, not assumed: `otbgroup.co.uk,jit-logistics.com` as of
+  2026-09-02 (13 users). `arthistorywithemily.co.uk` hosts one personal
+  account in `/99 _SYSTEM/Personal` and is excluded on purpose;
+  `blakefamily.uk` is alias-only. Confirm the `hd` behaviour empirically
+  with one JIT sign-in before the first JIT user is onboarded (the July plan
+  flagged this as the one inferred link), and re-enumerate at the Vale and
+  BIR domain cutovers.
+- **Group mapping choice.** The July plan proposed mapping the *existing*
+  groups (`otb-it-admins@`, `*-externalshare-publishers@`, `jit-ops@`,
+  `otb-all@`, ...) to roles instead of creating `mcp-*` groups. The policy
+  engine supports either: any group address can appear in
+  `core/group_policy.yaml`. Dedicated closed `mcp-*` groups keep "what the
+  assistant may do" separate from mail-distribution membership; reusing the
+  existing groups avoids a second membership to maintain. Decide before
+  step 6 of the rollout checklist. The live groups are flat (no nesting), so
+  the nested-membership support is unused but harmless.
 - **`admin.directory.user.security` scope.** Decide whether
   `list_oauth_tokens_for_user` earns a scope that also authorises deleting
   users' tokens; if not, add the tool to `BLOCKED_TOOLS` and drop the scope

@@ -166,6 +166,20 @@ class TestDependencyHygiene:
 
 
 class TestBlueprint:
+    def test_allowed_domains_cover_every_signin_domain(self):
+        """One Workspace customer, two staff sign-in domains. A single-domain
+        value locks JIT staff out (enumerated from the live Directory)."""
+        doc = yaml.safe_load((REPO_ROOT / "render.yaml").read_text())
+        env = {
+            e["key"]: e.get("value")
+            for svc in doc["services"]
+            for e in svc.get("envVars", [])
+        }
+        domains = {d.strip() for d in env["OAUTH_ALLOWED_EMAIL_DOMAINS"].split(",")}
+        assert {"otbgroup.co.uk", "jit-logistics.com"} <= domains
+        assert "blakefamily.uk" not in domains  # alias domain, nobody signs in
+        assert "arthistorywithemily.co.uk" not in domains  # personal, excluded
+
     def test_refresh_token_ttl_is_thirty_days(self):
         doc = yaml.safe_load((REPO_ROOT / "render.yaml").read_text())
         env = {
@@ -204,3 +218,28 @@ class TestPolicyEngineEnvIsolation:
             "AUDIT_SA_JSON_FILE",
         ):
             assert name not in os.environ
+
+
+class TestRepositoryMove:
+    @pytest.mark.parametrize(
+        "artefact",
+        [
+            ".github/workflows/publish-mcp-registry.yml",
+            "smithery.yaml",
+            "glama.json",
+            "manifest.json",
+            "server.json",
+            "README_NEW.md",
+            "google_workspace_mcp.dxt",
+        ],
+    )
+    def test_distribution_artefacts_are_gone(self, artefact):
+        assert not (REPO_ROOT / artefact).exists()
+
+    def test_package_is_named_for_otb(self):
+        import tomllib
+
+        data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        assert data["project"]["name"] == "otb-workspace-mcp"
+        assert "otb-workspace-mcp" in data["project"]["scripts"]
+        assert "Otblakee/otb-workspace-mcp" in data["project"]["urls"]["Repository"]

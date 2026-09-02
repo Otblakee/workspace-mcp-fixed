@@ -43,7 +43,20 @@ class TestPackageVersionLookup:
 
         monkeypatch.setattr(server_mod.metadata, "version", fake_version)
 
-    def test_prefers_fixed_distribution_name(self, monkeypatch):
+    def test_prefers_otb_distribution_name(self, monkeypatch):
+        from core.server import get_package_version
+
+        self._patch_metadata(
+            monkeypatch,
+            {
+                "otb-workspace-mcp": "1.13.1",
+                "workspace-mcp-fixed": "8.8.8",
+                "workspace-mcp": "9.9.9",
+            },
+        )
+        assert get_package_version() == "1.13.1"
+
+    def test_falls_back_to_fixed_fork_name(self, monkeypatch):
         from core.server import get_package_version
 
         self._patch_metadata(

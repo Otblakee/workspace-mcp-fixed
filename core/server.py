@@ -38,13 +38,14 @@ logger = logging.getLogger(__name__)
 def get_package_version() -> str:
     """Resolve the installed distribution version.
 
-    This fork is distributed as ``workspace-mcp-fixed`` (see pyproject.toml);
-    the upstream name ``workspace-mcp`` is kept as a fallback so the lookup
-    still works on environments installed from the upstream package. Returns
-    "dev" only when neither distribution is installed (e.g. running from a
-    plain source checkout without ``uv sync`` / ``pip install``).
+    This deployment is distributed as ``otb-workspace-mcp`` (see
+    pyproject.toml). The earlier fork name ``workspace-mcp-fixed`` and the
+    upstream name ``workspace-mcp`` are kept as fallbacks so the lookup still
+    works on an environment synced from either older package. Returns "dev"
+    only when no distribution is installed (e.g. running from a plain source
+    checkout without ``uv sync`` / ``pip install``).
     """
-    for dist_name in ("workspace-mcp-fixed", "workspace-mcp"):
+    for dist_name in ("otb-workspace-mcp", "workspace-mcp-fixed", "workspace-mcp"):
         try:
             return metadata.version(dist_name)
         except metadata.PackageNotFoundError:

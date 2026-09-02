@@ -1,4 +1,4 @@
-# Render service definition for OTB workspace-mcp-fixed.
+# Render service definition for OTB Workspace MCP (Otblakee/otb-workspace-mcp).
 #
 # Single-worker async server (the FastMCP streamable-HTTP transport is
 # session-stateful; multi-worker requires shared session storage and
@@ -91,8 +91,23 @@ services:
       # Only Google accounts on these domains may complete authentication.
       # Without it any Google account that finishes the OAuth flow gets a
       # session (with its own data, but on our server and our quota).
+      #
+      # One Workspace customer, several sign-in domains. In a multi-domain
+      # customer the `hd` claim and the email domain carry the USER'S OWN
+      # domain, so every domain that hosts a real sign-in account must be
+      # listed or that entity's staff are locked out with an unexplained auth
+      # failure. Enumerated from the live Directory (13 users, 2026-09-02):
+      #   otbgroup.co.uk              11 users (OTB, and VALE/BIR staff until
+      #                               valeautomotive.co.uk / bir-d.co.uk cut over)
+      #   jit-logistics.com            1 user  (JIT)
+      #   arthistorywithemily.co.uk    1 user  (/99 _SYSTEM/Personal; deliberately
+      #                               excluded: not staff)
+      #   blakefamily.uk               alias domain only, nobody signs in with it
+      # Re-enumerate (gadmin list_users) and update this value at every domain
+      # cutover or addition. It also defines "internal" for the capability
+      # guards (external recipients, external shares).
       - key: OAUTH_ALLOWED_EMAIL_DOMAINS
-        value: otbgroup.co.uk
+        value: otbgroup.co.uk,jit-logistics.com
 
       # ---- dynamic client registration allowlist ----
       # Comma-separated redirect URI patterns MCP clients may register with.

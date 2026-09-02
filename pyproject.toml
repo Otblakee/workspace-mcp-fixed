@@ -3,7 +3,7 @@ requires = [ "setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "workspace-mcp-fixed"
+name = "otb-workspace-mcp"
 version = "1.13.1"
 description = "Comprehensive, highly performant Google Workspace Streamable HTTP & SSE MCP Server for Calendar, Gmail, Docs, Sheets, Slides & Drive"
 readme = "README.md"
@@ -52,13 +52,13 @@ email = "taylor@taylorwilsdon.com"
 
 [project.urls]
 Homepage = "https://workspacemcp.com"
-Repository = "https://github.com/akilja24/workspace-mcp-fixed"
-Documentation = "https://github.com/akilja24/workspace-mcp-fixed#readme"
-Issues = "https://github.com/akilja24/workspace-mcp-fixed/issues"
-Changelog = "https://github.com/akilja24/workspace-mcp-fixed/releases"
+Repository = "https://github.com/Otblakee/otb-workspace-mcp"
+Documentation = "https://github.com/Otblakee/otb-workspace-mcp#readme"
+Issues = "https://github.com/Otblakee/otb-workspace-mcp/issues"
+Changelog = "https://github.com/Otblakee/otb-workspace-mcp/releases"
 
 [project.scripts]
-workspace-mcp-fixed = "main:main"
+otb-workspace-mcp = "main:main"
 
 [project.optional-dependencies]
 valkey = [
