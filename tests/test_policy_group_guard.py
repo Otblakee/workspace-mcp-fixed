@@ -242,6 +242,27 @@ class TestResolvedGuard:
         assert d.mutations == [("delete", canonical, "x@otbgroup.co.uk")]
 
     @pytest.mark.asyncio
+    async def test_nesting_deeper_than_the_walk_fails_closed(self):
+        """A chain longer than the walk bound must refuse the edit rather than
+        silently leave the deepest groups unguarded."""
+        chain = [f"g{i}@otbgroup.co.uk" for i in range(1, 9)]
+        members = {ADMINS: [{"type": "GROUP", "email": chain[0]}]}
+        for parent, child in zip(chain, chain[1:]):
+            members[parent] = [{"type": "GROUP", "email": child}]
+        members[chain[-1]] = []
+        target = "drivers@otbgroup.co.uk"
+        members[target] = []
+        d = _Directory(
+            {target: {"id": "g9", "email": target, "aliases": []}},
+            members_by_group=members,
+        )
+        with pytest.raises(UserInputError, match="nested more than"):
+            await _unwrap(groups.add_group_member)(
+                d, USER, group_email=target, member_email="x@otbgroup.co.uk"
+            )
+        assert d.mutations == []
+
+    @pytest.mark.asyncio
     async def test_policy_group_not_yet_created_is_not_an_error(self):
         target = "drivers@otbgroup.co.uk"
         d = _Directory(

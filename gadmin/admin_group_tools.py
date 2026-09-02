@@ -85,7 +85,10 @@ def _refuse_if_policy_group(group_key: str) -> None:
 
 # Nested groups are honoured by the access policy (members.hasMember reports
 # transitive membership), so a group nested inside a policy group is, for
-# access purposes, part of it. Walk that far and no further.
+# access purposes, part of it. The walk is bounded so a cyclic or absurdly
+# deep Directory cannot hang a request, but hitting the bound is an error,
+# never a silent truncation: a group below the bound would otherwise escape
+# the guard while its members still inherit policy-group access.
 _NESTING_MAX_DEPTH = 6
 
 
@@ -127,6 +130,14 @@ async def _groups_nested_in_policy_groups(service) -> set[str]:
                     next_frontier.append(email)
         frontier = next_frontier
         depth += 1
+    if frontier:
+        raise UserInputError(
+            "Refusing the group edit: access-policy groups are nested more than "
+            f"{_NESTING_MAX_DEPTH} levels deep ({', '.join(sorted(frontier)[:5])}"
+            f"{', ...' if len(frontier) > 5 else ''} unexplored), so the "
+            "escalation guard cannot see every group that inherits policy "
+            "access. Flatten the policy groups in the Admin console first."
+        )
     return seen
 
 

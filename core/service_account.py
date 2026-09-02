@@ -39,7 +39,14 @@ def load_service_account_info(
         p = Path(path).expanduser()
         if not p.exists():
             raise ServiceAccountConfigError(f"{file_env} points to a missing file: {p}")
-        raw = p.read_text(encoding="utf-8")
+        if not p.is_file():
+            raise ServiceAccountConfigError(f"{file_env} is not a regular file: {p}")
+        try:
+            raw = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ServiceAccountConfigError(
+                f"{file_env} cannot be read as UTF-8 text: {exc.__class__.__name__}"
+            ) from exc
     elif (env.get(b64_env) or "").strip():
         try:
             raw = base64.b64decode(env[b64_env].strip(), validate=True).decode("utf-8")

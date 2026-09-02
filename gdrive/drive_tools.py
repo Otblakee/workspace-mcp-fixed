@@ -1857,7 +1857,13 @@ async def update_drive_file(
     if properties is not None:
         update_body["properties"] = properties
 
-    async def _resolve_parent_arguments(parent_arg: Optional[str]) -> Optional[str]:
+    async def _resolve_parent_arguments(
+        parent_arg: Optional[str], *, destination: bool
+    ) -> Optional[str]:
+        """Resolve a comma-separated parent list. Only parents the file is
+        being moved *into* go through the external-destination guard; leaving
+        an externally owned folder reduces exposure and must never need the
+        ``external_share`` capability."""
         if not parent_arg:
             return None
         parent_ids = [part.strip() for part in parent_arg.split(",") if part.strip()]
@@ -1866,14 +1872,21 @@ async def update_drive_file(
 
         resolved_ids = []
         for parent in parent_ids:
-            resolved_parent = await resolve_destination_folder_id(
-                service, parent, action="update_drive_file"
-            )
+            if destination:
+                resolved_parent = await resolve_destination_folder_id(
+                    service, parent, action="update_drive_file"
+                )
+            else:
+                resolved_parent = await resolve_folder_id(service, parent)
             resolved_ids.append(resolved_parent)
         return ",".join(resolved_ids)
 
-    resolved_add_parents = await _resolve_parent_arguments(add_parents)
-    resolved_remove_parents = await _resolve_parent_arguments(remove_parents)
+    resolved_add_parents = await _resolve_parent_arguments(
+        add_parents, destination=True
+    )
+    resolved_remove_parents = await _resolve_parent_arguments(
+        remove_parents, destination=False
+    )
 
     # Build query parameters for parent changes
     query_params = {

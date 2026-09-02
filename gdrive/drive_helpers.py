@@ -7,7 +7,8 @@ Shared utilities for Google Drive operations including permission checking.
 import asyncio
 import os
 import re
-from typing import List, Dict, Any, Optional, Tuple
+import time
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 VALID_SHARE_ROLES = {"reader", "commenter", "writer"}
 VALID_SHARE_TYPES = {"user", "group", "domain", "anyone"}
@@ -288,16 +289,111 @@ def get_holding_folder_id() -> str:
     return folder_id
 
 
+INTERNAL_SHARED_DRIVES_ENV = "DRIVE_INTERNAL_SHARED_DRIVE_IDS"
+_SHARED_DRIVE_TRUST_TTL_S = 300.0
+_shared_drive_trust: Dict[str, Tuple[float, bool, str]] = {}
+
+
+def _internal_shared_drive_ids() -> Set[str]:
+    raw = os.getenv(INTERNAL_SHARED_DRIVES_ENV, "")
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _organizer_addresses(perm: Dict[str, Any]) -> List[str]:
+    """Addresses (or domains, as ``@domain``) a permission entry grants to."""
+    kind = (perm.get("type") or "").lower()
+    if kind in ("user", "group"):
+        return [perm.get("emailAddress") or ""]
+    if kind == "domain":
+        return [f"organizer@{perm.get('domain') or ''}"]
+    return ["anyone@"]  # anyone/unknown: never internal
+
+
+async def _shared_drive_is_internal(service, drive_id: str) -> Tuple[bool, str]:
+    """Whether the shared drive is controlled by this organisation.
+
+    Drive v3 exposes no owning-customer field to an ordinary member, and a
+    user can be a member of a drive another organisation owns. The tenant
+    signal an ordinary member *can* read is the drive's organizer list: a
+    drive is treated as internal only when it is named in
+    ``DRIVE_INTERNAL_SHARED_DRIVE_IDS``, or when every organizer is on an
+    internal domain (and at least one is visible). Anything else, including a
+    permissions listing the caller may not read, is external. Verdicts are
+    cached per process for a few minutes.
+    """
+    from core.access_policy import external_addresses
+
+    if drive_id in _internal_shared_drive_ids():
+        return True, "listed in DRIVE_INTERNAL_SHARED_DRIVE_IDS"
+    cached = _shared_drive_trust.get(drive_id)
+    now = time.monotonic()
+    if cached and now - cached[0] < _SHARED_DRIVE_TRUST_TTL_S:
+        return cached[1], cached[2]
+
+    organizers: List[str] = []
+    try:
+        token = None
+        pages = 0
+        while True:
+            pages += 1
+            if pages > 20:  # a shared drive never has 2,000 members
+                raise RuntimeError("organizer listing did not terminate")
+            page = await asyncio.to_thread(
+                service.permissions()
+                .list(
+                    fileId=drive_id,
+                    supportsAllDrives=True,
+                    useDomainAdminAccess=False,
+                    pageSize=100,
+                    pageToken=token,
+                    fields="nextPageToken, permissions(role, type, emailAddress, domain)",
+                )
+                .execute
+            )
+            entries = page.get("permissions") if isinstance(page, dict) else None
+            for perm in entries or []:
+                if not isinstance(perm, dict):
+                    continue
+                if (perm.get("role") or "").lower() == "organizer":
+                    organizers.extend(_organizer_addresses(perm))
+            token = page.get("nextPageToken") if isinstance(page, dict) else None
+            if not isinstance(token, str) or not token:
+                break
+    except Exception as exc:  # 403 for non-organizers, network, anything
+        verdict = (
+            False,
+            f"its organizers could not be read ({exc.__class__.__name__})",
+        )
+        _shared_drive_trust[drive_id] = (now, *verdict)
+        return verdict
+
+    if not organizers:
+        verdict = (False, "no organizer is visible")
+    else:
+        outside = external_addresses(organizers)
+        if outside:
+            verdict = (
+                False,
+                f"it has organizers outside the organisation ({', '.join(outside)})",
+            )
+        else:
+            verdict = (True, "every organizer is on an internal domain")
+    _shared_drive_trust[drive_id] = (now, *verdict)
+    return verdict
+
+
 async def assert_internal_destination(
     service, resolved_folder_id: str, *, action: str
 ) -> None:
-    """Refuse to write into a folder owned outside the organisation unless
-    the caller holds the ``external_share`` capability.
+    """Refuse to write into a destination controlled outside the organisation
+    unless the caller holds the ``external_share`` capability.
 
-    Anything created in, copied to or moved into a folder is readable by that
-    folder's owner, so an externally owned destination is a share. Shared
-    drives (``driveId`` set) have no owners and are trusted as in-tenant.
-    Inert until OAUTH_ALLOWED_EMAIL_DOMAINS defines "inside".
+    Anything created in, copied to or moved into a folder is readable by
+    whoever controls it, so an externally owned destination is a share. For
+    a My Drive folder that is its owner; for a shared drive it is the
+    drive's organizers (see ``_shared_drive_is_internal``), since a user can
+    be a member of a drive another organisation owns. Inert until
+    OAUTH_ALLOWED_EMAIL_DOMAINS defines "inside".
     """
     from core.access_policy import (
         caller_has_capability,
@@ -318,8 +414,21 @@ async def assert_internal_destination(
         )
         .execute
     )
-    if meta.get("driveId"):
-        return
+    drive_id = meta.get("driveId") if isinstance(meta, dict) else None
+    if isinstance(drive_id, str) and drive_id:
+        internal, why = await _shared_drive_is_internal(service, drive_id)
+        if internal or await caller_has_capability("external_share"):
+            return
+        from core.utils import UserInputError
+
+        raise UserInputError(
+            f"{action} refused: destination {resolved_folder_id} is in shared "
+            f"drive {drive_id}, which is not treated as internal because {why}. "
+            "Anything written there is readable by the drive's organizers, so "
+            "this needs the 'external_share' capability from the access policy. "
+            f"If the drive is this organisation's, add its ID to "
+            f"{INTERNAL_SHARED_DRIVES_ENV}."
+        )
     owners = [o.get("emailAddress") for o in (meta.get("owners") or [])]
     outside = external_addresses(owners)
     if outside and not await caller_has_capability("external_share"):

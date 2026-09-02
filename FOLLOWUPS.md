@@ -365,12 +365,15 @@ consent-screen change and no Render env change.**
   and closed (nobody can join, only admins can add members). `gadmin`'s read
   tools could verify this at startup via `groupssettings.get` if that API is
   ever enabled; today it is a manual Admin-console check.
-- **Destination guard and shared drives from other tenants.**
-  `assert_internal_destination` trusts any folder with a `driveId` as
-  in-tenant, because shared-drive items carry no owners. A shared drive that
-  another organisation shared with a user would pass. `drives.get` does not
-  expose the owning tenant; the only reliable signal is the Admin Directory,
-  which the policy service account could consult if this ever matters.
+- **Destination guard and shared drives from other tenants (done, with a
+  residual).** A shared drive now counts as internal only when it is listed
+  in `DRIVE_INTERNAL_SHARED_DRIVE_IDS` or every visible organizer is on an
+  internal domain; an unreadable or empty organizer list is external. The
+  residual: a drive another organisation owns whose only *visible*
+  organizers are internal would pass, which needs the owning organisation to
+  have no manager of its own on the drive. List OTB's own drives in the env
+  var once the architecture build is done and the organizer lookup is then
+  never consulted for them.
 - **Content-overwrite tools on shared files.** `mcp-staff` keeps
   `modify_doc_text` / `modify_sheet_values` for their own work, which also
   means a prompt injection in one shared file could rewrite another file the

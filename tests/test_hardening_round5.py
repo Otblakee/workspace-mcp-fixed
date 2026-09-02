@@ -243,3 +243,60 @@ class TestRepositoryMove:
         assert data["project"]["name"] == "otb-workspace-mcp"
         assert "otb-workspace-mcp" in data["project"]["scripts"]
         assert "Otblakee/otb-workspace-mcp" in data["project"]["urls"]["Repository"]
+
+
+class TestPolicyYamlStrictness:
+    def test_duplicate_keys_are_rejected(self, tmp_path):
+        from core import access_policy as ap
+
+        policy = tmp_path / "policy.yaml"
+        policy.write_text(
+            "groups:\n"
+            "  mcp-staff@otbgroup.co.uk:\n"
+            "    allow: [gmail.core]\n"
+            "    deny: [send_gmail_message]\n"
+            "    deny: []\n"
+        )
+        with pytest.raises(ap.PolicyError, match="duplicate key 'deny'"):
+            ap.load_policy_file(policy)
+
+    def test_duplicate_group_is_rejected(self, tmp_path):
+        from core import access_policy as ap
+
+        policy = tmp_path / "policy.yaml"
+        policy.write_text(
+            "groups:\n"
+            "  mcp-staff@otbgroup.co.uk:\n"
+            "    allow: [gmail.core]\n"
+            "  mcp-staff@otbgroup.co.uk:\n"
+            "    allow: ['*']\n"
+        )
+        with pytest.raises(ap.PolicyError, match="duplicate key"):
+            ap.load_policy_file(policy)
+
+    def test_shipped_policy_still_loads(self):
+        from core import access_policy as ap
+
+        assert ap.load_policy_file(ap.DEFAULT_POLICY_PATH).groups
+
+
+class TestServiceAccountFileErrors:
+    def test_directory_is_a_config_error(self, tmp_path):
+        from core.service_account import (
+            ServiceAccountConfigError,
+            load_service_account_info,
+        )
+
+        with pytest.raises(ServiceAccountConfigError, match="not a regular file"):
+            load_service_account_info("K_FILE", "K_B64", {"K_FILE": str(tmp_path)})
+
+    def test_invalid_utf8_is_a_config_error(self, tmp_path):
+        from core.service_account import (
+            ServiceAccountConfigError,
+            load_service_account_info,
+        )
+
+        key = tmp_path / "key.json"
+        key.write_bytes(b"\xff\xfe{}")
+        with pytest.raises(ServiceAccountConfigError, match="UTF-8"):
+            load_service_account_info("K_FILE", "K_B64", {"K_FILE": str(key)})

@@ -350,10 +350,34 @@ def load_policy_file(
     except (OSError, UnicodeDecodeError) as exc:
         raise PolicyError(f"{resolved}: cannot read policy file: {exc}") from exc
     try:
-        data = yaml.safe_load(text)
+        data = yaml.load(text, Loader=_StrictPolicyLoader)
     except yaml.YAMLError as exc:
         raise PolicyError(f"{resolved}: invalid YAML: {exc}") from exc
     return parse_policy(data, source=str(resolved), catalogue=catalogue)
+
+
+class _StrictPolicyLoader(yaml.SafeLoader):
+    """SafeLoader that refuses duplicate mapping keys.
+
+    PyYAML's default is last-value-wins, so a policy that repeats ``deny``
+    (or a group name) would silently drop the first block before
+    ``parse_policy`` could see it, and could widen access while startup
+    reports the file as valid.
+    """
+
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
 
 
 # --- selector expansion ----------------------------------------------------
@@ -1068,12 +1092,43 @@ except Exception:  # pragma: no cover - defensive
     pass
 
 
-async def current_user_email() -> Optional[str]:
-    """The verified identity on the current FastMCP request, if any."""
+def _fastmcp_context():
+    """The current FastMCP request context, or ``None`` outside a request.
+    Kept as a module-level seam so tests can substitute a stand-in."""
     try:
         from fastmcp.server.dependencies import get_context
 
-        ctx = get_context()
+        return get_context()
+    except Exception:
+        return None
+
+
+def _request_transport_is_stdio() -> bool:
+    """Mirror of ``AccessPolicyMiddleware._transport_is_stdio``: the request's
+    own transport when FastMCP stamped it on the Context, else the process
+    mode. stdio carries no OAuth identity, so the middleware skips the policy
+    there; the capability guards must agree or every guarded tool is listed
+    and callable over stdio yet always refused."""
+    ctx = _fastmcp_context()
+    if ctx is None:
+        # Outside any request (tests, background work) nothing is stdio:
+        # fail closed rather than trust the process default, which is stdio.
+        return False
+    transport = getattr(ctx, "transport", None)
+    if isinstance(transport, str):
+        return transport == "stdio"
+    try:
+        from core.config import get_transport_mode
+
+        return get_transport_mode() == "stdio"
+    except Exception:
+        return False
+
+
+async def current_user_email() -> Optional[str]:
+    """The verified identity on the current FastMCP request, if any."""
+    try:
+        ctx = _fastmcp_context()
         if ctx is None:
             return None
         return _norm_email(await ctx.get_state("authenticated_user_email")) or None
@@ -1084,8 +1139,10 @@ async def current_user_email() -> Optional[str]:
 async def caller_has_capability(capability: str) -> bool:
     """True when the policy grants ``capability`` to the current caller.
 
-    Off mode grants everything (single-user behaviour). Under ``enforce``
-    an unloadable policy, a missing identity or a failed membership lookup
+    Off mode grants everything (single-user behaviour), and so does the
+    stdio transport, which has no OAuth identity and is skipped by the
+    policy middleware for the same reason. Under ``enforce`` over HTTP an
+    unloadable policy, a missing identity or a failed membership lookup
     grants nothing.
     """
     if capability not in KNOWN_CAPABILITIES:
@@ -1096,6 +1153,8 @@ async def caller_has_capability(capability: str) -> bool:
         logger.error("group policy: cannot load policy for capability check: %s", exc)
         return False
     if not engine.enabled:
+        return True
+    if _request_transport_is_stdio():
         return True
     return capability in await engine.capabilities(await current_user_email())
 

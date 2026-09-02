@@ -337,9 +337,6 @@ class TestDriveGuards:
             service_with_owner("k@otbgroup.co.uk"), "F", action="x"
         )
         await assert_internal_destination(
-            service_with_owner("attacker@gmail.com", drive_id="D"), "F", action="x"
-        )
-        await assert_internal_destination(
             service_with_owner("attacker@gmail.com"), "root", action="x"
         )
 
@@ -347,6 +344,145 @@ class TestDriveGuards:
         await assert_internal_destination(
             service_with_owner("attacker@gmail.com"), "F", action="x"
         )
+
+    @staticmethod
+    def _shared_drive_service(organizers, *, list_error=None):
+        """files.get says the folder lives in shared drive D; permissions.list
+        returns the given organizer entries (or raises)."""
+        service = MagicMock()
+        service.files.return_value.get.return_value.execute = MagicMock(
+            return_value={"id": "F", "driveId": "D"}
+        )
+        execute = service.permissions.return_value.list.return_value.execute
+        if list_error is not None:
+            execute.side_effect = list_error
+        else:
+            execute.return_value = {
+                "permissions": [{"role": "organizer", **entry} for entry in organizers]
+                + [{"role": "writer", "type": "user", "emailAddress": "w@example.com"}]
+            }
+        return service
+
+    @pytest.mark.asyncio
+    async def test_shared_drive_trust_follows_its_organizers(
+        self, internal_domain, as_user, monkeypatch
+    ):
+        from gdrive import drive_helpers
+        from gdrive.drive_helpers import assert_internal_destination
+
+        monkeypatch.setattr(drive_helpers, "_shared_drive_trust", {})
+        as_user("s@otbgroup.co.uk", {"s@otbgroup.co.uk": {STAFF}})
+
+        internal = self._shared_drive_service(
+            [{"type": "user", "emailAddress": "it@otbgroup.co.uk"}]
+        )
+        await assert_internal_destination(internal, "F", action="x")
+
+        monkeypatch.setattr(drive_helpers, "_shared_drive_trust", {})
+        mixed = self._shared_drive_service(
+            [
+                {"type": "user", "emailAddress": "it@otbgroup.co.uk"},
+                {"type": "user", "emailAddress": "partner@example.com"},
+            ]
+        )
+        with pytest.raises(UserInputError, match="partner@example.com"):
+            await assert_internal_destination(mixed, "F", action="create_drive_file")
+
+        monkeypatch.setattr(drive_helpers, "_shared_drive_trust", {})
+        domain_grant = self._shared_drive_service(
+            [{"type": "domain", "domain": "example.com"}]
+        )
+        with pytest.raises(UserInputError, match="external_share"):
+            await assert_internal_destination(domain_grant, "F", action="x")
+
+        monkeypatch.setattr(drive_helpers, "_shared_drive_trust", {})
+        unreadable = self._shared_drive_service([], list_error=RuntimeError("403"))
+        with pytest.raises(UserInputError, match="could not be read"):
+            await assert_internal_destination(unreadable, "F", action="x")
+
+        monkeypatch.setattr(drive_helpers, "_shared_drive_trust", {})
+        no_organizers = self._shared_drive_service([])
+        with pytest.raises(UserInputError, match="no organizer"):
+            await assert_internal_destination(no_organizers, "F", action="x")
+
+        # The capability holder may still write there.
+        monkeypatch.setattr(drive_helpers, "_shared_drive_trust", {})
+        as_user("a@otbgroup.co.uk", {"a@otbgroup.co.uk": {ADMINS}})
+        await assert_internal_destination(mixed, "F", action="x")
+
+    @pytest.mark.asyncio
+    async def test_shared_drive_allowlist_skips_the_lookup(
+        self, internal_domain, as_user, monkeypatch
+    ):
+        from gdrive import drive_helpers
+        from gdrive.drive_helpers import assert_internal_destination
+
+        monkeypatch.setattr(drive_helpers, "_shared_drive_trust", {})
+        monkeypatch.setenv(drive_helpers.INTERNAL_SHARED_DRIVES_ENV, "D, other")
+        as_user("s@otbgroup.co.uk", {"s@otbgroup.co.uk": {STAFF}})
+        service = self._shared_drive_service([], list_error=RuntimeError("403"))
+        await assert_internal_destination(service, "F", action="x")
+        service.permissions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_shared_drive_verdict_is_cached(
+        self, internal_domain, as_user, monkeypatch
+    ):
+        from gdrive import drive_helpers
+        from gdrive.drive_helpers import assert_internal_destination
+
+        monkeypatch.setattr(drive_helpers, "_shared_drive_trust", {})
+        as_user("s@otbgroup.co.uk", {"s@otbgroup.co.uk": {STAFF}})
+        service = self._shared_drive_service(
+            [{"type": "group", "emailAddress": "it-team@otbgroup.co.uk"}]
+        )
+        await assert_internal_destination(service, "F", action="x")
+        await assert_internal_destination(service, "F", action="x")
+        assert service.permissions.return_value.list.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_remove_parents_is_not_a_destination(self, as_user, monkeypatch):
+        """Leaving an externally owned folder reduces exposure; only the folder
+        a file is moved *into* goes through the destination guard."""
+        from gdrive import drive_tools
+
+        as_user("s@otbgroup.co.uk", {"s@otbgroup.co.uk": {STAFF}})
+        file_meta = {
+            "id": "f",
+            "name": "n",
+            "description": "",
+            "mimeType": "application/pdf",
+            "parents": ["EXT"],
+            "starred": False,
+            "webViewLink": "https://drive.google.com/x",
+            "writersCanShare": True,
+            "copyRequiresWriterPermission": False,
+            "properties": {},
+        }
+        monkeypatch.setattr(
+            drive_tools,
+            "resolve_drive_item",
+            AsyncMock(return_value=("f", dict(file_meta))),
+        )
+        monkeypatch.setattr(
+            drive_tools, "resolve_folder_id", AsyncMock(return_value="EXT")
+        )
+        monkeypatch.setattr(
+            drive_tools,
+            "assert_internal_destination",
+            AsyncMock(side_effect=UserInputError("needs external_share")),
+        )
+        service = MagicMock()
+        service.files.return_value.update.return_value.execute = MagicMock(
+            return_value={**file_meta, "parents": []}
+        )
+        tool = _unwrap(drive_tools.update_drive_file)
+        await tool(service, "s@otbgroup.co.uk", file_id="f", remove_parents="EXT")
+        kwargs = service.files.return_value.update.call_args.kwargs
+        assert kwargs["removeParents"] == "EXT" and "addParents" not in kwargs
+
+        with pytest.raises(UserInputError, match="external_share"):
+            await tool(service, "s@otbgroup.co.uk", file_id="f", add_parents="EXT")
 
     @pytest.mark.asyncio
     async def test_destination_guard_inert_without_domains(self, monkeypatch, as_user):
@@ -357,6 +493,52 @@ class TestDriveGuards:
         service = MagicMock()
         await assert_internal_destination(service, "F", action="x")
         service.files.assert_not_called()
+
+
+class TestStdioBypass:
+    """stdio has no OAuth identity and the policy middleware skips it, so the
+    capability guards must agree or every guarded tool is callable over stdio
+    yet always refused."""
+
+    @pytest.mark.asyncio
+    async def test_stdio_request_is_granted(self, as_user, monkeypatch):
+        as_user("s@otbgroup.co.uk", {"s@otbgroup.co.uk": {STAFF}})
+        monkeypatch.setattr(
+            ap, "_fastmcp_context", lambda: SimpleNamespace(transport="stdio")
+        )
+        assert await ap.caller_has_capability("url_fetch") is True
+
+    @pytest.mark.asyncio
+    async def test_http_request_is_still_checked(self, as_user, monkeypatch):
+        as_user("s@otbgroup.co.uk", {"s@otbgroup.co.uk": {STAFF}})
+        monkeypatch.setattr(
+            ap, "_fastmcp_context", lambda: SimpleNamespace(transport="http")
+        )
+        assert await ap.caller_has_capability("url_fetch") is False
+
+    @pytest.mark.asyncio
+    async def test_context_without_transport_falls_back_to_process_mode(
+        self, as_user, monkeypatch
+    ):
+        from core import config
+
+        as_user("s@otbgroup.co.uk", {"s@otbgroup.co.uk": {STAFF}})
+        monkeypatch.setattr(ap, "_fastmcp_context", lambda: SimpleNamespace())
+        monkeypatch.setattr(config, "get_transport_mode", lambda: "stdio")
+        assert await ap.caller_has_capability("url_fetch") is True
+        monkeypatch.setattr(config, "get_transport_mode", lambda: "streamable-http")
+        assert await ap.caller_has_capability("url_fetch") is False
+
+    @pytest.mark.asyncio
+    async def test_no_request_context_is_never_stdio(self, as_user, monkeypatch):
+        """Outside a request the process default is stdio; that must not
+        grant anything (tests and background work run there)."""
+        from core import config
+
+        as_user("s@otbgroup.co.uk", {"s@otbgroup.co.uk": {STAFF}})
+        monkeypatch.setattr(ap, "_fastmcp_context", lambda: None)
+        monkeypatch.setattr(config, "get_transport_mode", lambda: "stdio")
+        assert await ap.caller_has_capability("url_fetch") is False
 
 
 class TestRateLimits:

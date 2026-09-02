@@ -127,6 +127,14 @@ services:
       - key: MCP_OAUTH_REFRESH_TOKEN_TTL_S
         value: "2592000"
 
+      # ---- shared drives the destination guard may trust outright ----
+      # Comma-separated shared-drive IDs. Unset: every shared drive is judged
+      # by its organizers (all on an internal domain = internal), which costs
+      # one permissions.list per drive per five minutes and fails closed when
+      # the caller cannot read the list. Fill in once the OTB drives exist.
+      - key: DRIVE_INTERNAL_SHARED_DRIVE_IDS
+        sync: false
+
       # ---- group-based tool access policy (core/access_policy.py) ----
       # "off" keeps today's behaviour (every otbgroup.co.uk user gets every
       # tool). Flip to "enforce" only after the CLAUDE.md multi-user rollout

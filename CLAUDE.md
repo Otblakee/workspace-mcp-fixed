@@ -688,7 +688,7 @@ each group may also carry `capabilities`, validated against
 | Capability | Gates |
 | --- | --- |
 | `url_fetch` | `create_drive_file(fileUrl=http…)`, `import_to_google_doc(file_url=…)`: the server fetching an arbitrary URL on the caller's behalf (a beacon / exfil channel under prompt injection). |
-| `external_share` | `set_drive_permission` to an individual or an outside address; `share_calendar` to an outside address or as `owner`; creating, copying, importing, exporting or moving anything into a folder owned outside the organisation (`gdrive.drive_helpers.assert_internal_destination`). |
+| `external_share` | `set_drive_permission` to an individual or an outside address; `share_calendar` to an outside address or as `owner`; creating, copying, importing, exporting or moving anything into a destination controlled outside the organisation (`gdrive.drive_helpers.assert_internal_destination`): a My Drive folder owned by an outside address, or a shared drive that is not internal. A user can be a member of a shared drive another organisation owns and Drive exposes no owning-customer field to a member, so a shared drive counts as internal only when it is named in `DRIVE_INTERNAL_SHARED_DRIVE_IDS` or every visible organizer is on an internal domain; an unreadable organizer list is external. Leaving a folder (`remove_parents`) is never guarded. |
 | `external_recipients` | `send_gmail_message` To/Cc/Bcc outside the organisation; `create_event` / `modify_event` attendees outside the organisation. |
 
 "Outside the organisation" means not in `OAUTH_ALLOWED_EMAIL_DOMAINS`; when
@@ -752,6 +752,7 @@ through Google Groups itself.
 | `MCP_GROUP_POLICY_STALE_TTL_S` | `3600` | How long a stale answer may be served during a Directory outage. |
 | `MCP_GROUP_POLICY_STATIC_MEMBERS` | unset | JSON `{group: [emails]}`; dev/test only, ignored when a service account is set. |
 | `MCP_TOOL_RATE_LIMITS` | see above | JSON override of the per-user call caps applied under `enforce`. |
+| `DRIVE_INTERNAL_SHARED_DRIVE_IDS` | unset | Comma-separated shared-drive IDs always treated as internal by the destination guard, skipping the organizer lookup. |
 
 **Also in this branch**
 
