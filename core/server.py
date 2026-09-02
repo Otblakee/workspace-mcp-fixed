@@ -1,7 +1,7 @@
 import functools
 import logging
 import os
-from typing import List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from importlib import metadata
 
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
@@ -193,6 +193,56 @@ def _allowed_client_redirect_uris() -> Optional[List[str]]:
     return patterns or None
 
 
+REFRESH_TOKEN_TTL_ENV = "MCP_OAUTH_REFRESH_TOKEN_TTL_S"
+ALLOWED_EMAIL_DOMAINS_ENV = "OAUTH_ALLOWED_EMAIL_DOMAINS"
+
+
+def _provider_hardening_kwargs(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Extra ``GoogleProvider`` kwargs derived from the environment.
+
+    * ``extra_authorize_params={"hd": <domain>}`` when
+      ``OAUTH_ALLOWED_EMAIL_DOMAINS`` names exactly one domain. Google's
+      sign-in page then pre-selects (or asks for) an account on that Workspace
+      domain. It is a hint, not a control: the domain policy in
+      ``AuthInfoMiddleware`` still rejects anything else. What it buys is that
+      a staff member signed into a personal Google account in the same browser
+      is not offered that account by default, so the wrong account's refresh
+      token never lands in the OAuth store in the first place.
+    * ``fallback_refresh_token_expiry_seconds`` from
+      ``MCP_OAUTH_REFRESH_TOKEN_TTL_S``: how long a client may stay signed in
+      to this server without the user consenting again. FastMCP's default is
+      one year; unset keeps it. A positive integer number of seconds.
+    """
+    env = os.environ if environ is None else environ
+    kwargs: Dict[str, Any] = {}
+
+    domains = [
+        d.strip().lower()
+        for d in (env.get(ALLOWED_EMAIL_DOMAINS_ENV) or "").split(",")
+        if d.strip()
+    ]
+    if len(domains) == 1:
+        kwargs["extra_authorize_params"] = {"hd": domains[0]}
+
+    raw_ttl = (env.get(REFRESH_TOKEN_TTL_ENV) or "").strip()
+    if raw_ttl:
+        try:
+            ttl = int(raw_ttl)
+            if ttl <= 0:
+                raise ValueError("must be positive")
+            kwargs["fallback_refresh_token_expiry_seconds"] = ttl
+        except ValueError as exc:
+            logger.warning(
+                "%s=%r ignored (%s); FastMCP default refresh-token lifetime applies",
+                REFRESH_TOKEN_TTL_ENV,
+                raw_ttl,
+                exc,
+            )
+    return kwargs
+
+
 def set_transport_mode(mode: str):
     """Sets the transport mode for the server."""
     _set_transport_mode(mode)
@@ -379,9 +429,16 @@ def configure_server_for_http():
                         salt="fastmcp-storage-encryption-key",
                     )
 
+                    # A record encrypted under a previous key (client secret
+                    # or JWT signing key rotated) must read as a miss, not
+                    # raise: with the default, the first OAuth request after a
+                    # rotation fails for every client until the store is wiped
+                    # by hand. A miss makes the client re-register and the user
+                    # re-consent, which is what a rotation is meant to do.
                     client_storage = FernetEncryptionWrapper(
                         key_value=client_storage,
                         fernet=Fernet(key=storage_encryption_key),
+                        raise_on_decryption_error=False,
                     )
                     logger.info(
                         "OAuth 2.1: Using ValkeyStore for FastMCP OAuth proxy client_storage (host=%s, port=%s, db=%s, tls=%s)",
@@ -443,9 +500,16 @@ def configure_server_for_http():
                         salt="fastmcp-storage-encryption-key",
                     )
 
+                    # A record encrypted under a previous key (client secret
+                    # or JWT signing key rotated) must read as a miss, not
+                    # raise: with the default, the first OAuth request after a
+                    # rotation fails for every client until the store is wiped
+                    # by hand. A miss makes the client re-register and the user
+                    # re-consent, which is what a rotation is meant to do.
                     client_storage = FernetEncryptionWrapper(
                         key_value=client_storage,
                         fernet=Fernet(key=storage_encryption_key),
+                        raise_on_decryption_error=False,
                     )
                     logger.info(
                         "OAuth 2.1: Using DiskStore for FastMCP OAuth proxy client_storage (directory=%s)",
@@ -534,6 +598,8 @@ def configure_server_for_http():
                     # authorising it. Patterns support wildcards, e.g.
                     # "http://localhost:*" for Claude Desktop / Claude Code.
                     provider_kwargs["allowed_client_redirect_uris"] = allowed_redirects
+                hardening_kwargs = _provider_hardening_kwargs()
+                provider_kwargs.update(hardening_kwargs)
                 provider = GoogleProvider(
                     client_id=config.client_id,
                     client_secret=config.client_secret,
@@ -565,6 +631,16 @@ def configure_server_for_http():
                     logger.info(
                         "OAuth 2.1: client redirect URIs restricted to %s",
                         allowed_redirects,
+                    )
+                if "extra_authorize_params" in hardening_kwargs:
+                    logger.info(
+                        "OAuth 2.1: Google sign-in hinted to hd=%s",
+                        hardening_kwargs["extra_authorize_params"]["hd"],
+                    )
+                if "fallback_refresh_token_expiry_seconds" in hardening_kwargs:
+                    logger.info(
+                        "OAuth 2.1: refresh-token lifetime capped at %ss",
+                        hardening_kwargs["fallback_refresh_token_expiry_seconds"],
                     )
 
                 # Explicitly mount well-known routes from the OAuth provider

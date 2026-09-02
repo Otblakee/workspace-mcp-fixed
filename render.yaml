@@ -103,6 +103,15 @@ services:
       - key: MCP_ALLOWED_CLIENT_REDIRECT_URIS
         sync: false
 
+      # ---- session lifetime ----
+      # How long an MCP client may stay signed in to this server without the
+      # user consenting again. FastMCP's default is one year; 30 days means a
+      # leaver's client, a lost laptop or a stale registration re-prompts
+      # within a month even if nobody revokes anything. Google-side
+      # suspension still cuts access on the next call regardless.
+      - key: MCP_OAUTH_REFRESH_TOKEN_TTL_S
+        value: "2592000"
+
       # ---- group-based tool access policy (core/access_policy.py) ----
       # "off" keeps today's behaviour (every otbgroup.co.uk user gets every
       # tool). Flip to "enforce" only after the CLAUDE.md multi-user rollout

@@ -19,7 +19,7 @@ from googleapiclient.errors import HttpError
 from auth.scopes import SCOPES, get_current_scopes, has_required_scopes  # noqa
 from auth.oauth21_session_store import get_oauth21_session_store
 from auth.credential_store import get_credential_store
-from auth.oauth_config import get_oauth_config, is_stateless_mode
+from auth.oauth_config import get_oauth_config, is_oauth21_enabled, is_stateless_mode
 from core.config import (
     get_transport_mode,
     get_oauth_redirect_uri,
@@ -557,6 +557,22 @@ def handle_auth_callback(
         raise  # Re-raise for the caller
 
 
+def _single_user_mode_active() -> bool:
+    """``MCP_SINGLE_USER_MODE=1`` makes the loader hand *any* cached credential
+    to every caller. That is only safe with exactly one user, so it is refused
+    under OAuth 2.1 (multi-user) even when the variable is set by hand rather
+    than by ``--single-user``, which main.py already rejects in that mode."""
+    if os.getenv("MCP_SINGLE_USER_MODE") != "1":
+        return False
+    if is_oauth21_enabled():
+        logger.warning(
+            "MCP_SINGLE_USER_MODE=1 ignored: OAuth 2.1 mode identifies every "
+            "caller by their own token and never shares cached credentials"
+        )
+        return False
+    return True
+
+
 def get_credentials(
     user_google_email: Optional[str],  # Can be None if relying on session_id
     required_scopes: List[str],
@@ -656,7 +672,7 @@ def get_credentials(
             logger.debug(f"[get_credentials] Error checking OAuth 2.1 store: {e}")
 
     # Check for single-user mode
-    if os.getenv("MCP_SINGLE_USER_MODE") == "1":
+    if _single_user_mode_active():
         logger.info(
             "[get_credentials] Single-user mode: bypassing session mapping, finding any credentials"
         )

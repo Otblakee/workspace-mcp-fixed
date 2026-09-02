@@ -755,6 +755,10 @@ through Google Groups itself.
   FastMCP's `GoogleProvider` as `allowed_client_redirect_uris`. Unset keeps
   FastMCP's default, which accepts *any* redirect URI at dynamic client
   registration; a WARNING is logged at startup until it is set.
+- `MCP_OAUTH_REFRESH_TOKEN_TTL_S` caps how long an MCP client stays signed
+  in without re-consent (FastMCP default one year; blueprint 30 days), and
+  a single-domain `OAUTH_ALLOWED_EMAIL_DOMAINS` is passed to Google as the
+  `hd` sign-in hint. See the security review section.
 - `render.yaml` now carries `OAUTH_ALLOWED_EMAIL_DOMAINS=otbgroup.co.uk`,
   `MCP_GROUP_POLICY_MODE=off`, `gadmin` in `TOOLS` (matching the live
   deployment) and `sync: false` placeholders for the new secrets,
@@ -834,8 +838,76 @@ fix in the same branch. Each has unit coverage (`tests/test_deploy_config.py`,
 - **Dynamic client registration allowlist.** `MCP_ALLOWED_CLIENT_REDIRECT_URIS`
   (see the access-policy section). Until it is set, any party can register
   an MCP client against this server and phish a consent click.
+- **Dependency advisories.** `mcp` 1.26.0 → 1.29.1: CVE-2026-52869
+  (GHSA-jpw9-pfvf-9f58, CVSS 7.1) let anyone holding another user's session
+  id inject JSON-RPC into that session because the SSE and Streamable HTTP
+  transports never checked the authenticated principal; patched in 1.27.2.
+  `python-multipart` 0.0.29 → 0.0.32 (seven denial-of-service and
+  parameter-smuggling advisories on the unauthenticated OAuth form
+  endpoints). `starlette` 0.52.1 is inside CVE-2026-54283's range (form
+  limits ignored for URL-encoded bodies, fixed in 1.3.1) but `fastapi`
+  0.128.3 caps starlette `<1.0`; fastapi is imported only for
+  `HTMLResponse` / `JSONResponse` / `FileResponse` and the OAuth 2.0
+  callback app, all of which starlette provides, so the way out is the
+  small refactor parked in `FOLLOWUPS.md`. `tests/test_hardening_round5.py`
+  pins the floors. `.github/dependabot.yml` shipped with an empty
+  `package-ecosystem` (Dependabot rejects the file, so nothing ever ran);
+  it now covers `uv`, `github-actions` and `docker` weekly.
+- **OAuth store survives a key rotation.** Both `FernetEncryptionWrapper`
+  constructions in `core/server.py` (disk and Valkey backends) pass
+  `raise_on_decryption_error=False`. A record encrypted under a previous
+  JWT signing key or client secret now reads as a miss (the client
+  re-registers, the user re-consents) instead of raising on every OAuth
+  request until `/data` is wiped by hand. Rotating the secret is the
+  incident-response action, so it must not brick the service.
+- **Google sign-in domain hint and refresh-token lifetime.**
+  `_provider_hardening_kwargs` in `core/server.py`: when
+  `OAUTH_ALLOWED_EMAIL_DOMAINS` names exactly one domain, Google's
+  authorize request carries `hd=<domain>` so the account chooser prefers
+  the Workspace account and a personal account's refresh token never lands
+  in the store. It is a hint; the middleware domain policy stays the
+  control. `MCP_OAUTH_REFRESH_TOKEN_TTL_S` (seconds, positive integer) maps
+  to FastMCP's `fallback_refresh_token_expiry_seconds`: how long a client
+  stays signed in without re-consent. FastMCP's default is one year;
+  `render.yaml` sets 2592000 (30 days).
+- **`MCP_SINGLE_USER_MODE` set by hand.** `main.py` rejected only the
+  `--single-user` flag under OAuth 2.1; the env var reached `get_credentials`
+  directly and would hand any cached credential to every caller. Both
+  `main._single_user_requested` and `google_auth._single_user_mode_active`
+  now refuse it under OAuth 2.1.
+- **Test isolation.** `tests/conftest.py` clears the deployment variables
+  (`MCP_GROUP_POLICY_*`, `AUDIT_SA_JSON_*`, `MCP_TOOL_RATE_LIMITS`,
+  `MCP_ALLOWED_CLIENT_REDIRECT_URIS`, `MCP_OAUTH_REFRESH_TOKEN_TTL_S`,
+  `MCP_SINGLE_USER_MODE`) for every test and resets the policy engine, and
+  `AccessPolicyEngine.from_env(environ=…)` no longer falls through to
+  `os.environ` for the policy path. Before this, a shell with Render's
+  `AUDIT_SA_JSON_B64` exported made four audit tests perform a live token
+  exchange against Google. The `remove_group_member` alias and nesting
+  guard now has its own tests.
 
 Findings deliberately **not** fixed in code, with the recommended control:
+
+- **`admin.directory.user.security` scope.** It is in `ADMIN_SCOPES`, so
+  every user is asked for it, and it also authorises `tokens.delete`; the
+  only consumer is the read tool `list_oauth_tokens_for_user`. Blocking that
+  tool (`BLOCKED_TOOLS`) and dropping the scope narrows every staff token
+  and the owner's stored refresh token. Left as a decision because it
+  removes a tool.
+- **Public repository and GHCR image.** The fork is public, so the group
+  policy, audit Sheet ID, holding-folder design and blueprint are readable
+  by anyone, and `docker-publish.yml` pushes the image to a public GHCR
+  package. Render builds from source (`dockerfilePath`), so the workflow is
+  not needed. A fork cannot be switched to private in place: detach it via
+  GitHub support or push the history to a new private repository.
+- **CI workflows.** `ruff.yml` runs with `contents: write` and auto-commits
+  to same-repo PR branches (fork PRs get a read-only token, so the exposure
+  is collaborators only); `publish-mcp-registry.yml` would try to publish
+  the fork on any `v*` tag; actions are pinned by tag. Recommended: a
+  read-only ruff check, delete the publish workflow, pin actions by SHA.
+- **`gc.collect()` after every tool call** (`auth/service_decorator.py`) and
+  per audit flush is a stop-the-world sweep on the single Render worker.
+  Upstream added it to stop a googleapiclient memory leak; measure under a
+  few concurrent users before replacing it with a periodic sweep.
 
 - **`/attachments/{file_id}` is an unauthenticated capability URL.** Anyone
   holding the UUID can fetch the file for an hour, which turns a Drive file a

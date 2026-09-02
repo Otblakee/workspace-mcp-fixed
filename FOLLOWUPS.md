@@ -386,3 +386,28 @@ consent-screen change and no Render env change.**
   the owner (expect `*` minus blocked), as a staff test account (expect the
   staff list), as a user in no group (expect `get_my_access` only), then a
   denied call to confirm the `status=denied` audit row appears.
+- **starlette CVE-2026-54283.** `starlette` 0.52.1 is in the affected range
+  (`request.form()` limits ignored for URL-encoded bodies, denial of
+  service, fixed in 1.3.1). `fastapi` 0.128.3 pins `starlette<1.0.0`.
+  fastapi is used only in `core/server.py` (`HTMLResponse`, `JSONResponse`,
+  `FileResponse`), `auth/oauth_responses.py` (`HTMLResponse`) and
+  `auth/oauth_callback_server.py` (the OAuth 2.0 callback app). Replace
+  those with `starlette.responses` and a Starlette app, drop `fastapi` from
+  `pyproject.toml`, then `uv lock --upgrade-package starlette`. Until then
+  Dependabot opens the PR when fastapi lifts the cap.
+- **Repository visibility and CI workflows.** See the "deliberately not
+  fixed" list in `CLAUDE.md`: private repo (detach the fork or push the
+  history to a new private repository), delete `docker-publish.yml` and
+  `publish-mcp-registry.yml`, read-only `ruff.yml`, pin actions by SHA.
+- **`admin.directory.user.security` scope.** Decide whether
+  `list_oauth_tokens_for_user` earns a scope that also authorises deleting
+  users' tokens; if not, add the tool to `BLOCKED_TOOLS` and drop the scope
+  from `ADMIN_SCOPES` (consent-screen change).
+- **`gc.collect()` per tool call.** Measure with two or three concurrent
+  users on the single Render worker before touching it.
+- **Verification coverage.** The adversarial verification pass on the audit
+  covered 20 of the 56 high and medium findings (11 stood, 9 refuted) before
+  the session's budget ran out; the rest were checked by hand. Two low
+  findings from the diff review were not voted on and are left as-is: the
+  tautological `test_no_blocked_tool_is_referenced` and the free-text log
+  assertions in `tests/test_access_policy.py`.

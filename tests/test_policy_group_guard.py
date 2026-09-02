@@ -65,11 +65,15 @@ def _http_error(status):
 class _Directory:
     """Directory double: groups.get resolves aliases; members.list walks nesting."""
 
-    def __init__(self, groups, members_by_group=None, list_error=None):
+    def __init__(
+        self, groups, members_by_group=None, list_error=None, memberships=None
+    ):
         # groups: {lookup_key: group_resource}
         self.groups_map = groups
         self.members_by_group = members_by_group or {}
         self.list_error = list_error
+        # memberships: {(group_email, member_email): role} answered by members.get
+        self.memberships = memberships or {}
         self.mutations = []
 
     def groups(self):
@@ -94,7 +98,14 @@ class _Directory:
                 return _request({"members": outer.members_by_group[groupKey]})
 
             def get(self, groupKey, memberKey):
-                return _request(_http_error(404))
+                role = outer.memberships.get((groupKey, memberKey))
+                if role is None:
+                    return _request(_http_error(404))
+                return _request({"email": memberKey, "role": role, "id": "m0"})
+
+            def delete(self, groupKey, memberKey):
+                outer.mutations.append(("delete", groupKey, memberKey))
+                return _request({})
 
             def insert(self, groupKey, body):
                 outer.mutations.append(("insert", groupKey, body))
@@ -183,6 +194,52 @@ class TestResolvedGuard:
                 d, USER, group_email=target, member_email="x@otbgroup.co.uk"
             )
         assert d.mutations == []
+
+    @pytest.mark.asyncio
+    async def test_remove_via_alias_of_policy_group_is_refused(self):
+        alias = "it-admins@otbgroup.co.uk"
+        d = _Directory(
+            {alias: {"id": "g1", "email": ADMINS, "aliases": [alias]}},
+            members_by_group={ADMINS: []},
+            memberships={(ADMINS, USER): "OWNER"},
+        )
+        with pytest.raises(UserInputError, match="access-policy group"):
+            await _unwrap(groups.remove_group_member)(
+                d, USER, group_email=alias, member_email=USER
+            )
+        assert d.mutations == []
+
+    @pytest.mark.asyncio
+    async def test_remove_from_group_nested_in_policy_group_is_refused(self):
+        inner = "it-team@otbgroup.co.uk"
+        d = _Directory(
+            {inner: {"id": "g7", "email": inner, "aliases": []}},
+            members_by_group={
+                ADMINS: [{"type": "GROUP", "email": inner}],
+                inner: [],
+            },
+            memberships={(inner, "x@otbgroup.co.uk"): "MEMBER"},
+        )
+        with pytest.raises(UserInputError, match="nested inside"):
+            await _unwrap(groups.remove_group_member)(
+                d, USER, group_email=inner, member_email="x@otbgroup.co.uk"
+            )
+        assert d.mutations == []
+
+    @pytest.mark.asyncio
+    async def test_remove_from_unrelated_group_uses_canonical_email(self):
+        alias = "drivers-alias@otbgroup.co.uk"
+        canonical = "drivers@otbgroup.co.uk"
+        d = _Directory(
+            {alias: {"id": "g4", "email": canonical, "aliases": [alias]}},
+            members_by_group={ADMINS: [], canonical: []},
+            memberships={(canonical, "x@otbgroup.co.uk"): "MEMBER"},
+        )
+        out = await _unwrap(groups.remove_group_member)(
+            d, USER, group_email=alias, member_email="x@otbgroup.co.uk"
+        )
+        assert "Removed" in out
+        assert d.mutations == [("delete", canonical, "x@otbgroup.co.uk")]
 
     @pytest.mark.asyncio
     async def test_policy_group_not_yet_created_is_not_an_error(self):

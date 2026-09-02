@@ -87,6 +87,18 @@ def safe_print(text):
         print(text.encode("ascii", errors="replace").decode(), file=sys.stderr)
 
 
+def _single_user_requested(args) -> bool:
+    """``--single-user`` or ``MCP_SINGLE_USER_MODE`` set by hand. Both reach
+    the same credential loader, so both must fail the OAuth 2.1 check."""
+    if getattr(args, "single_user", False):
+        return True
+    return os.getenv("MCP_SINGLE_USER_MODE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def validate_tools_argument(tools):
     """Reject an explicitly-empty --tools list.
 
@@ -447,7 +459,7 @@ def main():
     safe_print("")
 
     # Set global single-user mode flag
-    if args.single_user:
+    if _single_user_requested(args):
         # Check for incompatible OAuth 2.1 mode
         if os.getenv("MCP_ENABLE_OAUTH21", "false").lower() == "true":
             safe_print("❌ Single-user mode is incompatible with OAuth 2.1 mode")

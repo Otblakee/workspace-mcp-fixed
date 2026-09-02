@@ -842,6 +842,10 @@ class AccessPolicyEngine:
         )
 
         catalogue = ToolCatalogue()
+        # Resolve the path from *this* mapping so an explicit ``environ``
+        # (tests, tooling) never falls through to the process environment
+        # inside load_policy_file.
+        policy_path = env.get(FILE_ENV) or DEFAULT_POLICY_PATH
 
         if mode == "off":
             logger.info(
@@ -855,7 +859,7 @@ class AccessPolicyEngine:
             policy: Optional[GroupPolicy] = None
             policy_error: Optional[str] = None
             try:
-                policy = load_policy_file(env.get(FILE_ENV), catalogue=catalogue)
+                policy = load_policy_file(policy_path, catalogue=catalogue)
             except PolicyError as exc:
                 policy_error = str(exc)
                 logger.error(
@@ -874,7 +878,7 @@ class AccessPolicyEngine:
                 policy_error=policy_error,
             )
 
-        policy = load_policy_file(env.get(FILE_ENV), catalogue=catalogue)
+        policy = load_policy_file(policy_path, catalogue=catalogue)
         # Validate the tunables up front so a typo fails at startup rather
         # than the first time a membership source happens to be configured.
         cache_ttl_s = _float_env(env, CACHE_TTL_ENV, DEFAULT_CACHE_TTL_S)
