@@ -347,3 +347,44 @@ code keeps failing closed on it.
 **Scope note:** this needs `admin.directory.user.readonly`, which is already in
 `ADMIN_SCOPES` alongside the group-read scopes the check was using. **No
 consent-screen change and no Render env change.**
+
+## Token-expiry window: parked options (2026-09-16)
+
+Fixed on `claude/magical-pascal-rlubvr` by not declaring an expiry to
+google-auth when no refresh token is held (see CLAUDE.md "Token-expiry window
+fix"). Two stronger options were considered and parked:
+
+- **Recover the upstream Google refresh token from the FastMCP proxy** via
+  its `_upstream_token_store` / JTI mapping and set `refresh_token` on the
+  `Credentials`, so google-auth refreshes by itself even when the client is
+  slow to refresh. Closes the residual one-to-two-second window at true
+  expiry. Depends on fastmcp private internals that changed between 2.x and
+  3.x, and puts Google refresh tokens into the in-process session store.
+  Revisit only if the residual window is ever observed in the audit log.
+- **Shorten the proxy-issued token lifetime** (e.g. 50 min) so the client
+  refreshes before Google's token ages out. fastmcp 3.3.1 only exposes
+  `fallback_access_token_expiry_seconds`, which applies when the IdP omits
+  `expires_in` (Google never does), and `GoogleProvider` does not pass it
+  through. Would need a subclass or patch of token issuance.
+
+## fastmcp version review (2026-09-16)
+
+Pinned `fastmcp==3.3.1` (released 2026-05-15; `pyproject.toml` allows
+`>=3.2.0,<4.0.0`). Checked against the project's published advisories on
+2026-09-16 (github.com/jlowin/fastmcp/security/advisories, 8 entries, last
+published 2026-03-31). Every one is patched at or before 3.2.0, including the
+two OAuth-proxy ones that matter to this deployment (GHSA-rww4-4w9c-7733 /
+CVE-2026-27124 consent verification, patched 3.2.0; GHSA-5h2m-4q8j-pqpj /
+CVE-2025-69196 token reuse across servers, patched 2.14.2) and the OpenAPI
+SSRF (GHSA-vv7q-7jx5-f767 / CVE-2026-32871, patched 3.2.0, and we do not use
+the OpenAPI provider). **No known open advisory against 3.3.1.**
+
+Latest on PyPI is 4.0.4 (4.0.0 released 2026-08-31). That is a major-version
+migration, not a security patch: review the 4.x OAuth-proxy and middleware
+changes (`get_access_token`, `AccessToken.claims`, `_upstream_token_store`,
+`GoogleProvider`) against `auth/` before bumping, and re-run
+`tests/test_multi_user_security.py` and `tests/test_token_expiry_window.py`.
+Also worth checking whether 4.x proactively refreshes the upstream token,
+which would make the parked "recover refresh token" option unnecessary.
+osv.dev was unreachable from the remote session; re-check there before
+the bump.

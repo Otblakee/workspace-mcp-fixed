@@ -613,3 +613,52 @@ Record real numbers in `FOLLOWUPS.md` after the first live pilot.
 The suite is unit-scope with mocked Google services. Before the architecture
 build runs for real, execute the scratch-shared-drive checks listed in
 `FOLLOWUPS.md` under "Live scratch-drive verification".
+
+## Token-expiry window fix (claude/magical-pascal-rlubvr)
+
+Root cause of the 2026-09-16 "Authentication error occurred for
+oliver@otbgroup.co.uk. Please sign in via your MCP client's OAuth 2.1 flow"
+failures, diagnosed from Render logs (report:
+`workspace-mcp-auth-error-2026-09-16.md`). Coverage in
+`tests/test_token_expiry_window.py`.
+
+**Mechanism.** In OAuth 2.1 proxy mode this server never holds a Google
+refresh token: the FastMCP OAuth proxy keeps the upstream token, and the MCP
+client refreshes it at `/token` when the proxy-issued access token expires
+(3599 s, mirroring Google's `expires_in`). `auth/oauth21_session_store.py`
+built the google-auth `Credentials` with `refresh_token=None` **and**
+`expiry=<token expiry>`. google-auth (`REFRESH_THRESHOLD`, 3 min 45 s) treats
+such a token as expired early and calls `refresh()` before every request in
+that window, which raises `RefreshError("The credentials do not contain the
+necessary fields...")`. Net effect: every tool call and every audit flush
+failed for the final 3 min 45 s of each token hour, while the token was still
+good. The audit row for the failed call went to the Render log as
+`AUDIT_FALLBACK` because the writer used the same credentials.
+
+**Fix A — declare expiry only when refreshable.** New helper
+`_google_auth_expiry(expiry, refresh_token)` returns the normalised expiry only
+when a refresh token exists, else `None` (google-auth then never pre-refreshes;
+the token is used until Google rejects it, which coincides with the proxy
+token expiring and the client refreshing). Applied at all four build sites:
+`OAuth21SessionStore.get_credentials` (the audit writer's path),
+`_build_credentials_from_provider`, the fallback in
+`ensure_session_from_access_token`, and `get_credentials_from_token` (which
+also drops its assumed one-hour expiry). The session store still records the
+expiry for bookkeeping via new `_expiry_from_access_token`; it is no longer
+read back off the `Credentials` object.
+
+**Fix E — honest message at true expiry.** `_handle_token_refresh_error` now
+recognises google-auth's missing-refresh-token `RefreshError`
+(`_is_missing_refresh_token_error`) and returns "Access token expired before
+the client refreshed it: retry; reconnect the connector if it persists",
+logged at WARN. The previous wording sent the user to re-consent, which was
+not the cause. `invalid_grant` / revoked handling is unchanged.
+
+**Residual.** A call that starts within the last second or two before true
+expiry can still see a Google 401, which google-auth-httplib2 turns into the
+same `RefreshError`; Fix E covers the message and the next call works after
+the client refreshes. Recovering the upstream refresh token from the proxy's
+`_upstream_token_store` (would close the window completely) is parked in
+`FOLLOWUPS.md` because it depends on fastmcp private internals.
+
+**No Render env change, no consent change, no dependency change.**

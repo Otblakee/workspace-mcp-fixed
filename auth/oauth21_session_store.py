@@ -51,6 +51,38 @@ def _normalize_expiry_to_naive_utc(expiry: Optional[Any]) -> Optional[datetime]:
     return None
 
 
+def _google_auth_expiry(
+    expiry: Optional[Any], refresh_token: Optional[str]
+) -> Optional[datetime]:
+    """Expiry to hand to google-auth, or None when the credentials cannot refresh.
+
+    google-auth treats a token as expired ``REFRESH_THRESHOLD`` (3 min 45 s)
+    before its declared expiry and calls ``refresh()`` before every request in
+    that window. Without a refresh token that raises ``RefreshError`` ("The
+    credentials do not contain the necessary fields...") while the token is
+    still perfectly usable. In OAuth 2.1 proxy mode the MCP client owns the
+    refresh and this server never holds a Google refresh token, so declaring
+    the expiry only converts the last 3 min 45 s of every token hour into a
+    guaranteed failure. Declare it only when a refresh token exists, i.e. when
+    google-auth can actually act on it. The session store keeps the expiry for
+    bookkeeping regardless.
+    """
+    if refresh_token:
+        return _normalize_expiry_to_naive_utc(expiry)
+    return None
+
+
+def _expiry_from_access_token(access_token: Any) -> Optional[datetime]:
+    """Aware UTC expiry from a FastMCP ``AccessToken.expires_at``, or None."""
+    expires_at = getattr(access_token, "expires_at", None)
+    if not expires_at:
+        return None
+    try:
+        return datetime.fromtimestamp(expires_at, tz=timezone.utc)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 # =============================================================================
 # OAuth21SessionStore - Main Session Management
 # =============================================================================
@@ -303,14 +335,17 @@ class OAuth21SessionStore:
 
             try:
                 # Create Google credentials from session info
+                refresh_token = session_info.get("refresh_token")
                 credentials = Credentials(
                     token=session_info["access_token"],
-                    refresh_token=session_info.get("refresh_token"),
+                    refresh_token=refresh_token,
                     token_uri=session_info["token_uri"],
                     client_id=session_info.get("client_id"),
                     client_secret=session_info.get("client_secret"),
                     scopes=session_info.get("scopes", []),
-                    expiry=session_info.get("expiry"),
+                    expiry=_google_auth_expiry(
+                        session_info.get("expiry"), refresh_token
+                    ),
                 )
 
                 logger.debug(f"Retrieved OAuth 2.1 credentials for {user_email}")
@@ -657,18 +692,11 @@ def _build_credentials_from_provider(
         return None
 
     client_id, client_secret = _resolve_client_credentials()
-
-    expiry = None
-    expires_at = getattr(access_token, "expires_at", None)
-    if expires_at:
-        try:
-            expiry_candidate = datetime.fromtimestamp(expires_at, tz=timezone.utc)
-            expiry = _normalize_expiry_to_naive_utc(expiry_candidate)
-        except Exception:  # pragma: no cover - defensive
-            expiry = None
-
     scopes = getattr(access_token, "scopes", None)
 
+    # No refresh token is reachable here, so no expiry is declared either:
+    # see _google_auth_expiry. The token's expiry is still recorded in the
+    # session store by ensure_session_from_access_token.
     return Credentials(
         token=access_token.token,
         refresh_token=None,
@@ -676,7 +704,7 @@ def _build_credentials_from_provider(
         client_id=client_id,
         client_secret=client_secret,
         scopes=scopes,
-        expiry=expiry,
+        expiry=_google_auth_expiry(_expiry_from_access_token(access_token), None),
     )
 
 
@@ -695,19 +723,13 @@ def ensure_session_from_access_token(
         email = access_token.claims.get("email")
 
     credentials = _build_credentials_from_provider(access_token)
-    store_expiry: Optional[datetime] = None
+    # Bookkeeping expiry for the session store. Deliberately not read back
+    # off the Credentials object, which carries no expiry without a refresh
+    # token (see _google_auth_expiry).
+    store_expiry: Optional[datetime] = _expiry_from_access_token(access_token)
 
     if credentials is None:
         client_id, client_secret = _resolve_client_credentials()
-        expiry = None
-        expires_at = getattr(access_token, "expires_at", None)
-        if expires_at:
-            try:
-                expiry = datetime.fromtimestamp(expires_at, tz=timezone.utc)
-            except Exception:  # pragma: no cover - defensive
-                expiry = None
-
-        normalized_expiry = _normalize_expiry_to_naive_utc(expiry)
         credentials = Credentials(
             token=access_token.token,
             refresh_token=None,
@@ -715,11 +737,8 @@ def ensure_session_from_access_token(
             client_id=client_id,
             client_secret=client_secret,
             scopes=getattr(access_token, "scopes", None),
-            expiry=normalized_expiry,
+            expiry=_google_auth_expiry(store_expiry, None),
         )
-        store_expiry = expiry
-    else:
-        store_expiry = credentials.expiry
 
     # Skip session storage for external OAuth 2.1 to prevent memory leak from ephemeral tokens
     if email and not is_external_oauth21_provider():
@@ -784,11 +803,10 @@ def get_credentials_from_token(
         # / `_client_storage` adapters). The probe always missed; we now go
         # straight to the fallback minimal-credentials construction below.
 
-        # Otherwise, create minimal credentials with just the access token
-        # Assume token is valid for 1 hour (typical for Google tokens)
-        expiry = _normalize_expiry_to_naive_utc(
-            datetime.now(timezone.utc) + timedelta(hours=1)
-        )
+        # Otherwise, create minimal credentials with just the access token.
+        # No refresh token, so no expiry is declared (see _google_auth_expiry);
+        # the previous assumed one-hour expiry made google-auth fail the
+        # token 3 min 45 s early for no gain.
         client_id, client_secret = _resolve_client_credentials()
 
         credentials = Credentials(
@@ -798,7 +816,7 @@ def get_credentials_from_token(
             client_id=client_id,
             client_secret=client_secret,
             scopes=None,
-            expiry=expiry,
+            expiry=None,
         )
 
         logger.debug("Created fallback Google credentials from bearer token")
