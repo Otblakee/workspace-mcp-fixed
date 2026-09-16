@@ -534,6 +534,15 @@ def _resolve_scopes(scopes: Union[str, List[str]]) -> List[str]:
     return resolved
 
 
+# Substring of google-auth's RefreshError when Credentials have no
+# refresh_token (google/oauth2/credentials.py, Credentials.refresh).
+_MISSING_REFRESH_TOKEN_MARKER = "do not contain the necessary fields"
+
+
+def _is_missing_refresh_token_error(error_str: str) -> bool:
+    return _MISSING_REFRESH_TOKEN_MARKER in error_str.lower()
+
+
 def _handle_token_refresh_error(
     error: RefreshError, user_email: str, service_name: str
 ) -> str:
@@ -549,6 +558,29 @@ def _handle_token_refresh_error(
         A user-friendly error message with instructions for reauthentication
     """
     error_str = str(error)
+
+    if _is_missing_refresh_token_error(error_str):
+        # google-auth raises this when it decides a token needs refreshing but
+        # the Credentials carry no refresh_token. In OAuth 2.1 proxy mode this
+        # server never holds one (the MCP client owns the refresh), so the
+        # only way here is the Google access token genuinely reaching the end
+        # of its life before the client refreshed. Not a revoked login, not
+        # a scope problem: say so, instead of sending the user to re-consent.
+        logger.warning(
+            f"Access token for {user_email} reached end of life before the "
+            f"client refreshed it (service={service_name}); no refresh token "
+            f"held server-side. Client refresh on next request will clear it."
+        )
+        return (
+            f"**Access token expired before the client refreshed it ({service_name})**\n\n"
+            f"The Google access token for {user_email} has reached the end of its "
+            f"life and this server holds no refresh token for it (the MCP client "
+            f"owns the refresh in OAuth 2.1 mode). This is not a revoked login and "
+            f"not a scope problem.\n\n"
+            f"**To resolve this:** retry the command. The client refreshes the "
+            f"token automatically on its next request. If it keeps failing, "
+            f"disconnect and reconnect the connector in your MCP client."
+        )
 
     if (
         "invalid_grant" in error_str.lower()
