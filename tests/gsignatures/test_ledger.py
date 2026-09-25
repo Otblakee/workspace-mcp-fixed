@@ -391,6 +391,125 @@ class TestReadLedgerLatest:
         with pytest.raises(ledger.LedgerError):
             await ledger.read_ledger_latest(sheets, SHEET_ID)
 
+    @pytest.mark.asyncio
+    async def test_malformed_row_warning_never_logs_personal_data(self, caplog):
+        """A row without user/send-as is skipped; the log names only its
+        position, applied_at and run_id, never previous_signature_html
+        (a person's name, title and mobile) nor the actor."""
+        secret_html = "<div>Priya Patel, Head of Ops, 07700 900999</div>"
+        sheets = FakeSheets(
+            {
+                "Ledger": [
+                    ledger.LEDGER_HEADER,
+                    _row_values(),
+                    _row_values(
+                        applied_at="2026-09-27T09:00:00Z",
+                        user_email="",
+                        send_as_email="",
+                        previous_signature_html=secret_html,
+                        run_id="run-broken",
+                    ),
+                ]
+            }
+        )
+        with caplog.at_level("WARNING", logger="gsignatures.ledger"):
+            latest = await ledger.read_ledger_latest(sheets, SHEET_ID)
+        assert len(latest) == 1
+        text = caplog.text
+        assert "row 3" in text
+        assert "2026-09-27T09:00:00Z" in text and "run-broken" in text
+        assert "Priya" not in text and "07700" not in text
+        assert "oliver@otbgroup.co.uk" not in text
+        assert "<div>" not in text
+
+
+class TestReadLedgerRows:
+    @pytest.mark.asyncio
+    async def test_every_attributable_row_in_sheet_order(self):
+        sheets = FakeSheets(
+            {
+                "Ledger": [
+                    ledger.LEDGER_HEADER,
+                    _row_values(run_id="run-1"),
+                    [],
+                    _row_values(run_id="run-2", applied_at="2026-09-26T09:00:00Z"),
+                    ["2026-09-25T12:00:00Z", "oliver@otbgroup.co.uk", "", ""],
+                ]
+            }
+        )
+        rows = await ledger.read_ledger_rows(sheets, SHEET_ID)
+        assert [r["run_id"] for r in rows] == ["run-1", "run-2"]
+        assert all(set(r) == set(ledger.LEDGER_HEADER) for r in rows)
+        assert ledger.ledger_key(rows[0]) == (
+            "alice@otbgroup.co.uk",
+            "alice@otbgroup.co.uk",
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_and_header_only(self):
+        assert await ledger.read_ledger_rows(FakeSheets({"Ledger": []}), SHEET_ID) == []
+        sheets = FakeSheets({"Ledger": [ledger.LEDGER_HEADER]})
+        assert await ledger.read_ledger_rows(sheets, SHEET_ID) == []
+
+
+class TestLedgerTabExists:
+    @pytest.mark.asyncio
+    async def test_reports_presence_without_reading_values(self):
+        sheets = FakeSheets({"Other": [["x"]]})
+        assert await ledger.ledger_tab_exists(sheets, SHEET_ID) is False
+        assert sheets.names() == ["spreadsheets.get"]
+        sheets = FakeSheets({"Ledger": []})
+        assert await ledger.ledger_tab_exists(sheets, SHEET_ID) is True
+
+    @pytest.mark.asyncio
+    async def test_blank_sheet_id_is_refused(self):
+        with pytest.raises(ledger.LedgerError):
+            await ledger.ledger_tab_exists(FakeSheets(), "")
+
+
+class TestAssertTabWritable:
+    @pytest.mark.asyncio
+    async def test_rewrites_the_header_unchanged(self):
+        sheets = FakeSheets({"Ledger": [ledger.LEDGER_HEADER, _row_values()]})
+        before = [list(r) for r in sheets.tabs["Ledger"]]
+        await ledger.assert_tab_writable(
+            sheets, SHEET_ID, ledger.LEDGER_TAB, ledger.LEDGER_HEADER
+        )
+        assert sheets.names() == ["values.update"]
+        params = sheets.calls[0][1]
+        assert _tab_of(params["range"]) == "Ledger"
+        assert params["range"].endswith("!1:1")
+        assert params["valueInputOption"] == "RAW"
+        assert params["body"] == {"values": [ledger.LEDGER_HEADER]}
+        assert sheets.tabs["Ledger"] == before
+
+    @pytest.mark.asyncio
+    async def test_read_only_share_is_refused(self):
+        from googleapiclient.errors import HttpError
+
+        from tests.gsignatures.fakes import FakeSheets as SharedFakeSheets
+        from tests.gsignatures.fakes import http_error
+
+        sheets = SharedFakeSheets({"Ledger": [ledger.LEDGER_HEADER]})
+        sheets.fail_writes = http_error(403, "forbidden")
+        with pytest.raises(HttpError):
+            await ledger.assert_tab_writable(
+                sheets, SHEET_ID, ledger.LEDGER_TAB, ledger.LEDGER_HEADER
+            )
+
+    @pytest.mark.asyncio
+    async def test_blank_arguments_are_refused_before_any_call(self):
+        sheets = FakeSheets({"Ledger": [ledger.LEDGER_HEADER]})
+        with pytest.raises(ledger.LedgerError):
+            await ledger.assert_tab_writable(sheets, "", "Ledger", ledger.LEDGER_HEADER)
+        with pytest.raises(ledger.LedgerError):
+            await ledger.assert_tab_writable(
+                sheets, SHEET_ID, " ", ledger.LEDGER_HEADER
+            )
+        with pytest.raises(ledger.LedgerError):
+            await ledger.assert_tab_writable(sheets, SHEET_ID, "Ledger", [])
+        assert sheets.calls == []
+
 
 class TestWriteAuditReport:
     @pytest.mark.asyncio

@@ -125,6 +125,12 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 RESULT_ACTIONS = ("applied", "would_apply", "unchanged", "skipped", "error")
 
+# Gmail enforces a 10,000-character limit on a signature. The engine refuses
+# a render over that size rather than sending something Gmail will reject or
+# cut; the refusal is a TemplateError, which plan_for_user turns into an
+# error row for that address.
+MAX_SIGNATURE_CHARS = 10000
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -861,13 +867,20 @@ def render_signature(
         "email": person.email,
         "statutory": statutory_html,
     }
-    return _render(
+    rendered = _render(
         template.signature_html,
         values,
         SIGNATURE_PLACEHOLDERS,
         raw_names=("statutory",),
         label=f"{template.signature_path.name}",
     )
+    if len(rendered) > MAX_SIGNATURE_CHARS:
+        raise TemplateError(
+            f"{template.signature_path.name}: rendered signature is "
+            f"{len(rendered)} characters, over Gmail's limit of "
+            f"{MAX_SIGNATURE_CHARS}; shorten the template"
+        )
+    return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -980,10 +993,13 @@ def drift_status(
     """Compare what Gmail holds now with what the ledger says was applied.
 
     Checked in this order: unmanaged, error, never_applied, stale_template,
-    changed_since_apply, in_sync. The comparison for ``changed_since_apply``
-    is against the ledger's ``readback_hash`` (what Gmail returned right after
-    the apply), never against a fresh render, because Gmail sanitises what it
-    stores.
+    stale_directory, changed_since_apply, in_sync. ``stale_directory`` means
+    the fresh render no longer hashes to the ledger's ``rendered_hash`` (the
+    person's Directory data changed since the apply), which is still a
+    judgement against the ledger, not against Gmail. The comparison for
+    ``changed_since_apply`` is against the ledger's ``readback_hash`` (what
+    Gmail returned right after the apply), never against a fresh render,
+    because Gmail sanitises what it stores.
     """
     if planned.status == "skipped":
         return "unmanaged", planned.reason or "not managed"
@@ -1001,6 +1017,13 @@ def drift_status(
             "stale_template",
             f"ledger has template {ledger_tv or '?'} / statutory {ledger_sv or '?'}, "
             f"config pins {planned.template_version} / {planned.statutory_version}",
+        )
+
+    if str(ledger_row.get("rendered_hash") or "") != (planned.rendered_hash or ""):
+        return (
+            "stale_directory",
+            "rendered output differs from the ledger rendered_hash (Directory "
+            "data changed since apply)",
         )
 
     current_hash = signature_hash(current_signature_html)
@@ -1070,6 +1093,7 @@ __all__ = [
     "SIGNATURE_PLACEHOLDERS",
     "STATUTORY_PLACEHOLDERS",
     "LEGAL_FORMS",
+    "MAX_SIGNATURE_CHARS",
     "RESULT_ACTIONS",
     "SignatureConfigError",
     "MissingDirectoryDataError",

@@ -35,6 +35,7 @@ from gsignatures import engine  # noqa: E402
 from gsignatures.engine import (  # noqa: E402
     DEFAULT_CONFIG_PATH,
     DEFAULT_TEMPLATES_DIR,
+    MAX_SIGNATURE_CHARS,
     SIGNATURE_PLACEHOLDERS,
     STATUTORY_PLACEHOLDERS,
     Entity,
@@ -1066,7 +1067,10 @@ def _planned(status="planned", html="<p>sig</p>") -> PlannedSignature:
 
 
 def _ledger(
-    readback_html="<p>sig as gmail stored it</p>", tv="1.0.0", sv="1.0.0"
+    readback_html="<p>sig as gmail stored it</p>",
+    tv="1.0.0",
+    sv="1.0.0",
+    rendered_html="<p>sig</p>",
 ) -> dict:
     return {
         "applied_at": "2026-09-25T10:00:00+00:00",
@@ -1076,7 +1080,7 @@ def _ledger(
         "entity": "OTB",
         "template_version": tv,
         "statutory_version": sv,
-        "rendered_hash": signature_hash("<p>sig</p>"),
+        "rendered_hash": signature_hash(rendered_html),
         "readback_hash": signature_hash(readback_html),
         "previous_hash": "",
         "previous_signature_html": "",
@@ -1131,10 +1135,61 @@ def test_drift_in_sync_ignores_whitespace():
 
 
 def test_drift_in_sync_does_not_compare_raw_template():
-    """Gmail sanitises what it stores; in_sync is judged on the readback hash only."""
-    planned = _planned(html="<table><tr><td>rich</td></tr></table>")
-    status, _ = drift_status(planned, "<p>sig as gmail stored it</p>", _ledger())
+    """Gmail sanitises what it stores; in_sync is judged on the readback hash only.
+
+    The ledger row's rendered_hash matches the plan (nothing changed in the
+    Directory), so the only comparison left is Gmail's current signature
+    against the readback hash, and the raw template must play no part.
+    """
+    rich = "<table><tr><td>rich</td></tr></table>"
+    planned = _planned(html=rich)
+    ledger = _ledger(rendered_html=rich)
+    assert ledger["readback_hash"] != planned.rendered_hash
+    status, _ = drift_status(planned, "<p>sig as gmail stored it</p>", ledger)
     assert status == "in_sync"
+
+
+def test_drift_stale_directory_when_render_differs_from_ledger():
+    """A Directory change (title, mobile) shows up as a new rendered hash.
+
+    The audit must report it even though Gmail still holds exactly what the
+    last apply wrote, otherwise the cron says in_sync while apply says
+    would_apply for the same address.
+    """
+    planned = _planned(html="<p>sig with the new job title</p>")
+    status, reason = drift_status(planned, "<p>sig as gmail stored it</p>", _ledger())
+    assert status == "stale_directory"
+    assert "Directory" in reason and "rendered_hash" in reason
+
+
+def test_drift_stale_template_beats_stale_directory():
+    planned = _planned(html="<p>sig with the new job title</p>")
+    status, _ = drift_status(
+        planned, "<p>sig as gmail stored it</p>", _ledger(tv="0.9.0")
+    )
+    assert status == "stale_template"
+
+
+def test_drift_stale_directory_beats_changed_since_apply():
+    planned = _planned(html="<p>sig with the new job title</p>")
+    status, _ = drift_status(planned, "<p>edited by user</p>", _ledger())
+    assert status == "stale_directory"
+
+
+def test_drift_statuses_are_all_listed_by_operations():
+    """Every status drift_status can return is in the report order tuple."""
+    from gsignatures.operations import AUDIT_STATUSES, DRIFT_STATUSES
+
+    assert set(AUDIT_STATUSES) == {
+        "in_sync",
+        "unmanaged",
+        "never_applied",
+        "stale_template",
+        "stale_directory",
+        "changed_since_apply",
+        "error",
+    }
+    assert DRIFT_STATUSES == set(AUDIT_STATUSES) - {"in_sync", "unmanaged"}
 
 
 # ---------------------------------------------------------------------------
@@ -1343,3 +1398,153 @@ def test_no_dashes_in_new_files():
                 # Built from code points so this file itself passes the scan.
                 assert chr(0x2014) not in text, f"em dash in {path}"
                 assert chr(0x2013) not in text, f"en dash in {path}"
+
+
+# ---------------------------------------------------------------------------
+# Size limit (Gmail's 10,000-character cap is enforced, not remembered)
+# ---------------------------------------------------------------------------
+
+
+def test_max_signature_chars_is_gmails_limit():
+    assert MAX_SIGNATURE_CHARS == 10000
+
+
+def test_render_refuses_a_signature_over_the_limit(shipped_config):
+    padding = "<!-- " + "x" * MAX_SIGNATURE_CHARS + " -->"
+    tpl = _tpl("<table><tr><td>{{name}}</td></tr></table>" + padding)
+    with pytest.raises(TemplateError) as excinfo:
+        render_signature(tpl, _person(None), shipped_config.entities["OTB"], "")
+    message = str(excinfo.value)
+    assert str(MAX_SIGNATURE_CHARS) in message
+    assert "limit" in message
+
+
+def test_render_at_the_limit_is_allowed(shipped_config):
+    body = "<table><tr><td>{{name}}</td></tr></table>"
+    rendered_len = len(body.replace("{{name}}", "Ada Lovelace"))
+    tpl = _tpl(body + "x" * (MAX_SIGNATURE_CHARS - rendered_len))
+    out = render_signature(tpl, _person(None), shipped_config.entities["OTB"], "")
+    assert len(out) == MAX_SIGNATURE_CHARS
+
+
+def test_plan_for_user_over_size_template_is_an_error_row(shipped_copy):
+    """The size refusal surfaces as an error row for that address only."""
+    cfg_path, templates_dir = shipped_copy
+    cfg = load_config(cfg_path, templates_dir)
+    path = templates_dir / "JIT" / "JIT-signature-v1.0.0.html"
+    path.write_text(
+        path.read_text(encoding="utf-8") + "<!-- " + "x" * MAX_SIGNATURE_CHARS + " -->",
+        encoding="utf-8",
+    )
+    rows = plan_for_user(cfg, OLI, OLI_SEND_AS)
+    by = {r.send_as_email: r for r in rows}
+    jit = by["oliver.blake@jit-logistics.com"]
+    assert jit.status == "error"
+    assert "template error" in jit.reason and str(MAX_SIGNATURE_CHARS) in jit.reason
+    assert by["oliver@otbgroup.co.uk"].status == "planned"
+
+
+def test_shipped_templates_are_well_under_the_limit(shipped_config):
+    for code in ALL_CODES:
+        entity = shipped_config.entities[code]
+        tpl = load_template(shipped_config, code)
+        html = render_signature(tpl, _person(mobile="07700 900000"), entity)
+        assert len(html) < MAX_SIGNATURE_CHARS // 2, code
+
+
+# ---------------------------------------------------------------------------
+# AHWE ring-fence on the finished product, not only the inputs
+# ---------------------------------------------------------------------------
+
+
+EMILY = _user(
+    "emily@arthistorywithemily.co.uk",
+    "/99 _SYSTEM/Personal",
+    given="Emily",
+    family="Example",
+    full="Emily Example",
+    title="Art Historian",
+    phones=[{"type": "mobile", "value": "07700 900456"}],
+)
+
+
+def test_ahwe_full_render_is_ring_fenced(shipped_config):
+    """The whole rendered AHWE signature, via plan_for_user, names no group company."""
+    rows = plan_for_user(
+        shipped_config, EMILY, [_send_as(EMILY["primaryEmail"], primary=True)]
+    )
+    assert len(rows) == 1
+    plan = rows[0]
+    assert plan.status == "planned", plan.reason
+    assert plan.entity == "AHWE"
+    assert plan.html and "Emily Example" in plan.html
+    _assert_ring_fenced(plan.html, "AHWE rendered signature")
+    _assert_ring_fenced(plan.reason or "", "AHWE plan reason")
+
+
+# ---------------------------------------------------------------------------
+# No-dash rule on the wiring and documentation outside gsignatures/
+# ---------------------------------------------------------------------------
+
+
+def _section(text: str, start: str, stops: tuple[str, ...]) -> str:
+    """``text`` from the first line beginning with ``start`` to the next stop line."""
+    lines = text.splitlines(keepends=True)
+    begin = next(i for i, ln in enumerate(lines) if ln.startswith(start))
+    end = len(lines)
+    for i in range(begin + 1, len(lines)):
+        if any(lines[i].startswith(stop) for stop in stops):
+            end = i
+            break
+    return "".join(lines[begin:end])
+
+
+def _comment_runs_mentioning(text: str, needle: str) -> str:
+    """Lines containing ``needle`` plus the run of comment lines just above each."""
+    lines = text.splitlines()
+    chosen: set[int] = set()
+    for i, ln in enumerate(lines):
+        if needle not in ln:
+            continue
+        chosen.add(i)
+        j = i - 1
+        while j >= 0 and lines[j].lstrip().startswith("#"):
+            chosen.add(j)
+            j -= 1
+    return "\n".join(lines[i] for i in sorted(chosen))
+
+
+def test_no_dashes_in_gsignatures_wiring_sections():
+    """The hunks this feature added outside gsignatures/ carry no em or en dash.
+
+    Whole-file scans are not possible: the older surrounding text already
+    uses em dashes. So the exact sections are cut out and scanned.
+    """
+    root = Path(__file__).resolve().parent.parent.parent
+    read = lambda rel: (root / rel).read_text(encoding="utf-8")  # noqa: E731
+    changelog = read("CHANGELOG.md")
+    sections = {
+        "core/tool_tiers.yaml": _section(
+            read("core/tool_tiers.yaml"), "gsignatures:", ()
+        ),
+        "CLAUDE.md": _section(read("CLAUDE.md"), "## Gmail signatures", ("## ",)),
+        "README.md": _section(
+            read("README.md"), "### Gmail signatures", ("### ", "---")
+        ),
+        "FOLLOWUPS.md": _section(
+            read("FOLLOWUPS.md"), "## Gmail signatures live checks", ("## ",)
+        ),
+        "auth/scopes.py": _comment_runs_mentioning(
+            read("auth/scopes.py"), "gsignatures"
+        ),
+        "main.py": _comment_runs_mentioning(read("main.py"), "gsignatures"),
+    }
+    # Every 1.15.x CHANGELOG section belongs to this feature.
+    for line in changelog.splitlines():
+        if line.startswith("## [1.15."):
+            sections[f"CHANGELOG.md {line}"] = _section(changelog, line, ("## [",))
+    assert any(k.startswith("CHANGELOG.md") for k in sections)
+    for name, text in sections.items():
+        assert text.strip(), f"{name}: section not found"
+        assert chr(0x2014) not in text, f"em dash in {name}"
+        assert chr(0x2013) not in text, f"en dash in {name}"

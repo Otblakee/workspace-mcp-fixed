@@ -4,6 +4,61 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.15.1] - 2026-09-25
+
+### Added
+
+- `restore_email_signature`: the sixth `gsignatures` tool. Puts back the
+  `previous_signature_html` the ledger recorded for one send-as address
+  (latest row, or a named `run_id`), under the same dry-run and confirm
+  rule, and records the restore as a ledger row with versions `restored`.
+  Replaces the runbook's "paste it back in the editor" rollback step, which
+  the owner could not perform.
+- Audit status `stale_directory`: the ledger's `rendered_hash` no longer
+  matches a fresh render (a job title or mobile changed in the Directory
+  since the apply). Counts as drift for the cron, as it already counted as
+  `would_apply` for `apply_email_signatures`.
+- The engine refuses a rendered signature over Gmail's 10,000-character
+  limit (`engine.MAX_SIGNATURE_CHARS`) as an `error` row for that address.
+
+### Fixed
+
+- `--read-only` now removes `set_email_signature`, `apply_email_signatures`
+  and `restore_email_signature` at registration (they carry a
+  `_workspace_write_tool` marker that `core.tool_registry` honours, since
+  they hold no OAuth scope), and each refuses a live run in its body when
+  the server is read-only.
+- A live run proves the ledger writable before the first Gmail patch by
+  re-writing the identical header row, so a Sheet shared as Viewer is
+  refused up front instead of after the write. Once a ledger append fails
+  mid-run, no further address is patched in that run (each becomes an
+  `error` row reading `not attempted`), in that user and every later one.
+- A dry run whose ledger could not be read says so on every `would_apply`
+  row and in a header line, instead of claiming `no ledger row for this
+  address`. A Sheet with no `Ledger` tab yet reads as an empty ledger for
+  the read tools and the cron, so a fresh deployment audits as
+  `never_applied` rather than failing with a 400.
+- `python -m gsignatures.audit_cli`: a command line argparse rejects exits 1
+  (fatal), not argparse's 2, which is the drift code; `--help` stays 0. The
+  CLI reads the ledger through the same `prepare_ledger` as the audit tool.
+- An unknown or unreadable group scope is refused naming the group; a
+  missing or unreadable service-account key aborts a scope run instead of
+  producing one identical error row per user. `include_aliases=False`
+  reports excluded aliases as `skipped` even when the engine would have
+  reported an error for them. The switch checks run before any client is
+  built, so the caller sees the confirm or scope refusal even when no ledger
+  or key is configured.
+- Ledger rows without a user or send-as are logged by position, timestamp
+  and run_id only, never with `previous_signature_html`. Audit rows for the
+  signature tools now carry the mailbox (`user_email`) as `resource_id`.
+- Runbook: pilot expectations corrected (step 6.2 with no `Ledger` tab,
+  step 6.8 after two addresses), the Companies House cross-reference, the
+  `render.yaml` reconciliation, the Directory admin's required privileges,
+  delegation propagation (up to 24 hours), Render failure notifications
+  (opt-in, not automatic email), and the secret file readability fallback.
+  `uv run python -m gsignatures.audit_cli --all` is the cron command
+  everywhere.
+
 ## [1.15.0] - 2026-09-25
 
 ### Added
@@ -16,9 +71,10 @@ releases are recorded in the git history and in `CLAUDE.md`.
   in a scope with the ledger and never writes a signature. Scopes are exactly
   one of OU, domain or group (or `all_users` for audits); a scope larger
   than `max_users` is refused with the count.
-- `python -m gsignatures.audit_cli` for the weekly Render cron: exit 0 when
-  every managed address matches the ledger, 2 on any drift, 1 on a fatal
-  error. Audits only; never re-applies.
+- `python -m gsignatures.audit_cli` for the weekly Render cron (run as
+  `uv run python -m gsignatures.audit_cli --all` in the container): exit 0
+  when every managed address matches the ledger, 2 on any drift, 1 on a
+  fatal error. Audits only; never re-applies.
 - The service uses a Google service account with domain-wide delegation
   (`gsignatures/sa_auth.py`), never the user's OAuth token. Delegation
   scopes are exactly `gmail.settings.basic`,

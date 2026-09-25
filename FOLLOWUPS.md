@@ -415,5 +415,18 @@ Unit-scope only so far (`tests/gsignatures/`). Before the first live apply:
    on the primary and one alias, check Gmail web and app, `audit`. Only then
    `apply_email_signatures` by OU, dry run first, result tables kept. The
    full sequence is in `gsignatures/RUNBOOK.md`.
-6. **Cron.** After the first Monday run, confirm Render emailed on a
-   non-zero exit and that the `Audit_<date>` tab appeared in the ledger.
+6. **Cron.** Turn on failure notifications for the Render workspace first
+   (Render dashboard > Settings > Notifications; a failed run does not email
+   anyone by itself). After the first Monday run, confirm a notification
+   arrived on the non-zero exit and that the `Audit_<date>` tab appeared in
+   the ledger.
+7. **Secret file readability.** `entrypoint.sh` drops to the non-root `app`
+   user before the server and the cron run, and the repo has never mounted
+   a Render secret file before. On the first `preview_email_signature`
+   record whether `/etc/secrets/signature-sa.json` was readable as `app`;
+   if not, the fallback is `SIGNATURE_SERVICE_ACCOUNT_JSON` or a copy step
+   in `entrypoint.sh` (RUNBOOK step 6.1). Write the outcome here.
+8. **Restore path.** After the pilot apply, run `restore_email_signature`
+   as a dry run on the owner's `bir-d.co.uk` alias to confirm the ledger row
+   resolves and the previous HTML is the one expected; do a live restore
+   and re-apply only if the pilot signature needs pulling.

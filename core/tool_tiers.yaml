@@ -276,5 +276,6 @@ gsignatures:
     - set_email_signature
     - apply_email_signatures
     - audit_email_signatures
+    - restore_email_signature
   extended: []
   complete: []

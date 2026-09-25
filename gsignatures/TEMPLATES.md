@@ -56,8 +56,10 @@ statutory-only name (or the other way round) fails the render.
 * Web-safe fonts with fallbacks (for example
   `font-family: Arial, Helvetica, sans-serif`). Web fonts are not loaded in
   signatures.
-* Keep the whole rendered signature under roughly 10,000 characters. Gmail
-  has a size limit on signatures and long ones get truncated silently.
+* Keep the whole rendered signature under 10,000 characters. Gmail enforces
+  a 10,000-character limit on a signature, and the engine refuses a render
+  over that size (`engine.MAX_SIGNATURE_CHARS`): the address becomes an
+  `error` row naming the template and the size, and nothing is sent.
 * Images only by absolute public `https://` URL on a host we control (not a
   Drive link, not a Docs-published link, not a data URI). Every image needs
   `alt` text and explicit `width` and `height` attributes.
@@ -103,7 +105,9 @@ statutory-only name (or the other way round) fails the render.
 4. Fonts are web-safe with fallbacks.
 5. Every image is an absolute `https://` URL on our host, with `alt`,
    `width` and `height`.
-6. Rendered size is under roughly 10,000 characters.
+6. Rendered size is under 10,000 characters for the longest name, title and
+   mobile in the Directory (the engine refuses anything over the limit at
+   apply time, so a template near the limit fails for some people only).
 7. The statutory partial carries the legal name, place of registration,
    company number and registered office for a limited company, and the
    values in `entities.yaml` have been checked against Companies House

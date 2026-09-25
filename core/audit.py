@@ -205,6 +205,9 @@ def _resource_id(result: Any, kwargs: dict) -> str:
         "hub_folder_id",
         "target_id",
         "registry_spreadsheet_id",
+        # gsignatures: the mailbox a signature tool acts on. Only that
+        # package has a user_email parameter, so no other row changes.
+        "user_email",
         # gadmin_write group mutations.
         "group_email",
     ):

@@ -1,7 +1,7 @@
 """
 MCP tools for centrally managed Gmail signatures (opt-in service ``gsignatures``).
 
-These five tools are thin. Every decision lives in ``gsignatures/engine.py``
+These six tools are thin. Every decision lives in ``gsignatures/engine.py``
 and every Google call in ``gsignatures/operations.py``; this module resolves
 the caller, checks the allowlist, builds the clients and formats the result.
 
@@ -24,10 +24,17 @@ empty identity, or an address off the list is refused before any client is
 built. The gate is in the function body, not a decorator, so it cannot be
 peeled off.
 
-Write safety: the two write tools default to ``dry_run=True``, and a live
-write needs ``dry_run=False`` AND ``confirm=True``. Every live apply is
-recorded in the ledger Sheet before the tool returns; a live run is refused
-outright when the ledger cannot be reached.
+Write safety: the three write tools (set, apply, restore) default to
+``dry_run=True``, and a live write needs ``dry_run=False`` AND
+``confirm=True``. Every live apply is recorded in the ledger Sheet before the
+tool returns; a live run is refused outright when the ledger cannot be
+reached. The write tools also carry ``_workspace_write_tool = True`` (set by
+``_write_tool``), which ``core.tool_registry.filter_server_tools`` honours in
+``--read-only`` mode, so a read-only server drops them at registration; and
+each refuses a live run in the body when the server is read-only, in case a
+future registry change stops reading the marker. The read-only mode of the
+server is honoured even though these tools hold no OAuth scope, because the
+mode is a promise about the server, not about a scope.
 
 Errors from the feature's own setup (``SignatureAuthError``, ``LedgerError``,
 ``SignatureConfigError``) are raised as ``UserInputError`` so the message
@@ -40,6 +47,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Awaitable, List, Optional, TypeVar
 
+from auth.scopes import is_read_only_mode
 from core.server import server
 from core.utils import UserInputError, handle_http_errors
 
@@ -61,6 +69,30 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 _SETUP_ERRORS = (SignatureAuthError, LedgerError, SignatureConfigError)
+
+READ_ONLY_MESSAGE = (
+    "This server is running in read-only mode; signature writes are disabled. "
+    "Nothing was changed. Dry runs still work."
+)
+
+
+def _write_tool(fn):
+    """Mark a tool as a write for ``--read-only`` filtering.
+
+    The other write tools are recognised by the scopes ``require_google_service``
+    attaches; these tools hold no OAuth scope, so they carry this marker
+    instead. Innermost decorator: every wrapper above it uses
+    ``functools.wraps``, which copies the attribute outwards to the function
+    the registry inspects.
+    """
+    fn._workspace_write_tool = True
+    return fn
+
+
+def _refuse_if_read_only(dry_run: bool) -> None:
+    """A live write on a read-only server is refused before any client is built."""
+    if not dry_run and is_read_only_mode():
+        raise UserInputError(READ_ONLY_MESSAGE)
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +272,32 @@ def _mode_word(dry_run: bool) -> str:
     return "DRY RUN (no change made)" if dry_run else "LIVE"
 
 
+def _ledger_note_lines(rows) -> List[str]:
+    """One header line when a dry run could not read the ledger."""
+    prefixes = (
+        operations.LEDGER_NOT_CONFIGURED_NOTE,
+        operations.LEDGER_UNAVAILABLE_NOTE_PREFIX,
+    )
+    notes = sorted(
+        {
+            r.reason.split("; ", 1)[0]
+            for r in rows
+            if r.action == "would_apply"
+            and r.reason
+            and r.reason.startswith(prefixes)
+            and "; " in r.reason
+        }
+    )
+    if not notes:
+        return []
+    return [
+        "Ledger: "
+        + "; ".join(notes)
+        + ". Drift was not judged: every would_apply row says so. Fix the "
+        "ledger before a live run; a live run with this ledger is refused."
+    ]
+
+
 async def _set(
     actor: str,
     user_email: str,
@@ -248,6 +306,10 @@ async def _set(
     confirm: bool,
     force: bool,
 ) -> str:
+    # Switch checks first, so the caller sees the right refusal even when the
+    # runtime cannot be built (no ledger env, no key).
+    _refuse_if_read_only(dry_run)
+    operations.gate_live(dry_run, confirm)
     rt = build_runtime(need_ledger=not dry_run)
     run_id = operations.new_run_id()
     rows = await operations.apply_user(
@@ -268,6 +330,7 @@ async def _set(
     )
     lines = [
         f"{_mode_word(dry_run)} | run_id {run_id} | actor {actor}",
+        *_ledger_note_lines(rows),
         format_result_table(rows),
     ]
     if dry_run:
@@ -283,6 +346,50 @@ async def _set(
     return "\n".join(lines)
 
 
+async def _restore(
+    actor: str,
+    user_email: str,
+    send_as_email: Optional[str],
+    run_id_to_restore: Optional[str],
+    dry_run: bool,
+    confirm: bool,
+) -> str:
+    _refuse_if_read_only(dry_run)
+    operations.gate_live(dry_run, confirm)
+    # The row being restored lives in the ledger, so even a dry run needs it.
+    rt = build_runtime(need_ledger=True)
+    run_id = operations.new_run_id()
+    rows = await operations.restore_user(
+        user_email,
+        send_as_email,
+        actor=actor,
+        run_id=run_id,
+        from_run_id=run_id_to_restore,
+        dry_run=dry_run,
+        confirm=confirm,
+        sheets=rt.sheets,
+        sheet_id=rt.sheet_id,
+        gmail_factory=rt.gmail_factory,
+    )
+    lines = [
+        f"RESTORE {_mode_word(dry_run)} | run_id {run_id} | actor {actor}",
+        format_result_table(rows),
+    ]
+    if dry_run:
+        lines.append(
+            "Notes: nothing was written. To restore, repeat with dry_run=False "
+            "and confirm=True."
+        )
+    else:
+        lines.append(
+            "Notes: the restore is recorded in the Ledger tab with versions "
+            "'restored' and the replaced signature in previous_signature_html, "
+            "so it can itself be reversed. The next apply will re-apply the "
+            "managed signature unless the address is excluded first."
+        )
+    return "\n".join(lines)
+
+
 async def _apply(
     actor: str,
     ou_path: Optional[str],
@@ -294,6 +401,11 @@ async def _apply(
     force: bool,
     max_users: int,
 ) -> str:
+    # Scope and switch checks first, so the caller sees the right refusal
+    # even when the runtime cannot be built (no ledger env, no key).
+    operations.scope_label(ou_path=ou_path, domain=domain, group_email=group_email)
+    _refuse_if_read_only(dry_run)
+    operations.gate_live(dry_run, confirm)
     rt = build_runtime(need_ledger=not dry_run)
     run_id = operations.new_run_id()
     rows, meta = await operations.apply_scope(
@@ -316,6 +428,25 @@ async def _apply(
     lines = [
         f"Scope {meta['scope']} | run_id {run_id} | {_mode_word(dry_run)} | "
         f"actor {actor} | users {meta['user_count']}",
+        *(
+            [
+                f"Ledger: {meta['ledger_note']}. Drift was not judged: every "
+                "would_apply row says so. Fix the ledger before a live run; a "
+                "live run with this ledger is refused."
+            ]
+            if meta.get("ledger_note")
+            else []
+        ),
+        *(
+            [
+                "LEDGER FAILED MID-RUN: after the first failed ledger append "
+                "no further address was patched; those rows read 'not "
+                "attempted'. Record the 'applied but the ledger append "
+                "failed' rows by hand, fix the ledger, then run again."
+            ]
+            if meta.get("ledger_failed")
+            else []
+        ),
         format_result_table(rows),
         f"Report: {meta['report_filename']}. {meta['access_line']}",
         "Keep this table and the report: together with the Ledger tab they are "
@@ -417,6 +548,7 @@ async def get_email_signatures(user_email: str) -> str:
 
 @server.tool()
 @handle_http_errors("set_email_signature", service_type="gmail")
+@_write_tool
 async def set_email_signature(
     user_email: str,
     send_as_email: Optional[str] = None,
@@ -430,8 +562,9 @@ async def set_email_signature(
     Dry run by default. A live write needs dry_run=False AND confirm=True,
     and a reachable ledger Sheet; every live apply is recorded there with
     the previous signature HTML. An address whose ledger row already matches
-    Gmail is reported 'unchanged' unless force=True. Caller must be on
-    SIGNATURE_ADMIN_EMAILS.
+    Gmail is reported 'unchanged' unless force=True. force never touches an
+    address the rules skip (personal alias, suspended user, excluded OU).
+    Refused on a read-only server. Caller must be on SIGNATURE_ADMIN_EMAILS.
 
     Args:
         user_email (str): The user's primary address. Required.
@@ -454,6 +587,7 @@ async def set_email_signature(
 
 @server.tool()
 @handle_http_errors("apply_email_signatures", service_type="gmail")
+@_write_tool
 async def apply_email_signatures(
     ou_path: Optional[str] = None,
     domain: Optional[str] = None,
@@ -470,8 +604,10 @@ async def apply_email_signatures(
     Exactly one scope. Dry run by default; a live write needs dry_run=False
     AND confirm=True and a reachable ledger. A scope with more users than
     max_users is refused with the count (never truncated). One failing
-    address or user is an error row; the rest continue. Every row is also
-    written as a JSONL report. Caller must be on SIGNATURE_ADMIN_EMAILS.
+    address or user is an error row; the rest continue, except that after a
+    failed ledger append nothing further is patched in that run. Every row
+    is also written as a JSONL report. Refused on a read-only server. Caller
+    must be on SIGNATURE_ADMIN_EMAILS.
 
     Args:
         ou_path (Optional[str]): Organisational unit path, e.g. '/01 OTB'
@@ -518,9 +654,11 @@ async def audit_email_signatures(
     Compares every send-as in one scope with the ledger. Never writes a signature.
 
     Exactly one scope (all_users=True counts as one). Statuses: in_sync,
-    unmanaged, never_applied, stale_template, changed_since_apply, error.
-    With write_report=True the rows are also written to an 'Audit_<UTC
-    date>' tab of the ledger Sheet. Caller must be on SIGNATURE_ADMIN_EMAILS.
+    unmanaged, never_applied, stale_template, stale_directory (the person's
+    Directory data changed since the apply, so the signature is out of
+    date), changed_since_apply, error. With write_report=True the rows are
+    also written to an 'Audit_<UTC date>' tab of the ledger Sheet. Caller
+    must be on SIGNATURE_ADMIN_EMAILS.
 
     Args:
         ou_path (Optional[str]): Organisational unit path (includes children).
@@ -536,4 +674,45 @@ async def audit_email_signatures(
     await _require_allowed_caller()
     return await _translated(
         _audit(ou_path, domain, group_email, all_users, write_report)
+    )
+
+
+@server.tool()
+@handle_http_errors("restore_email_signature", service_type="gmail")
+@_write_tool
+async def restore_email_signature(
+    user_email: str,
+    send_as_email: Optional[str] = None,
+    run_id: Optional[str] = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> str:
+    """
+    Puts back the previous signature the ledger recorded for one send-as address.
+
+    Uses the latest ledger row for the address (or the row from a given
+    run_id) and restores its previous_signature_html: the signature that was
+    in place before that apply. An empty previous signature clears the
+    signature. Dry run by default; a live restore needs dry_run=False AND
+    confirm=True and a writable ledger, and is itself recorded as a ledger
+    row (versions 'restored') so it can be reversed. The next apply will
+    re-apply the managed signature. Refused on a read-only server. Caller
+    must be on SIGNATURE_ADMIN_EMAILS.
+
+    Args:
+        user_email (str): The user's primary address. Required.
+        send_as_email (Optional[str]): The send-as address to restore.
+            Defaults to the primary.
+        run_id (Optional[str]): Restore from the ledger row of this run_id
+            instead of the latest row for the address.
+        dry_run (bool): Report without writing. Defaults to True.
+        confirm (bool): Second switch for a live restore. Defaults to False.
+
+    Returns:
+        str: Mode line, a one-row result table and notes.
+    """
+    actor = await _require_allowed_caller()
+    user_email = _require_email(user_email, "user_email")
+    return await _translated(
+        _restore(actor, user_email, send_as_email, run_id, dry_run, confirm)
     )

@@ -1,4 +1,4 @@
-"""Unit tests for the five MCP tools in ``gsignatures.signature_tools``.
+"""Unit tests for the six MCP tools in ``gsignatures.signature_tools``.
 
 Covers:
 
@@ -13,6 +13,10 @@ Covers:
   the confirm path, one address at a time;
 * ``apply_email_signatures``: header, table, JSONL access line, reminder;
 * ``audit_email_signatures``: counts, table, the ``Audit_<date>`` tab;
+* ``restore_email_signature``: dry run by default, the live path, run_id;
+* ``--read-only`` mode: the write tools refuse a live run and still dry-run;
+* the switch checks run before the runtime is built, so the caller sees the
+  right refusal even when no ledger or key is configured;
 * ``SignatureAuthError`` / ``LedgerError`` / ``SignatureConfigError`` reach
   the client as ``UserInputError``.
 
@@ -32,9 +36,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from auth.scopes import set_read_only  # noqa: E402
 from core.utils import UserInputError  # noqa: E402
 from gsignatures import operations, sa_auth, signature_tools  # noqa: E402
-from gsignatures.engine import SignatureConfigError, load_config, signature_hash  # noqa: E402
+from gsignatures.engine import (  # noqa: E402
+    SignatureConfigError,
+    load_config,
+    plan_for_user,
+    signature_hash,
+)
 from gsignatures.ledger import AUDIT_HEADER, LEDGER_HEADER, LedgerError  # noqa: E402
 from tests.gsignatures.fakes import (  # noqa: E402
     FakeDirectory,
@@ -58,6 +68,7 @@ get_email_signatures = _unwrap(signature_tools.get_email_signatures)
 set_email_signature = _unwrap(signature_tools.set_email_signature)
 apply_email_signatures = _unwrap(signature_tools.apply_email_signatures)
 audit_email_signatures = _unwrap(signature_tools.audit_email_signatures)
+restore_email_signature = _unwrap(signature_tools.restore_email_signature)
 
 SHEET_ID = "ledger-sheet"
 OWNER = "oliver@otbgroup.co.uk"
@@ -66,6 +77,7 @@ ALICE_JIT = "alice@jit-logistics.com"
 ALICE_HOME = "alice@blakefamily.uk"
 BOB = "bob@jit-logistics.com"
 CAROL = "carol@otbgroup.co.uk"
+EMILY = "emily@arthistorywithemily.co.uk"
 OLD_PRIMARY = "<div>old primary</div>"
 
 
@@ -107,6 +119,7 @@ def pool():
     )
     pool.add(BOB, [send_as(BOB, primary=True, signature="")])
     pool.add(CAROL, [send_as(CAROL, primary=True, signature="")])
+    pool.add(EMILY, [send_as(EMILY, primary=True, signature="")])
     return pool
 
 
@@ -123,6 +136,14 @@ def directory():
                 phones=[{"type": "mobile", "value": "07700 900123"}],
             ),
             user(CAROL, "/01 OTB", full="Carol Cole", title=None),
+            user(
+                EMILY,
+                "/99 _SYSTEM/Personal",
+                given="Emily",
+                family="Example",
+                full="Emily Example",
+                title="Art Historian",
+            ),
         ],
         groups={"leads@otbgroup.co.uk": [{"email": ALICE, "type": "USER"}]},
     )
@@ -168,7 +189,63 @@ def _tool_calls():
         ("set", lambda: set_email_signature(ALICE)),
         ("apply", lambda: apply_email_signatures(ou_path="/01 OTB")),
         ("audit", lambda: audit_email_signatures(ou_path="/01 OTB")),
+        ("restore", lambda: restore_email_signature(ALICE)),
     ]
+
+
+@pytest.fixture
+def ledger_row_for_alice(sheets):
+    """A ledger row for Alice's primary that says OLD_PRIMARY was our apply."""
+    row = [
+        "2026-09-20T09:00:00+00:00",
+        OWNER,
+        ALICE,
+        ALICE,
+        "OTB",
+        "1.0.0",
+        "1.0.0",
+        "rendered-old",
+        signature_hash(OLD_PRIMARY),
+        "",
+        "<div>before the rollout</div>",
+        "run-old",
+    ]
+    sheets.tabs["Ledger"].append(row)
+    return row
+
+
+class _StubContext:
+    """Stands in for the FastMCP request context in the resolver tests."""
+
+    def __init__(self, value=None, error=None):
+        self.value = value
+        self.error = error
+        self.keys = []
+
+    async def get_state(self, key):
+        self.keys.append(key)
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
+@pytest.fixture
+def context_owner(monkeypatch):
+    """A live FastMCP context whose authenticated user is the owner."""
+    import fastmcp.server.dependencies as deps
+
+    ctx = _StubContext(value=OWNER)
+    monkeypatch.setattr(deps, "get_context", lambda: ctx)
+    return ctx
+
+
+@pytest.fixture
+def read_only_server():
+    set_read_only(True)
+    try:
+        yield
+    finally:
+        set_read_only(False)
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +258,78 @@ class TestCallerGate:
     async def test_resolver_returns_none_without_a_context(self):
         # No FastMCP request is live under pytest.
         assert await signature_tools._resolve_caller_email() is None
+
+    @pytest.mark.asyncio
+    async def test_resolver_reads_authenticated_user_email_from_context(
+        self, context_owner
+    ):
+        assert await signature_tools._resolve_caller_email() == OWNER
+        assert context_owner.keys == ["authenticated_user_email"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["", None])
+    async def test_resolver_returns_none_when_state_is_empty(self, monkeypatch, state):
+        import fastmcp.server.dependencies as deps
+
+        monkeypatch.setattr(deps, "get_context", lambda: _StubContext(value=state))
+        monkeypatch.setenv("DEFAULT_USER", "oli")
+        assert await signature_tools._resolve_caller_email() is None
+
+    @pytest.mark.asyncio
+    async def test_resolver_returns_none_when_get_state_raises(self, monkeypatch):
+        import fastmcp.server.dependencies as deps
+
+        monkeypatch.setattr(
+            deps,
+            "get_context",
+            lambda: _StubContext(error=RuntimeError("state store gone")),
+        )
+        monkeypatch.setenv("DEFAULT_USER", "oli")
+        assert await signature_tools._resolve_caller_email() is None
+
+    @pytest.mark.asyncio
+    async def test_resolver_returns_none_when_context_is_none(self, monkeypatch):
+        import fastmcp.server.dependencies as deps
+
+        monkeypatch.setattr(deps, "get_context", lambda: None)
+        assert await signature_tools._resolve_caller_email() is None
+
+    @pytest.mark.asyncio
+    async def test_resolver_never_falls_back_to_default_user(self, monkeypatch):
+        """core.audit falls back to DEFAULT_USER; the gate must not."""
+        import fastmcp.server.dependencies as deps
+
+        monkeypatch.setenv("DEFAULT_USER", OWNER)
+        monkeypatch.setattr(deps, "get_context", lambda: _StubContext(value=""))
+        assert await signature_tools._resolve_caller_email() is None
+        with pytest.raises(UserInputError):
+            await preview_email_signature(ALICE)
+
+    @pytest.mark.parametrize("name,call", _tool_calls())
+    @pytest.mark.asyncio
+    async def test_gate_passes_through_the_real_resolver(
+        self, runtime, context_owner, ledger_row_for_alice, name, call
+    ):
+        """Every tool, through the real resolver against a stub context that
+        carries the owner's identity: the gate opens and the tool runs."""
+        result = await call()
+        assert isinstance(result, str) and result
+        assert len(runtime.build_calls) == 1
+        assert context_owner.keys == ["authenticated_user_email"]
+
+    @pytest.mark.parametrize("name,call", _tool_calls())
+    @pytest.mark.asyncio
+    async def test_gate_refuses_a_stranger_through_the_real_resolver(
+        self, runtime, monkeypatch, name, call
+    ):
+        import fastmcp.server.dependencies as deps
+
+        monkeypatch.setattr(
+            deps, "get_context", lambda: _StubContext(value="mallory@otbgroup.co.uk")
+        )
+        with pytest.raises(UserInputError):
+            await call()
+        assert runtime.build_calls == []
 
     @pytest.mark.parametrize("name,call", _tool_calls())
     @pytest.mark.asyncio
@@ -219,7 +368,9 @@ class TestCallerGate:
 
     @pytest.mark.parametrize("name,call", _tool_calls())
     @pytest.mark.asyncio
-    async def test_allowlisted_proceeds(self, runtime, as_owner, name, call):
+    async def test_allowlisted_proceeds(
+        self, runtime, as_owner, ledger_row_for_alice, name, call
+    ):
         result = await call()
         assert isinstance(result, str) and result
         assert len(runtime.build_calls) == 1
@@ -286,6 +437,24 @@ class TestPreview:
         assert "<table" not in out
 
     @pytest.mark.asyncio
+    async def test_ahwe_preview_is_ring_fenced(self, runtime, as_owner):
+        """The whole preview text for the AHWE mailbox names no group company,
+        not only the template: a shared strapline in the preview layout would
+        leak group branding into the ring-fenced entity."""
+        from tests.gsignatures.test_engine import _assert_ring_fenced
+
+        out = await preview_email_signature(EMILY)
+        assert "Entity: AHWE (Art History with Emily)" in out
+        assert "Emily Example" in out and "Art Historian" in out
+        assert "<table" in out
+        # Every line apart from the entity line, and the entity line itself
+        # once its legal name (the one permitted mention) is removed.
+        for line in out.splitlines():
+            if line.strip().startswith("Entity:"):
+                line = line.replace("Art History with Emily", "")
+            _assert_ring_fenced(line, f"AHWE preview line {line!r}")
+
+    @pytest.mark.asyncio
     async def test_unknown_send_as_is_a_user_input_error(self, runtime, as_owner):
         with pytest.raises(UserInputError):
             await preview_email_signature(ALICE, send_as_email="x@otbgroup.co.uk")
@@ -303,7 +472,15 @@ class TestPreview:
 
 class TestGetEmailSignatures:
     @pytest.mark.asyncio
-    async def test_one_block_per_send_as(self, runtime, as_owner, sheets):
+    async def test_one_block_per_send_as(
+        self, runtime, as_owner, sheets, config, directory, pool
+    ):
+        plan = plan_for_user(
+            config,
+            directory.users_by_email[ALICE],
+            list(pool.mailboxes[ALICE].send_as.values()),
+        )[0]
+        assert plan.send_as_email == ALICE
         row = dict(
             zip(
                 LEDGER_HEADER,
@@ -315,7 +492,7 @@ class TestGetEmailSignatures:
                     "OTB",
                     "1.0.0",
                     "1.0.0",
-                    "r",
+                    plan.rendered_hash,
                     signature_hash(OLD_PRIMARY),
                     "",
                     "",
@@ -352,6 +529,18 @@ class TestGetEmailSignatures:
         out = await get_email_signatures(ALICE)
         assert "ledger" in out.lower()
         assert "OTB" in out
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_tab_reports_never_applied(self, runtime, as_owner, sheets):
+        """RUNBOOK step 6.2: on a Sheet nothing has written yet (no Ledger tab)
+        every managed address reads never_applied, not 'ledger unavailable'."""
+        sheets.tabs.clear()
+        sheets.tabs["Sheet1"] = [[]]
+        out = await get_email_signatures(ALICE)
+        assert "ledger unavailable" not in out
+        assert out.count("never_applied") == 2
+        assert "unmanaged" in out
+        assert "Ledger" not in sheets.tabs  # a read never creates the tab
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +591,69 @@ class TestSetEmailSignature:
         out = await set_email_signature(ALICE, force=True)
         assert "force" in out
 
+    @pytest.mark.asyncio
+    async def test_confirm_alone_is_still_a_dry_run(
+        self, runtime, as_owner, pool, sheets
+    ):
+        out = await set_email_signature(ALICE, confirm=True)
+        assert out.startswith("DRY RUN")
+        assert "would_apply" in out
+        assert pool.patch_calls() == []
+        assert sheets.ledger_rows() == []
+        assert runtime.build_calls[0]["need_ledger"] is False
+
+    @pytest.mark.asyncio
+    async def test_live_without_confirm_refuses_before_building_the_runtime(
+        self, runtime, as_owner, monkeypatch
+    ):
+        """With no ledger configured the caller must still see the confirm
+        message, not a LedgerError from build_runtime."""
+
+        def boom(**kwargs):
+            raise LedgerError("SIGNATURE_LEDGER_SHEET_ID is not set.")
+
+        monkeypatch.setattr(signature_tools, "build_runtime", boom)
+        with pytest.raises(UserInputError) as excinfo:
+            await set_email_signature(ALICE, dry_run=False)
+        assert str(excinfo.value) == operations.LIVE_CONFIRM_MESSAGE
+        assert runtime.build_calls == []
+
+    @pytest.mark.asyncio
+    async def test_dry_run_with_unreadable_ledger_says_so(
+        self, runtime, as_owner, pool, sheets
+    ):
+        sheets.fail_reads = http_error(500, "backendError")
+        out = await set_email_signature(ALICE)
+        lines = out.splitlines()
+        assert lines[0].startswith("DRY RUN")
+        assert lines[1].startswith("Ledger: ledger unavailable (HttpError")
+        assert "Drift was not judged" in lines[1]
+        assert "would_apply" in out
+        # The row's reason carries the note too, as the table is the evidence.
+        table_row = next(ln for ln in lines if ln.startswith(ALICE))
+        assert "ledger unavailable" in table_row
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_dry_run_with_readable_ledger_has_no_ledger_line(
+        self, runtime, as_owner
+    ):
+        out = await set_email_signature(ALICE)
+        assert not any(ln.startswith("Ledger:") for ln in out.splitlines())
+
+    @pytest.mark.asyncio
+    async def test_read_only_server_refuses_a_live_write_and_allows_dry_run(
+        self, runtime, as_owner, pool, sheets, read_only_server
+    ):
+        with pytest.raises(UserInputError) as excinfo:
+            await set_email_signature(ALICE, dry_run=False, confirm=True)
+        assert "read-only" in str(excinfo.value)
+        assert runtime.build_calls == []
+        assert pool.patch_calls() == []
+        assert sheets.ledger_rows() == []
+        out = await set_email_signature(ALICE)
+        assert out.startswith("DRY RUN")
+
 
 # ---------------------------------------------------------------------------
 # apply_email_signatures
@@ -444,6 +696,70 @@ class TestApplyEmailSignatures:
             await apply_email_signatures(domain="otbgroup.co.uk", max_users=1)
         assert "max_users" in str(excinfo.value)
         assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    async def test_confirm_alone_is_still_a_dry_run(
+        self, runtime, as_owner, pool, sheets
+    ):
+        out = await apply_email_signatures(ou_path="/01 OTB", confirm=True)
+        assert "DRY RUN" in out.splitlines()[0]
+        assert "signatures-dryrun-" in out
+        assert pool.patch_calls() == []
+        assert sheets.ledger_rows() == []
+
+    @pytest.mark.asyncio
+    async def test_scope_and_confirm_checked_before_building_the_runtime(
+        self, runtime, as_owner, monkeypatch
+    ):
+        def boom(**kwargs):
+            raise sa_auth.SignatureAuthError("No signature service account configured.")
+
+        monkeypatch.setattr(signature_tools, "build_runtime", boom)
+        with pytest.raises(UserInputError) as excinfo:
+            await apply_email_signatures(ou_path="/01 OTB", domain="otbgroup.co.uk")
+        assert "exactly one scope" in str(excinfo.value)
+        with pytest.raises(UserInputError) as excinfo:
+            await apply_email_signatures(ou_path="/01 OTB", dry_run=False)
+        assert str(excinfo.value) == operations.LIVE_CONFIRM_MESSAGE
+        assert runtime.build_calls == []
+
+    @pytest.mark.asyncio
+    async def test_dry_run_with_unreadable_ledger_says_so(
+        self, runtime, as_owner, sheets
+    ):
+        sheets.fail_reads = http_error(500, "backendError")
+        out = await apply_email_signatures(ou_path="/01 OTB")
+        lines = out.splitlines()
+        assert lines[1].startswith("Ledger: ledger unavailable (HttpError")
+        assert "Drift was not judged" in lines[1]
+        table_row = next(ln for ln in lines if ln.startswith(ALICE + " "))
+        assert "ledger unavailable" in table_row
+
+    @pytest.mark.asyncio
+    async def test_live_run_ledger_failure_mid_run_is_flagged(
+        self, runtime, as_owner, pool, sheets
+    ):
+        sheets.fail_append = http_error(500, "backendError")
+        out = await apply_email_signatures(
+            group_email="leads@otbgroup.co.uk", dry_run=False, confirm=True
+        )
+        assert "LEDGER FAILED MID-RUN" in out
+        assert operations.LEDGER_FAILED_REASON in out
+        assert pool.patch_calls() == [(ALICE, ALICE)]
+
+    @pytest.mark.asyncio
+    async def test_read_only_server_refuses_a_live_write_and_allows_dry_run(
+        self, runtime, as_owner, pool, read_only_server
+    ):
+        with pytest.raises(UserInputError) as excinfo:
+            await apply_email_signatures(
+                group_email="leads@otbgroup.co.uk", dry_run=False, confirm=True
+            )
+        assert "read-only" in str(excinfo.value)
+        assert runtime.build_calls == []
+        assert pool.patch_calls() == []
+        out = await apply_email_signatures(ou_path="/01 OTB")
+        assert "DRY RUN" in out.splitlines()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +804,104 @@ class TestAuditEmailSignatures:
         with pytest.raises(UserInputError) as excinfo:
             await audit_email_signatures(ou_path="/01 OTB")
         assert "ledger" in str(excinfo.value).lower()
+
+    def test_docstring_lists_every_status(self):
+        doc = signature_tools.audit_email_signatures.__doc__ or ""
+        doc = doc if doc.strip() else audit_email_signatures.__doc__
+        for status in operations.AUDIT_STATUSES:
+            assert status in doc, status
+
+
+# ---------------------------------------------------------------------------
+# restore_email_signature
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreEmailSignature:
+    @pytest.mark.asyncio
+    async def test_default_is_dry_run(
+        self, runtime, as_owner, pool, sheets, ledger_row_for_alice
+    ):
+        out = await restore_email_signature(ALICE)
+        assert out.startswith("RESTORE DRY RUN")
+        assert "would_apply" in out
+        assert "run-old" in out
+        assert "restored" in out
+        assert "confirm=True" in out
+        assert pool.patch_calls() == []
+        assert len(sheets.ledger_rows()) == 1
+        # Even a dry run needs the ledger: the row being restored lives there.
+        assert runtime.build_calls[0]["need_ledger"] is True
+
+    @pytest.mark.asyncio
+    async def test_confirm_alone_is_still_a_dry_run(
+        self, runtime, as_owner, pool, sheets, ledger_row_for_alice
+    ):
+        out = await restore_email_signature(ALICE, confirm=True)
+        assert out.startswith("RESTORE DRY RUN")
+        assert pool.patch_calls() == []
+        assert len(sheets.ledger_rows()) == 1
+
+    @pytest.mark.asyncio
+    async def test_live_without_confirm_is_refused(
+        self, runtime, as_owner, pool, ledger_row_for_alice
+    ):
+        with pytest.raises(UserInputError) as excinfo:
+            await restore_email_signature(ALICE, dry_run=False)
+        assert str(excinfo.value) == operations.LIVE_CONFIRM_MESSAGE
+        assert runtime.build_calls == []
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_live_restores_and_records(
+        self, runtime, as_owner, pool, sheets, ledger_row_for_alice
+    ):
+        out = await restore_email_signature(ALICE, dry_run=False, confirm=True)
+        assert out.startswith("RESTORE LIVE")
+        assert "applied" in out
+        assert pool.patch_calls() == [(ALICE, ALICE)]
+        assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == (
+            "<div>before the rollout</div>"
+        )
+        rows = sheets.ledger_rows()
+        assert len(rows) == 2
+        assert rows[-1]["template_version"] == operations.RESTORED_VERSION
+        assert rows[-1]["previous_signature_html"] == OLD_PRIMARY
+        assert rows[-1]["actor"] == OWNER
+        assert rows[-1]["run_id"] in out
+
+    @pytest.mark.asyncio
+    async def test_run_id_is_passed_through(
+        self, runtime, as_owner, pool, ledger_row_for_alice
+    ):
+        out = await restore_email_signature(ALICE, run_id="run-old")
+        assert "run-old" in out
+        with pytest.raises(UserInputError) as excinfo:
+            await restore_email_signature(ALICE, run_id="run-nope")
+        assert "run-nope" in str(excinfo.value) and "run-old" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_row_is_a_user_input_error(self, runtime, as_owner, pool):
+        with pytest.raises(UserInputError) as excinfo:
+            await restore_email_signature(ALICE, send_as_email=ALICE_JIT)
+        assert "no row" in str(excinfo.value)
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_read_only_server_refuses_a_live_restore(
+        self, runtime, as_owner, pool, ledger_row_for_alice, read_only_server
+    ):
+        with pytest.raises(UserInputError) as excinfo:
+            await restore_email_signature(ALICE, dry_run=False, confirm=True)
+        assert "read-only" in str(excinfo.value)
+        assert runtime.build_calls == []
+        assert pool.patch_calls() == []
+        assert (await restore_email_signature(ALICE)).startswith("RESTORE DRY RUN")
+
+    @pytest.mark.asyncio
+    async def test_blank_user_email_is_refused(self, runtime, as_owner):
+        with pytest.raises(UserInputError):
+            await restore_email_signature(" ")
 
 
 # ---------------------------------------------------------------------------

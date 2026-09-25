@@ -14,7 +14,12 @@ Covers:
 * ``apply_scope``: exactly one scope, ``max_users`` refusal without
   truncation, the group path, per-user isolation, the JSONL report;
 * ``audit_scope``: every drift status, exactly one scope, ``all_users``,
-  per-user isolation.
+  per-user isolation;
+* the run-wide ledger rule: after one failed ledger append nothing further
+  is patched, in that user or any later one;
+* ``force`` never touches an address the engine skipped;
+* ``restore_user``: the previous signature from a ledger row goes back,
+  under the same dry-run and confirm rule, and is itself recorded.
 
 No Google client is ever built: every service is a fake from ``fakes.py``.
 """
@@ -271,6 +276,88 @@ class TestApplyUserDryRun:
         )
         assert {r.action for r in rows} == {"would_apply", "skipped"}
         assert pool.patch_calls() == []
+        # The table must not claim "no ledger row" when the ledger could not
+        # be read: every would_apply reason says the ledger was unavailable.
+        for row in rows:
+            if row.action == "would_apply":
+                assert row.reason.startswith(
+                    operations.LEDGER_UNAVAILABLE_NOTE_PREFIX
+                ), row.reason
+                assert "HttpError" in row.reason
+                assert "no ledger row for this address" in row.reason
+
+    @pytest.mark.asyncio
+    async def test_dry_run_without_a_ledger_client_says_not_configured(
+        self, config, directory, pool
+    ):
+        rows = await _apply_alice(config, directory, pool)
+        alice = _rows_by_send_as(rows)[ALICE]
+        assert alice.action == "would_apply"
+        assert alice.reason.startswith(operations.LEDGER_NOT_CONFIGURED_NOTE + "; ")
+
+    @pytest.mark.asyncio
+    async def test_dry_run_with_no_ledger_tab_is_an_empty_ledger(
+        self, config, directory, pool
+    ):
+        """A shared but never-written Sheet has no Ledger tab. That is an
+        empty ledger, not an unavailable one: the reason is the plain
+        "no ledger row" and no tab is created by a dry run."""
+        sheets = FakeSheets({"Sheet1": [[]]})
+        rows = await _apply_alice(
+            config, directory, pool, sheets=sheets, sheet_id=SHEET_ID
+        )
+        alice = _rows_by_send_as(rows)[ALICE]
+        assert alice.action == "would_apply"
+        assert alice.reason == "no ledger row for this address"
+        assert "Ledger" not in sheets.tabs
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_confirm_alone_is_still_a_dry_run(self, config, directory, pool):
+        """The rule is dry_run=False AND confirm=True. confirm on its own
+        must not go live."""
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        rows = await _apply_alice(
+            config, directory, pool, confirm=True, sheets=sheets, sheet_id=SHEET_ID
+        )
+        assert rows
+        assert {r.action for r in rows} <= {"would_apply", "skipped", "unchanged"}
+        assert pool.patch_calls() == []
+        assert "values.append" not in sheets.names()
+        assert "values.update" not in sheets.names()
+
+    @pytest.mark.asyncio
+    async def test_include_aliases_false_hides_alias_errors(
+        self, config, directory, pool
+    ):
+        """An alias the caller excluded is 'skipped' even when the engine
+        would have reported an error for it; the primary's error stays."""
+        pool.mailboxes[CAROL].send_as["carol@jit-logistics.com"] = send_as(
+            "carol@jit-logistics.com", signature=""
+        )
+        rows = await operations.apply_user(
+            config,
+            directory,
+            CAROL,
+            actor=ACTOR,
+            run_id=RUN,
+            include_aliases=False,
+            gmail_factory=pool.factory,
+        )
+        by = _rows_by_send_as(rows)
+        assert by[CAROL].action == "error"
+        assert by["carol@jit-logistics.com"].action == "skipped"
+        assert by["carol@jit-logistics.com"].reason == "aliases not included"
+        # With aliases included the same alias is an error row.
+        rows = await operations.apply_user(
+            config,
+            directory,
+            CAROL,
+            actor=ACTOR,
+            run_id=RUN,
+            gmail_factory=pool.factory,
+        )
+        assert _rows_by_send_as(rows)["carol@jit-logistics.com"].action == "error"
 
     @pytest.mark.asyncio
     async def test_include_aliases_false_skips_non_primary(
@@ -357,8 +444,67 @@ class TestApplyUserLiveGate:
                 sheets=FakeSheets(),
                 sheet_id="",
             )
+        # Ledger before Directory before Gmail: nothing else was touched.
+        assert directory.calls == []
         assert pool.factory_calls == []
         assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_live_with_read_only_ledger_share_refuses_before_gmail(
+        self, config, directory, pool
+    ):
+        """The steady state: the Ledger tab exists with the right header, but
+        the Sheet is shared with the service account as Viewer. Every read
+        works; only writes fail. The run must be refused before any patch,
+        not after it at the append."""
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        sheets.fail_writes = http_error(403, "forbidden")
+        with pytest.raises(LedgerError) as excinfo:
+            await _apply_alice(
+                config,
+                directory,
+                pool,
+                dry_run=False,
+                confirm=True,
+                sheets=sheets,
+                sheet_id=SHEET_ID,
+            )
+        assert "HttpError" in str(excinfo.value)
+        assert directory.calls == []
+        assert pool.factory_calls == []
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_write_probe_leaves_the_ledger_unchanged(
+        self, config, directory, pool
+    ):
+        row = await _ledger_row_for_current_state(config, directory, pool, ALICE)
+        sheets = _ledger_with_rows([row])
+        before = [list(r) for r in sheets.tabs["Ledger"]]
+        await _apply_alice(
+            config,
+            directory,
+            pool,
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            primary_only=True,
+        )
+        # Alice's primary is unchanged, so the only write was the probe,
+        # and the probe rewrote the header byte for byte.
+        assert sheets.tabs["Ledger"] == before
+        assert sheets.names().count("values.update") == 1
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_gate_live_is_public_and_verbatim(self):
+        operations.gate_live(True, False)
+        operations.gate_live(True, True)
+        operations.gate_live(False, True)
+        with pytest.raises(UserInputError) as excinfo:
+            operations.gate_live(False, False)
+        assert str(excinfo.value) == operations.LIVE_CONFIRM_MESSAGE
 
     @pytest.mark.asyncio
     async def test_live_with_unreadable_ledger_refuses_before_gmail(
@@ -551,6 +697,124 @@ class TestApplyUserLive:
         assert (ALICE, ALICE) in pool.patch_calls()
 
     @pytest.mark.asyncio
+    async def test_force_never_patches_a_skipped_alias(self, config, directory, pool):
+        """force re-applies unchanged addresses; it must never override the
+        engine's skip, or a personal blakefamily.uk alias would get a company
+        signature."""
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        rows = await _apply_alice(
+            config,
+            directory,
+            pool,
+            dry_run=False,
+            confirm=True,
+            force=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+        )
+        by = _rows_by_send_as(rows)
+        assert by[ALICE_HOME].action == "skipped"
+        assert "blakefamily.uk" in by[ALICE_HOME].reason
+        assert "force" not in by[ALICE_HOME].reason
+        assert (ALICE, ALICE_HOME) not in pool.patch_calls()
+        assert set(pool.patch_calls()) == {(ALICE, ALICE), (ALICE, ALICE_JIT)}
+        assert all(r["send_as_email"] != ALICE_HOME for r in sheets.ledger_rows())
+        assert pool.mailboxes[ALICE].send_as[ALICE_HOME]["signature"] == ""
+
+    @pytest.mark.asyncio
+    async def test_only_send_as_personal_alias_live_is_skipped(
+        self, config, directory, pool
+    ):
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        rows = await _apply_alice(
+            config,
+            directory,
+            pool,
+            dry_run=False,
+            confirm=True,
+            force=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            only_send_as=ALICE_HOME,
+        )
+        assert len(rows) == 1
+        assert rows[0].action == "skipped"
+        assert rows[0].send_as_email == ALICE_HOME
+        assert pool.patch_calls() == []
+        assert sheets.ledger_rows() == []
+
+    @pytest.mark.asyncio
+    async def test_force_never_patches_a_suspended_user(self, config, directory, pool):
+        erin = "erin@otbgroup.co.uk"
+        directory.users_by_email[erin] = user(
+            erin, "/01 OTB", full="Erin Eve", title="Analyst", suspended=True
+        )
+        pool.add(erin, [send_as(erin, primary=True, signature="<div>old</div>")])
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        rows = await operations.apply_user(
+            config,
+            directory,
+            erin,
+            actor=ACTOR,
+            run_id=RUN,
+            dry_run=False,
+            confirm=True,
+            force=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            gmail_factory=pool.factory,
+        )
+        assert [r.action for r in rows] == ["skipped"]
+        assert "suspended" in rows[0].reason
+        assert pool.patch_calls() == []
+        assert sheets.ledger_rows() == []
+
+    @pytest.mark.asyncio
+    async def test_ledger_row_for_another_user_does_not_count_as_unchanged(
+        self, config, directory, pool
+    ):
+        """A ledger row keyed (BOB, BOB) carrying Alice's hashes must not make
+        Alice's primary read unchanged: the key is the mailbox and address."""
+        row = await _ledger_row_for_current_state(config, directory, pool, ALICE)
+        row[LEDGER_HEADER.index("user_email")] = BOB
+        row[LEDGER_HEADER.index("send_as_email")] = BOB
+        rows = await _apply_alice(
+            config, directory, pool, sheets=_ledger_with_rows([row]), sheet_id=SHEET_ID
+        )
+        alice = _rows_by_send_as(rows)[ALICE]
+        assert alice.action == "would_apply"
+        assert "no ledger row" in alice.reason
+
+    @pytest.mark.asyncio
+    async def test_ledger_append_failure_stops_further_patches_in_the_run(
+        self, config, directory, pool
+    ):
+        """Two planned addresses, the append fails from the first: exactly one
+        patch. The second address is an error row that says it was not
+        attempted, so no write happens without its ledger row."""
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        sheets.fail_append = http_error(500, "backendError")
+        rows = await _apply_alice(
+            config,
+            directory,
+            pool,
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+        )
+        by = _rows_by_send_as(rows)
+        assert by[ALICE].action == "error"
+        assert operations.LEDGER_APPEND_FAILED_REASON in by[ALICE].reason
+        assert by[ALICE_JIT].action == "error"
+        assert by[ALICE_JIT].reason.startswith(operations.LEDGER_FAILED_REASON)
+        assert "HttpError" in by[ALICE_JIT].reason
+        assert by[ALICE_JIT].after_hash is None
+        assert by[ALICE_HOME].action == "skipped"
+        assert pool.patch_calls() == [(ALICE, ALICE)]
+        assert pool.mailboxes[ALICE].send_as[ALICE_JIT]["signature"] == OLD_ALIAS
+
+    @pytest.mark.asyncio
     async def test_one_failing_send_as_does_not_stop_the_others(
         self, config, directory, pool
     ):
@@ -738,6 +1002,174 @@ class TestApplyScope:
         assert meta["counts"]["applied"] == 2
 
     @pytest.mark.asyncio
+    async def test_live_scope_patches_each_mailbox_with_its_own_client(
+        self, config, directory, pool
+    ):
+        """Two users applied live: each patch lands in its own mailbox, one
+        Gmail client per user, and every ledger row names the mailbox its
+        send-as belongs to."""
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        rows, meta = await _apply_scope(
+            config,
+            directory,
+            pool,
+            group_email="leads@otbgroup.co.uk",
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+        )
+        assert set(pool.patch_calls()) == {
+            (ALICE, ALICE),
+            (ALICE, ALICE_JIT),
+            (BOB, BOB),
+        }
+        assert sorted(pool.factory_calls) == [ALICE, BOB]
+        owner_of = {ALICE: ALICE, ALICE_JIT: ALICE, BOB: BOB}
+        ledger = sheets.ledger_rows()
+        assert len(ledger) == 3
+        for entry in ledger:
+            assert entry["user_email"] == owner_of[entry["send_as_email"]]
+            assert entry["run_id"] == RUN
+            assert entry["actor"] == ACTOR
+        by = _rows_by_send_as(rows)
+        assert by[BOB].user_email == BOB and by[BOB].action == "applied"
+        assert by[ALICE_JIT].user_email == ALICE
+        assert meta["counts"]["applied"] == 3
+        assert meta["ledger_failed"] is None
+
+    @pytest.mark.asyncio
+    async def test_ledger_append_failure_stops_later_users_in_the_scope(
+        self, config, directory, pool
+    ):
+        """Alice's first append fails; Alice's alias and Bob are then not
+        attempted. One patch for the whole scope."""
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        sheets.fail_append = http_error(500, "backendError")
+        rows, meta = await _apply_scope(
+            config,
+            directory,
+            pool,
+            group_email="leads@otbgroup.co.uk",
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+        )
+        assert pool.patch_calls() == [(ALICE, ALICE)]
+        by = _rows_by_send_as(rows)
+        assert by[ALICE].action == "error"
+        assert by[ALICE_JIT].action == "error"
+        assert by[ALICE_JIT].reason.startswith(operations.LEDGER_FAILED_REASON)
+        assert by[BOB].action == "error"
+        assert by[BOB].reason.startswith(operations.LEDGER_FAILED_REASON)
+        assert meta["ledger_failed"] and "HttpError" in meta["ledger_failed"]
+        assert meta["counts"].get("applied", 0) == 0
+        assert pool.mailboxes[BOB].send_as[BOB]["signature"] == ""
+
+    @pytest.mark.asyncio
+    async def test_dry_run_scope_reports_the_ledger_note(self, config, directory, pool):
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        sheets.fail_reads = http_error(500, "backendError")
+        rows, meta = await _apply_scope(
+            config, directory, pool, ou_path="/01 OTB", sheets=sheets, sheet_id=SHEET_ID
+        )
+        assert meta["ledger_note"].startswith(operations.LEDGER_UNAVAILABLE_NOTE_PREFIX)
+        for row in rows:
+            if row.action == "would_apply":
+                assert row.reason.startswith(operations.LEDGER_UNAVAILABLE_NOTE_PREFIX)
+        rows, meta = await _apply_scope(
+            config,
+            directory,
+            pool,
+            ou_path="/01 OTB",
+            sheets=FakeSheets({"Ledger": [LEDGER_HEADER]}),
+            sheet_id=SHEET_ID,
+        )
+        assert meta["ledger_note"] is None
+
+    @pytest.mark.asyncio
+    async def test_live_with_read_only_ledger_share_refuses_before_any_gmail(
+        self, config, directory, pool
+    ):
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        sheets.fail_writes = http_error(403, "forbidden")
+        with pytest.raises(LedgerError):
+            await _apply_scope(
+                config,
+                directory,
+                pool,
+                ou_path="/01 OTB",
+                dry_run=False,
+                confirm=True,
+                sheets=sheets,
+                sheet_id=SHEET_ID,
+            )
+        assert directory.calls == []
+        assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    async def test_setup_error_propagates_instead_of_n_error_rows(
+        self, config, directory, pool
+    ):
+        """A missing or bad key is not one user's fault: SignatureAuthError
+        from the Gmail factory aborts the scope so the tool reports an error
+        (audit status=error) instead of a clean run full of error rows."""
+        from gsignatures import sa_auth
+
+        def broken_factory(email):
+            raise sa_auth.SignatureAuthError("key file could not be read")
+
+        with pytest.raises(sa_auth.SignatureAuthError):
+            await _apply_scope(
+                config,
+                directory,
+                pool,
+                ou_path="/01 OTB",
+                gmail_factory=broken_factory,
+            )
+
+    @pytest.mark.asyncio
+    async def test_unknown_group_is_a_user_input_error(self, config, directory, pool):
+        with pytest.raises(UserInputError) as excinfo:
+            await _apply_scope(
+                config, directory, pool, group_email="nope@otbgroup.co.uk"
+            )
+        message = str(excinfo.value)
+        assert "nope@otbgroup.co.uk" in message
+        assert "Nothing was changed" in message
+        assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    async def test_group_scope_suspended_member_is_skipped_not_patched(
+        self, config, directory, pool
+    ):
+        """members.list does not filter suspended users, so the engine's skip
+        must carry it: no patch, no ledger row, a skipped row."""
+        erin = "erin@otbgroup.co.uk"
+        directory.users_by_email[erin] = user(
+            erin, "/01 OTB", full="Erin Eve", title="Analyst", suspended=True
+        )
+        directory.groups["leads@otbgroup.co.uk"].append({"email": erin, "type": "USER"})
+        pool.add(erin, [send_as(erin, primary=True, signature="")])
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        rows, _ = await _apply_scope(
+            config,
+            directory,
+            pool,
+            group_email="leads@otbgroup.co.uk",
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+        )
+        by = _rows_by_send_as(rows)
+        assert by[erin].action == "skipped"
+        assert "suspended" in by[erin].reason
+        assert (erin, erin) not in pool.patch_calls()
+        assert all(r["user_email"] != erin for r in sheets.ledger_rows())
+
+    @pytest.mark.asyncio
     async def test_one_failing_user_does_not_stop_the_scope(
         self, config, directory, pool
     ):
@@ -836,6 +1268,60 @@ class TestAuditScope:
         assert by[ALICE_JIT]["status"] == "changed_since_apply"
 
     @pytest.mark.asyncio
+    async def test_stale_directory_when_directory_data_changed(
+        self, config, directory, pool
+    ):
+        """Gmail still holds exactly what was applied, but Alice's job title
+        changed in the Directory since: the audit must say so, as apply
+        would say would_apply for the same address."""
+        row = await _ledger_row_for_current_state(config, directory, pool, ALICE)
+        ledger_latest = {(ALICE, ALICE): dict(zip(LEDGER_HEADER, row))}
+        directory.users_by_email[ALICE]["organizations"][0]["title"] = "Chair"
+        rows = await operations.audit_scope(
+            config,
+            directory,
+            ou_path="/01 OTB",
+            ledger_latest=ledger_latest,
+            gmail_factory=pool.factory,
+        )
+        alice = {r["send_as_email"]: r for r in rows}[ALICE]
+        assert alice["status"] == "stale_directory"
+        assert "Directory" in alice["reason"]
+        assert operations.has_drift([alice])
+        assert operations.audit_counts(rows)["stale_directory"] == 1
+        assert "stale_directory: 1" in operations.format_audit_counts(rows)
+
+    @pytest.mark.asyncio
+    async def test_setup_error_propagates_instead_of_n_error_rows(
+        self, config, directory, pool
+    ):
+        from gsignatures import sa_auth
+
+        def broken_factory(email):
+            raise sa_auth.SignatureAuthError("key file could not be read")
+
+        with pytest.raises(sa_auth.SignatureAuthError):
+            await operations.audit_scope(
+                config,
+                directory,
+                all_users=True,
+                ledger_latest={},
+                gmail_factory=broken_factory,
+            )
+
+    @pytest.mark.asyncio
+    async def test_unknown_group_is_a_user_input_error(self, config, directory, pool):
+        with pytest.raises(UserInputError) as excinfo:
+            await operations.audit_scope(
+                config,
+                directory,
+                group_email="nope@otbgroup.co.uk",
+                ledger_latest={},
+                gmail_factory=pool.factory,
+            )
+        assert "nope@otbgroup.co.uk" in str(excinfo.value)
+
+    @pytest.mark.asyncio
     async def test_all_users_is_customer_wide(self, config, directory, pool):
         rows = await operations.audit_scope(
             config,
@@ -893,6 +1379,36 @@ class TestLedgerAndRuntime:
         assert sheets.tabs["Ledger"] == [LEDGER_HEADER]
 
     @pytest.mark.asyncio
+    async def test_prepare_ledger_probe_is_opt_in(self):
+        """Audits read only: no probe write on an existing, correct tab.
+        A write path asks for the probe and a Viewer share is refused."""
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        await operations.prepare_ledger(sheets, SHEET_ID)
+        assert "values.update" not in sheets.names()
+        await operations.prepare_ledger(sheets, SHEET_ID, probe_write=True)
+        assert sheets.names().count("values.update") == 1
+        assert sheets.tabs["Ledger"] == [LEDGER_HEADER]
+        sheets.fail_writes = http_error(403, "forbidden")
+        await operations.prepare_ledger(sheets, SHEET_ID)
+        with pytest.raises(LedgerError) as excinfo:
+            await operations.prepare_ledger(sheets, SHEET_ID, probe_write=True)
+        assert "HttpError" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_read_ledger_best_effort_treats_missing_tab_as_empty(self):
+        sheets = FakeSheets({"Sheet1": [[]]})
+        assert await operations.read_ledger_best_effort(sheets, SHEET_ID) == ({}, None)
+        assert "Ledger" not in sheets.tabs
+        assert await operations.read_ledger_best_effort(None, SHEET_ID) == (
+            None,
+            operations.LEDGER_NOT_CONFIGURED_NOTE,
+        )
+        sheets.fail_reads = http_error(500, "backendError")
+        rows, note = await operations.read_ledger_best_effort(sheets, SHEET_ID)
+        assert rows is None
+        assert note.startswith(operations.LEDGER_UNAVAILABLE_NOTE_PREFIX)
+
+    @pytest.mark.asyncio
     async def test_prepare_ledger_wraps_failures(self):
         sheets = FakeSheets()
         sheets.fail_reads = http_error(500, "backendError")
@@ -937,3 +1453,235 @@ class TestLedgerAndRuntime:
         monkeypatch.setattr(sa_auth, "build_directory_as_admin", boom)
         with pytest.raises(sa_auth.SignatureAuthError):
             operations.build_runtime(need_ledger=False)
+
+
+# ---------------------------------------------------------------------------
+# restore_user
+# ---------------------------------------------------------------------------
+
+
+PREVIOUS = "<div>hand-written before the rollout</div>"
+RESTORE_RUN = "restore01"
+
+
+async def _restore(pool, **kw):
+    kw.setdefault("actor", ACTOR)
+    kw.setdefault("run_id", RESTORE_RUN)
+    kw.setdefault("gmail_factory", pool.factory)
+    kw.setdefault("sheet_id", SHEET_ID)
+    return await operations.restore_user(ALICE, kw.pop("send_as_email", None), **kw)
+
+
+def _applied_row(send_as_email, previous_html, applied_at, run_id, entity="OTB"):
+    return [
+        applied_at,
+        ACTOR,
+        ALICE,
+        send_as_email,
+        entity,
+        "1.0.0",
+        "1.0.0",
+        "rendered-" + run_id,
+        "readback-" + run_id,
+        signature_hash(previous_html),
+        previous_html,
+        run_id,
+    ]
+
+
+class TestRestoreUser:
+    @pytest.mark.asyncio
+    async def test_live_gate_before_any_call(self, directory, pool):
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        with pytest.raises(UserInputError) as excinfo:
+            await _restore(pool, sheets=sheets, dry_run=False)
+        assert str(excinfo.value) == operations.LIVE_CONFIRM_MESSAGE
+        assert sheets.calls == []
+        assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    async def test_dry_run_needs_a_readable_ledger(self, pool):
+        with pytest.raises(LedgerError):
+            await _restore(pool, sheets=None)
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        sheets.fail_reads = http_error(500, "backendError")
+        with pytest.raises(LedgerError):
+            await _restore(pool, sheets=sheets)
+        assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_row_is_a_user_input_error(self, pool):
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        with pytest.raises(UserInputError) as excinfo:
+            await _restore(pool, sheets=sheets)
+        assert "no row" in str(excinfo.value)
+        assert "Nothing was changed" in str(excinfo.value)
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_dry_run_reports_the_row_it_would_restore(self, pool):
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        rows = await _restore(pool, sheets=sheets)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.action == "would_apply"
+        assert row.user_email == ALICE and row.send_as_email == ALICE
+        assert row.entity == "OTB"
+        assert row.template_version == operations.RESTORED_VERSION
+        assert row.before_hash == signature_hash(OLD_PRIMARY)
+        assert row.after_hash == signature_hash(PREVIOUS)
+        assert "run-a" in row.reason and "2026-09-20" in row.reason
+        assert pool.patch_calls() == []
+        assert "values.append" not in sheets.names()
+        assert "values.update" not in sheets.names()  # no probe on a dry run
+
+    @pytest.mark.asyncio
+    async def test_confirm_alone_is_still_a_dry_run(self, pool):
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        rows = await _restore(pool, sheets=sheets, confirm=True)
+        assert rows[0].action == "would_apply"
+        assert pool.patch_calls() == []
+        assert sheets.ledger_rows()[-1]["run_id"] == "run-a"
+
+    @pytest.mark.asyncio
+    async def test_live_restores_the_previous_html_and_records_it(self, pool):
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        rows = await _restore(pool, sheets=sheets, dry_run=False, confirm=True)
+        row = rows[0]
+        assert row.action == "applied"
+        assert pool.patch_calls() == [(ALICE, ALICE)]
+        box = pool.mailboxes[ALICE]
+        patched = [c for c in box.calls if c[0] == "sendAs.patch"][0][1]
+        assert patched["body"] == {"signature": PREVIOUS}
+        stored = box.send_as[ALICE]["signature"]
+        assert row.after_hash == signature_hash(stored)
+        assert row.before_hash == signature_hash(OLD_PRIMARY)
+        ledger = sheets.ledger_rows()
+        assert len(ledger) == 2
+        new = ledger[-1]
+        assert new["run_id"] == RESTORE_RUN
+        assert new["actor"] == ACTOR
+        assert new["user_email"] == ALICE and new["send_as_email"] == ALICE
+        assert new["entity"] == "OTB"
+        assert new["template_version"] == operations.RESTORED_VERSION
+        assert new["statutory_version"] == operations.RESTORED_VERSION
+        assert new["rendered_hash"] == signature_hash(PREVIOUS)
+        assert new["readback_hash"] == signature_hash(stored)
+        assert new["previous_hash"] == signature_hash(OLD_PRIMARY)
+        assert new["previous_signature_html"] == OLD_PRIMARY
+
+    @pytest.mark.asyncio
+    async def test_restored_address_reads_as_not_managed_afterwards(
+        self, config, directory, pool
+    ):
+        """After a restore the next apply re-applies (the ledger says
+        'restored', not the pinned versions) and the audit reports
+        stale_template: the managed signature is not in place."""
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        await _restore(pool, sheets=sheets, dry_run=False, confirm=True)
+        rows = await _apply_alice(
+            config, directory, pool, sheets=sheets, sheet_id=SHEET_ID, primary_only=True
+        )
+        assert rows[0].action == "would_apply"
+        assert operations.RESTORED_VERSION in rows[0].reason
+        latest = await operations.prepare_ledger(sheets, SHEET_ID)
+        audit = await operations.audit_scope(
+            config,
+            directory,
+            ou_path="/01 OTB",
+            ledger_latest=latest,
+            gmail_factory=pool.factory,
+        )
+        alice = {r["send_as_email"]: r for r in audit}[ALICE]
+        assert alice["status"] == "stale_template"
+        assert alice["ledger_template_version"] == operations.RESTORED_VERSION
+
+    @pytest.mark.asyncio
+    async def test_latest_row_wins_unless_a_run_id_is_named(self, pool):
+        older = "<div>older</div>"
+        sheets = _ledger_with_rows(
+            [
+                _applied_row(ALICE, older, "2026-09-20T09:00:00+00:00", "run-a"),
+                _applied_row(ALICE, PREVIOUS, "2026-09-21T09:00:00+00:00", "run-b"),
+            ]
+        )
+        rows = await _restore(pool, sheets=sheets)
+        assert rows[0].after_hash == signature_hash(PREVIOUS)
+        assert "run-b" in rows[0].reason
+        rows = await _restore(pool, sheets=sheets, from_run_id="run-a")
+        assert rows[0].after_hash == signature_hash(older)
+        assert "run-a" in rows[0].reason
+        with pytest.raises(UserInputError) as excinfo:
+            await _restore(pool, sheets=sheets, from_run_id="run-zzz")
+        message = str(excinfo.value)
+        assert "run-zzz" in message and "run-b" in message and "run-a" in message
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_alias_and_unknown_send_as(self, pool):
+        sheets = _ledger_with_rows(
+            [
+                _applied_row(
+                    ALICE_JIT, OLD_ALIAS, "2026-09-20T09:00:00+00:00", "run-a", "JIT"
+                )
+            ]
+        )
+        rows = await _restore(pool, sheets=sheets, send_as_email=ALICE_JIT.upper())
+        # Gmail already holds the previous alias signature: nothing to do.
+        assert rows[0].action == "unchanged"
+        assert rows[0].send_as_email == ALICE_JIT
+        assert rows[0].entity == "JIT"
+        with pytest.raises(UserInputError) as excinfo:
+            await _restore(pool, sheets=sheets, send_as_email="x@otbgroup.co.uk")
+        assert ALICE_JIT in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_empty_previous_signature_clears_the_address(self, pool):
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, "", "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        rows = await _restore(pool, sheets=sheets, dry_run=False, confirm=True)
+        assert rows[0].action == "applied"
+        assert "clears" in rows[0].reason
+        assert rows[0].after_hash == ""
+        assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == ""
+        assert sheets.ledger_rows()[-1]["rendered_hash"] == ""
+
+    @pytest.mark.asyncio
+    async def test_live_with_read_only_ledger_share_refuses_before_gmail(self, pool):
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        sheets.fail_writes = http_error(403, "forbidden")
+        with pytest.raises(LedgerError):
+            await _restore(pool, sheets=sheets, dry_run=False, confirm=True)
+        assert pool.factory_calls == []
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_patch_failure_and_append_failure_are_error_rows(self, pool):
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        pool.mailboxes[ALICE].fail_patch_for[ALICE] = http_error(403, "forbidden")
+        rows = await _restore(pool, sheets=sheets, dry_run=False, confirm=True)
+        assert rows[0].action == "error"
+        assert rows[0].reason.startswith("HttpError")
+        assert len(sheets.ledger_rows()) == 1
+
+        pool.mailboxes[ALICE].fail_patch_for.clear()
+        sheets.fail_append = http_error(500, "backendError")
+        rows = await _restore(pool, sheets=sheets, dry_run=False, confirm=True)
+        assert rows[0].action == "error"
+        assert operations.LEDGER_APPEND_FAILED_REASON in rows[0].reason
+        assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == PREVIOUS

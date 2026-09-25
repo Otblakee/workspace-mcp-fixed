@@ -5,16 +5,20 @@ Audits Gmail signatures against the ledger and exits:
 
 * ``0`` when every row is ``in_sync`` or ``unmanaged``;
 * ``2`` when any row is ``never_applied``, ``stale_template``,
-  ``changed_since_apply`` or ``error`` (drift: Render reports the failed
-  run, and a human decides whether to re-apply);
-* ``1`` on a fatal error (config, service-account auth, ledger) with a
-  one-line reason on stderr.
+  ``stale_directory``, ``changed_since_apply`` or ``error`` (drift: Render
+  records the failed run, and a human decides whether to re-apply);
+* ``1`` on a fatal error (config, service-account auth, ledger, or a
+  command line argparse rejects) with a one-line reason on stderr. A usage
+  error is deliberately 1, not argparse's own 2, so a mistyped cron command
+  can never be read as drift. ``--help`` still exits 0.
 
 This process audits only. It never patches a signature: the only writes it
-makes are the audit report tab in the ledger Sheet (skip with
-``--no-report``). There is no MCP caller gate here because there is no MCP
-caller: the CLI is a trusted process run by the platform with the same
-service-account key as the web service.
+makes are the ``Ledger`` tab header on a Sheet that has none yet (the same
+``prepare_ledger`` the audit tool uses, so both audit paths read one
+contract) and the audit report tab (skip with ``--no-report``). There is no
+MCP caller gate here because there is no MCP caller: the CLI is a trusted
+process run by the platform with the same service-account key as the web
+service.
 
 Scopes are exactly one of ``--ou PATH``, ``--domain D``, ``--group G`` or
 ``--all`` (every active user in the tenant).
@@ -32,7 +36,7 @@ from core.utils import UserInputError
 
 from gsignatures import operations
 from gsignatures.engine import SignatureConfigError
-from gsignatures.ledger import LedgerError, read_ledger_latest, write_audit_report
+from gsignatures.ledger import LedgerError, write_audit_report
 from gsignatures.operations import build_runtime
 from gsignatures.sa_auth import SignatureAuthError
 
@@ -80,14 +84,11 @@ async def _run(args: argparse.Namespace) -> int:
         ou_path=args.ou, domain=args.domain, group_email=args.group, all_users=args.all
     )
     runtime = build_runtime(need_ledger=True)
-    try:
-        ledger_latest = await read_ledger_latest(runtime.sheets, runtime.sheet_id or "")
-    except LedgerError:
-        raise
-    except Exception as exc:
-        raise LedgerError(
-            f"the signature ledger could not be read ({type(exc).__name__}: {exc})"
-        ) from exc
+    # Same contract as the audit tool: tab ensured, header validated, every
+    # failure a LedgerError. A Sheet with no Ledger tab yet is an empty
+    # ledger, so a fresh deployment audits as never_applied (exit 2), not
+    # as a fatal read error.
+    ledger_latest = await operations.prepare_ledger(runtime.sheets, runtime.sheet_id)
 
     rows = await operations.audit_scope(
         runtime.config,
@@ -123,7 +124,20 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = _parser().parse_args(argv)
+    try:
+        args = _parser().parse_args(argv)
+    except SystemExit as exc:
+        # argparse exits 2 on a usage error, which is this CLI's drift code.
+        # Map it to fatal so a mistyped cron command is never read as drift;
+        # --help (exit 0) stays 0.
+        if not exc.code:
+            return EXIT_OK
+        print(
+            "signature audit failed: the command line was rejected (see the "
+            "usage message above); exit 1, not drift",
+            file=sys.stderr,
+        )
+        return EXIT_FATAL
     try:
         return asyncio.run(_run(args))
     except _FATAL as exc:

@@ -288,23 +288,59 @@ async def append_ledger_rows(sheets, sheet_id: str, rows: List[Dict[str, Any]]) 
     return len(values)
 
 
-async def read_ledger_latest(
-    sheets, sheet_id: str
-) -> Dict[Tuple[str, str], Dict[str, str]]:
-    """Latest ledger row per ``(user_email, send_as_email)``, both lower-cased.
+async def ledger_tab_exists(sheets, sheet_id: str) -> bool:
+    """Whether the Sheet has a ``Ledger`` tab at all.
 
-    "Latest" is the greatest ``applied_at`` string (ISO-8601 UTC compares
-    lexically); on a tie the later row in the sheet wins. Short rows are
-    padded with empty strings and blank rows are ignored. An empty sheet, or
-    a header with no data, gives ``{}``. A first row that is not the ledger
-    header is refused rather than misread.
+    A Sheet that was shared but never written to has no such tab, and
+    ``values.get`` on a missing tab is a 400 from the API. Callers that read
+    the ledger for information treat "no tab" as an empty ledger.
+    """
+    sheet_id = _check_sheet_id(sheet_id)
+    return LEDGER_TAB in await _tab_titles(sheets, sheet_id)
+
+
+async def assert_tab_writable(
+    sheets, sheet_id: str, tab: str, header: List[str]
+) -> None:
+    """Prove the tab can be written by re-writing its header row unchanged.
+
+    ``ensure_tab`` only writes when the tab or its header is missing, so on a
+    Sheet shared as Viewer the steady state (tab present, header right) would
+    pass every read and only fail at the first append, after the Gmail write.
+    Writing the identical header back changes nothing in the Sheet and fails
+    with the API's 403 when the share is read-only. Call it only on a path
+    that is about to write.
+    """
+    sheet_id = _check_sheet_id(sheet_id)
+    tab = _check_tab(tab)
+    header = _check_header(header)
+    await _write_values(sheets, sheet_id, _a1(tab, "1:1"), [header])
+
+
+def ledger_key(record: Dict[str, Any]) -> Tuple[str, str]:
+    """The ``(user_email, send_as_email)`` key of a ledger record, lower-cased."""
+    return (
+        _cell(record.get("user_email")).strip().lower(),
+        _cell(record.get("send_as_email")).strip().lower(),
+    )
+
+
+async def read_ledger_rows(sheets, sheet_id: str) -> List[Dict[str, str]]:
+    """Every attributable ledger row as a dict, in sheet order.
+
+    Short rows are padded with empty strings and blank rows are ignored. A
+    row without a user or send-as address is skipped with a warning that
+    names only its row number, ``applied_at`` and ``run_id``: never the
+    previous signature HTML, which carries a person's details. An empty
+    sheet, or a header with no data, gives ``[]``. A first row that is not
+    the ledger header is refused rather than misread.
     """
     sheet_id = _check_sheet_id(sheet_id)
     rows = await _read_values(
         sheets, sheet_id, _a1(LEDGER_TAB, f"A:{_LEDGER_LAST_COLUMN}")
     )
     if not rows:
-        return {}
+        return []
 
     header = [_cell(v).strip() for v in rows[0]]
     if header[: len(LEDGER_HEADER)] != LEDGER_HEADER:
@@ -313,21 +349,39 @@ async def read_ledger_latest(
             f"Expected {LEDGER_HEADER}; found {header}."
         )
 
-    latest: Dict[Tuple[str, str], Dict[str, str]] = {}
+    records: List[Dict[str, str]] = []
     width = len(LEDGER_HEADER)
-    for raw in rows[1:]:
+    for index, raw in enumerate(rows[1:], start=2):
         cells = [_cell(v) for v in raw[:width]]
         if not any(c.strip() for c in cells):
             continue
         cells += [""] * (width - len(cells))
         record = dict(zip(LEDGER_HEADER, cells))
-        key = (
-            record["user_email"].strip().lower(),
-            record["send_as_email"].strip().lower(),
-        )
-        if not key[0] or not key[1]:
-            logger.warning("ledger row without user/send-as skipped: %r", record)
+        user_key, send_as_key = ledger_key(record)
+        if not user_key or not send_as_key:
+            logger.warning(
+                "ledger row %d skipped: no user/send-as (applied_at=%r run_id=%r)",
+                index,
+                record["applied_at"],
+                record["run_id"],
+            )
             continue
+        records.append(record)
+    return records
+
+
+async def read_ledger_latest(
+    sheets, sheet_id: str
+) -> Dict[Tuple[str, str], Dict[str, str]]:
+    """Latest ledger row per ``(user_email, send_as_email)``, both lower-cased.
+
+    "Latest" is the greatest ``applied_at`` string (ISO-8601 UTC compares
+    lexically); on a tie the later row in the sheet wins. Rows come from
+    ``read_ledger_rows`` and share its tolerance and refusals.
+    """
+    latest: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for record in await read_ledger_rows(sheets, sheet_id):
+        key = ledger_key(record)
         current = latest.get(key)
         if current is None or record["applied_at"] >= current["applied_at"]:
             latest[key] = record

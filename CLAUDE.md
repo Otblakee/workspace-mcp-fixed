@@ -691,7 +691,7 @@ Package `gsignatures/`: `engine.py` (pure: config, entity resolution,
 rendering, hashing, planning, drift), `sa_auth.py` (service-account auth),
 `clients.py` (thin Gmail and Directory wrappers), `ledger.py` (the Sheet),
 `operations.py` (the async orchestration, injected clients, no transport),
-`signature_tools.py` (the five MCP tools), `audit_cli.py` (the cron), plus
+`signature_tools.py` (the six MCP tools), `audit_cli.py` (the cron), plus
 `config/entities.yaml`, `templates/<CODE>/`, `TEMPLATES.md` and `RUNBOOK.md`.
 Tests in `tests/gsignatures/`; the fakes live in `tests/gsignatures/fakes.py`.
 
@@ -732,15 +732,57 @@ case-insensitive). The gate is in the function body, not a decorator, so
 nothing can peel it off, and it runs before any client is built. The cron CLI
 has no gate because it has no caller; it is a trusted process.
 
-**The dry_run + confirm rule.** `set_email_signature` and
-`apply_email_signatures` default to `dry_run=True`. A live write needs
-`dry_run=False` AND `confirm=True`; anything else raises
-`operations.LIVE_CONFIRM_MESSAGE` before any Google call. A live run also needs
-a reachable ledger: `prepare_ledger` ensures the `Ledger` tab and reads it
-BEFORE the first Gmail write, and refuses the whole run if it cannot. The
-ledger is the evidence; a write that cannot be recorded does not happen.
-`apply_scope` refuses a scope above `max_users` (default 200) with the count
-and never truncates.
+**The dry_run + confirm rule.** `set_email_signature`,
+`apply_email_signatures` and `restore_email_signature` default to
+`dry_run=True`. A live write needs `dry_run=False` AND `confirm=True`;
+anything else raises `operations.LIVE_CONFIRM_MESSAGE` before any Google
+call, and the tool layer runs that check (and the scope check) before it
+builds any client, so the caller sees the right refusal even with no ledger
+or key configured. A live run also needs a writable ledger:
+`prepare_ledger(probe_write=True)` ensures the `Ledger` tab, re-writes the
+identical header row to prove the share is Editor, and reads it BEFORE the
+first Gmail write, refusing the whole run if it cannot. The ledger is the
+evidence; a write that cannot be recorded does not happen, and that holds
+mid-run: after the first failed ledger append, `_RunState.ledger_failed` is
+set and every further address in that user and every later user becomes an
+`error` row reading `not attempted` (`LEDGER_FAILED_REASON`), never a
+patch. A dry run whose ledger could not be read prefixes every
+`would_apply` reason with the note and the tools print a `Ledger:` header
+line; a Sheet with no `Ledger` tab yet is an empty ledger for the read
+paths. `force` never touches an address the engine skipped (personal
+alias, suspended user, excluded OU): the skip check runs before the force
+branch. `apply_scope` refuses a scope above `max_users` (default 200) with
+the count and never truncates, refuses an unknown or unreadable group by
+name, and lets `SignatureAuthError` / `SignatureConfigError` propagate
+instead of writing one error row per user.
+
+**Read-only mode.** The three write tools carry `_workspace_write_tool =
+True` (the `_write_tool` marker, innermost decorator so `functools.wraps`
+carries it out to `tool.fn`); `core.tool_registry.filter_server_tools`
+removes any tool with that marker under `--read-only`, because these tools
+hold no OAuth scope for the usual scope check to see. Each write tool also
+refuses a live run in its body via `auth.scopes.is_read_only_mode()`.
+
+**Restore.** `restore_email_signature` (`operations.restore_user`) reads
+the ledger (even for a dry run: the row is what is restored), picks the
+latest row for (user, send-as) or the one with the given `run_id`, patches
+its `previous_signature_html` back (empty clears the signature) and appends
+a ledger row with `rendered_hash` of what was restored, both versions
+`RESTORED_VERSION` (`restored`) and the replaced signature in
+`previous_signature_html`. Because `restored` never equals a pinned semver,
+the next apply re-applies and the audit reports `stale_template` for a
+restored address, which is the truth.
+
+**Drift statuses** (`engine.drift_status`, in order): `unmanaged`, `error`,
+`never_applied`, `stale_template` (pinned versions moved), `stale_directory`
+(the ledger `rendered_hash` no longer matches a fresh render: the person's
+Directory data changed since the apply, still judged against the ledger),
+`changed_since_apply` (Gmail's current hash differs from the read-back
+hash), `in_sync`. `operations.AUDIT_STATUSES` lists them all and
+`DRIFT_STATUSES` is everything but `in_sync` and `unmanaged`; a test pins
+both against the engine. `engine.MAX_SIGNATURE_CHARS` (10,000, Gmail's
+limit) is enforced in `render_signature` as a `TemplateError`, so an
+over-long render is an `error` row, never a silent send.
 
 **Ledger design.** Sheet `OTB_LOG_SignatureLedger_2026-09-25_v1`, tab
 `Ledger`, append-only, columns `LEDGER_HEADER`. One row per (live apply,
@@ -759,7 +801,10 @@ forwarding and mailbox delegation); no forwarding, delegate, vacation or
 send-as create/delete/verify call anywhere in the package, and
 `tests/gsignatures/test_registration.py` scans the source to keep it so.
 The cron never writes a signature: it audits, writes the report tab, and
-exits 0 (in sync), 2 (drift) or 1 (fatal). `blakefamily.uk` aliases are
+exits 0 (in sync), 2 (drift) or 1 (fatal, including a command line argparse
+rejects, mapped from argparse's own 2 so a typo is never read as drift);
+`tests/gsignatures/test_audit_cli.py` scans its source for any apply path
+and pins its option list. `blakefamily.uk` aliases are
 skipped by config. `fastmcp_server.py` does not import the service, the
 start-up banner prints no `SIGNATURE_*` value, and the service is in
 `OPT_IN_TOOLS`, so it never loads unless `TOOLS` names it.

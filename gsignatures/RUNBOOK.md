@@ -60,9 +60,10 @@ that only holds the basic scope cannot be used to forward anyone's mail or
 hand their mailbox to someone else, even if it leaks. Never add the sharing
 scope to this entry.
 
-Delegation can take a few minutes to propagate. If the first tool call
-returns `unauthorized_client`, wait ten minutes and retry before changing
-anything.
+Delegation usually propagates within minutes, but Google says a change to
+domain-wide delegation can take up to 24 hours. If the first tool call
+returns `unauthorized_client`, retry later before changing anything; only
+re-check the client ID and scope list once it has failed for more than a day.
 
 ## 3. Create the ledger Sheet
 
@@ -94,7 +95,7 @@ Environment variables:
 | Variable | Value |
 | --- | --- |
 | `SIGNATURE_SERVICE_ACCOUNT_FILE` | `/etc/secrets/signature-sa.json` |
-| `SIGNATURE_DIRECTORY_ADMIN` | `oliver@otbgroup.co.uk` (the admin impersonated for Directory reads) |
+| `SIGNATURE_DIRECTORY_ADMIN` | `oliver@otbgroup.co.uk` (the admin impersonated for Directory reads). Must be a Workspace super admin, or hold an admin role with Users: Read and Groups: Read; the Admin SDK authorises each call by this user's privileges, so a non-admin address makes every Directory call fail with 403 |
 | `SIGNATURE_ADMIN_EMAILS` | `oliver@otbgroup.co.uk` (comma-separated allowlist of who may call the tools) |
 | `SIGNATURE_LEDGER_SHEET_ID` | the Sheet ID from step 3 |
 
@@ -110,8 +111,20 @@ TOOLS=gmail drive calendar docs sheets contacts gsignatures
 ```
 
 `gsignatures` is an opt-in service (`OPT_IN_TOOLS` in `main.py`): it never
-loads unless `TOOLS` names it, whatever the tier. Its five tools sit at the
+loads unless `TOOLS` names it, whatever the tier. Its six tools sit at the
 core tier so `TOOL_TIER=extended` picks them up unchanged. Redeploy.
+
+Also change the `TOOLS` value in `render.yaml` in the same PR (and add the
+cron job from step 8 to `render.yaml` if you want it under blueprint
+control). `render.yaml` still pins the six original services, and a
+blueprint sync overwrites the dashboard value, so without this edit the next
+sync removes the service with no warning while the weekly cron keeps
+reporting on signatures nobody can touch from a client.
+
+Do not start the server with `--read-only` and expect signature writes:
+read-only mode drops `set_email_signature`, `apply_email_signatures` and
+`restore_email_signature` at registration, and each also refuses a live run
+in its body. The three read tools stay available.
 
 Confirm in the start-up banner that the service loaded, and that the OAuth
 consent prompt is unchanged: the feature requests no OAuth scope of its own.
@@ -123,10 +136,24 @@ Do these in order, from a connected client signed in as an address on
 
 1. `preview_email_signature(user_email="oliver@otbgroup.co.uk")`. Check the
    entity, versions, name, title, mobile and the HTML. Expect the
-   `statutory_verified: false` warning until step 6 of `TEMPLATES.md` is done.
+   `statutory_verified: false` warning until the Companies House check
+   (`FOLLOWUPS.md`, "Gmail signatures live checks", item 1; `TEMPLATES.md`
+   hand-over checklist item 7) is done and `statutory_verified` is flipped
+   to `true`.
+
+   If the preview reports that the key file could not be read (`Permission
+   denied`), the secret file is not readable by the non-root `app` user the
+   container drops to. Either set `SIGNATURE_SERVICE_ACCOUNT_JSON` to the
+   key contents as a normal secret environment variable instead of the
+   file, or extend `entrypoint.sh` to copy `/etc/secrets/signature-sa.json`
+   to an app-owned path and point `SIGNATURE_SERVICE_ACCOUNT_FILE` there.
+   Record which one was needed in `FOLLOWUPS.md` (item 7).
 2. `get_email_signatures(user_email="oliver@otbgroup.co.uk")`. Every send-as
    should show as `never_applied` (managed) or `unmanaged` (the
-   `blakefamily.uk` alias).
+   `blakefamily.uk` alias). The ledger Sheet has no `Ledger` tab yet at this
+   point; the read tools treat that as an empty ledger, so this is the
+   expected output, not a broken setup. `ledger unavailable` here means the
+   Sheet ID is wrong or the share is missing.
 3. `set_email_signature(user_email="oliver@otbgroup.co.uk")`: the default dry
    run. Read the table; the action should be `would_apply`.
 4. `set_email_signature(user_email="oliver@otbgroup.co.uk", dry_run=False,
@@ -143,8 +170,12 @@ Do these in order, from a connected client signed in as an address on
    or via a test message. Record in `TEMPLATES.md` ("Layout rules") what the
    sanitiser stripped or rewrote, so the branded templates are written to
    survive it.
-8. `audit_email_signatures(ou_path="/01 OTB")`: the owner's rows should now
-   read `in_sync`.
+8. `audit_email_signatures(ou_path="/01 OTB")`: the two addresses applied in
+   step 4 (the primary and `oliver@bir-d.co.uk`) read `in_sync`. Every other
+   managed address reads `never_applied` until step 7: the owner's remaining
+   aliases (`oliver.blake@jit-logistics.com`, `otb@otbgroup.co.uk`) and every
+   other user in `/01 OTB`. `oliver@blakefamily.uk` reads `unmanaged`. That
+   is the expected picture; only `error` rows need attention here.
 
 ## 7. Rollout by OU
 
@@ -180,30 +211,44 @@ Create a cron job in the same Render workspace:
 
 The cron audits only. It never re-applies a signature. Its exit code is the
 signal: `0` when every managed address matches the ledger, `2` when any row
-is `never_applied`, `stale_template`, `changed_since_apply` or `error`, `1`
-on a fatal error (config, key, ledger). Render marks the run failed on a
-non-zero exit and emails the workspace, so an email from the cron means
-drift or a broken setup, and a human decides what to do. The run also writes
-an `Audit_<UTC date>` tab to the ledger Sheet (skip with `--no-report`).
+is `never_applied`, `stale_template`, `stale_directory` (the person's job
+title or mobile changed in the Directory since the apply, so the signature
+is out of date), `changed_since_apply` or `error`, `1` on a fatal error
+(config, key, ledger, or a mistyped command line). Render records a
+non-zero exit as a failed run; turn on failure notifications for the
+workspace (Render dashboard > Settings > Notifications) and confirm one
+arrives after the first Monday run (`FOLLOWUPS.md` item 6). A failed run
+then means drift or a broken setup, and a human decides what to do. The run
+also writes an `Audit_<UTC date>` tab to the ledger Sheet (skip with
+`--no-report`); on a Sheet with no `Ledger` tab yet it creates the tab and
+reports every managed address as `never_applied` (exit 2).
 
 ## 9. Rollback
 
 Fastest to slowest:
 
 1. **Stop the tools:** remove `gsignatures` from `TOOLS` and redeploy. The
-   five tools disappear from every client. Nothing else changes.
+   six tools disappear from every client. Nothing else changes.
 2. **Kill the capability:** in the Admin console, delete the domain-wide
    delegation entry from step 2. The key can then do nothing in the tenant,
    whether or not it has leaked. Do this first if a leak is suspected, then
    rotate the key (step 10).
-3. **Restore a signature:** the ledger row for the address holds
-   `previous_signature_html`. Paste it back in Gmail's signature editor (or
-   apply it via the API by hand). Setting `force=True` after reverting the
-   template in git is the managed way for many addresses.
-4. **Revert content:** revert the template files and the pinned versions in
-   `config/entities.yaml` in git, redeploy, and run `apply_email_signatures`
-   again (dry run, then live). The ledger records the new versions, so the
-   audit stays honest.
+3. **Restore one signature:**
+   `restore_email_signature(user_email="...", send_as_email="...")` puts back
+   the `previous_signature_html` from the latest ledger row for that address
+   (pass `run_id="..."` to pick an older row; the run_id is in the result
+   table you kept and in the ledger). Dry run by default; repeat with
+   `dry_run=False, confirm=True` to restore. The restore is itself a ledger
+   row (versions `restored`, the replaced signature in
+   `previous_signature_html`), so it can be reversed the same way. An empty
+   previous signature clears the address. Until the template is fixed and
+   re-applied, the audit reports that address as `stale_template`, which is
+   correct: the managed signature is not in place.
+4. **Revert content for many addresses:** revert the template files and the
+   pinned versions in `config/entities.yaml` in git, redeploy, and run
+   `apply_email_signatures` again (dry run, then live). The ledger rows carry
+   the old versions, so every address re-applies without `force`; the ledger
+   records the reverted versions and the audit stays honest.
 
 ## 10. Key rotation
 

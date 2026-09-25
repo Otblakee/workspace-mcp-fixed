@@ -14,11 +14,20 @@ Rules carried by this module (owner decisions, see CLAUDE.md):
 * Writes default to a dry run. A live write needs ``dry_run=False`` AND
   ``confirm=True``; anything else is refused before any Google call.
 * The ledger is the evidence. A live run needs a reachable ledger Sheet
-  (readable and writable) BEFORE the first Gmail write; if the ledger
-  cannot be prepared the run is refused and nothing is written.
+  (readable and writable, proved by re-writing the header row unchanged)
+  BEFORE the first Gmail write; if the ledger cannot be prepared the run is
+  refused and nothing is written. Once a ledger append fails mid-run, no
+  further address in that run is patched: each becomes an ``error`` row
+  saying it was not attempted, in this user and every later one.
 * Drift and "unchanged" are judged against the ledger's read-back hash
   (what Gmail returned right after the last apply), never against a fresh
-  render, because Gmail sanitises what it stores.
+  render, because Gmail sanitises what it stores. A dry run whose ledger
+  could not be read says so in every ``would_apply`` reason rather than
+  claiming the address was never applied.
+* A restore (``restore_user``) puts back the ``previous_signature_html`` a
+  ledger row recorded, under the same dry-run and confirm rule, and records
+  a new ledger row with both versions set to ``restored`` so the next apply
+  and audit see the managed signature is not in place.
 * Isolation: one failing send-as address becomes an ``error`` row and the
   rest of the user continues; one failing user becomes an ``error`` row
   and the rest of the scope continues.
@@ -36,6 +45,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from googleapiclient.errors import HttpError
+
 from core.utils import UserInputError
 from gdrive.drive_batch import write_jsonl_report
 
@@ -44,6 +55,7 @@ from gsignatures.engine import (
     PlannedSignature,
     ResultRow,
     SignatureConfig,
+    SignatureConfigError,
     drift_status,
     load_config,
     plan_for_user,
@@ -55,9 +67,13 @@ from gsignatures.ledger import (
     LEDGER_TAB,
     LedgerError,
     append_ledger_rows,
+    assert_tab_writable,
     ensure_tab,
+    ledger_key,
     ledger_sheet_id,
+    ledger_tab_exists,
     read_ledger_latest,
+    read_ledger_rows,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +95,30 @@ USER_LEVEL_SEND_AS = "*"
 
 DEFAULT_MAX_USERS = 200
 
+# Recorded as both versions on the ledger row a restore writes. It can never
+# equal a pinned semver, so the next apply re-applies and the next audit
+# reports stale_template for a restored address, which is the truth: the
+# managed signature is not in place.
+RESTORED_VERSION = "restored"
+
+# Reason prefix on every address left unpatched after a ledger append
+# failed earlier in the same run. Tested verbatim.
+LEDGER_FAILED_REASON = "not attempted: ledger append failed earlier in this run"
+
+# Reason on a live address whose ledger row could not be appended after the
+# patch went through. Tested verbatim (prefix).
+LEDGER_APPEND_FAILED_REASON = "but the ledger append failed"
+
+# The two notes a dry run carries when the ledger could not be consulted.
+# ``read_ledger_best_effort`` produces them; the tool layer recognises them
+# on the rows to print one header line.
+LEDGER_NOT_CONFIGURED_NOTE = "ledger not configured"
+LEDGER_UNAVAILABLE_NOTE_PREFIX = "ledger unavailable ("
+
+# Setup errors that are never one user's fault. They propagate out of a
+# scope loop instead of becoming N identical error rows.
+_SETUP_ERRORS = (sa_auth.SignatureAuthError, SignatureConfigError)
+
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -97,6 +137,16 @@ def utc_now_iso() -> str:
 
 def _error_text(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
+
+
+def _http_status(exc: BaseException) -> Optional[int]:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def scope_label(
@@ -180,22 +230,40 @@ def build_runtime(*, need_ledger: bool = True) -> Runtime:
 # ---------------------------------------------------------------------------
 
 
-async def prepare_ledger(sheets, sheet_id: Optional[str]) -> LedgerLatest:
-    """Prove the ledger is writable and readable, then return its latest rows.
-
-    Ensures the ``Ledger`` tab exists with the right header (creating it on
-    first use), then reads the latest row per (user, send-as). Any failure
-    is raised as ``LedgerError`` naming the underlying error, so a live run
-    can be refused before its first Gmail write.
-    """
+def _require_ledger_client(sheets, sheet_id: Optional[str]) -> str:
     if sheets is None or not (sheet_id or "").strip():
         raise LedgerError(
             "A live run needs the signature ledger (a Sheets client and "
             f"{sa_auth.ENV_LEDGER_SHEET_ID}). The ledger is the evidence of "
             "every apply, so no signature is written without it."
         )
+    return str(sheet_id).strip()
+
+
+async def _prepare_ledger_tab(sheets, sheet_id: str, *, probe_write: bool) -> None:
+    """Ensure the ``Ledger`` tab and header; with ``probe_write`` prove it writable."""
+    await ensure_tab(sheets, sheet_id, LEDGER_TAB, LEDGER_HEADER)
+    if probe_write:
+        await assert_tab_writable(sheets, sheet_id, LEDGER_TAB, LEDGER_HEADER)
+
+
+async def prepare_ledger(
+    sheets, sheet_id: Optional[str], *, probe_write: bool = False
+) -> LedgerLatest:
+    """Prepare the ledger and return its latest rows, or raise ``LedgerError``.
+
+    Ensures the ``Ledger`` tab exists with the right header (creating it on
+    first use), then reads the latest row per (user, send-as). With
+    ``probe_write=True`` (every path about to write a signature) it also
+    re-writes the identical header row first, so a Sheet shared as Viewer is
+    refused here and not after the first Gmail patch. Audits pass the default
+    and only read. Any failure is raised as ``LedgerError`` naming the
+    underlying error, so a live run can be refused before its first Gmail
+    write.
+    """
+    sheet_id = _require_ledger_client(sheets, sheet_id)
     try:
-        await ensure_tab(sheets, sheet_id, LEDGER_TAB, LEDGER_HEADER)
+        await _prepare_ledger_tab(sheets, sheet_id, probe_write=probe_write)
         return await read_ledger_latest(sheets, sheet_id)
     except LedgerError:
         raise
@@ -209,14 +277,21 @@ async def prepare_ledger(sheets, sheet_id: Optional[str]) -> LedgerLatest:
 async def read_ledger_best_effort(
     sheets, sheet_id: Optional[str]
 ) -> Tuple[Optional[LedgerLatest], Optional[str]]:
-    """Read the ledger for information only: ``(rows, None)`` or ``(None, why)``."""
+    """Read the ledger for information only: ``(rows, None)`` or ``(None, why)``.
+
+    A Sheet with no ``Ledger`` tab yet (shared, never written) is an empty
+    ledger, ``({}, None)``, not a failure: every managed address then reads
+    ``never_applied``, which is the truth.
+    """
     if sheets is None or not (sheet_id or "").strip():
-        return None, "ledger not configured"
+        return None, LEDGER_NOT_CONFIGURED_NOTE
     try:
+        if not await ledger_tab_exists(sheets, sheet_id):
+            return {}, None
         return await read_ledger_latest(sheets, sheet_id), None
     except Exception as exc:
         logger.warning("ledger read failed (continuing): %s", _error_text(exc))
-        return None, f"ledger unavailable ({_error_text(exc)})"
+        return None, f"{LEDGER_UNAVAILABLE_NOTE_PREFIX}{_error_text(exc)})"
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +444,18 @@ def _select_plans(
     return plans
 
 
+@dataclass
+class _RunState:
+    """What one run has learnt so far; shared across every user in a scope.
+
+    ``ledger_failed`` holds the text of the first failed ledger append. Once
+    set, no further address is patched: a write that cannot be recorded does
+    not happen, and that rule holds mid-run as much as before the run.
+    """
+
+    ledger_failed: Optional[str] = None
+
+
 async def _apply_loaded(
     loaded: _LoadedUser,
     *,
@@ -382,19 +469,29 @@ async def _apply_loaded(
     sheet_id: Optional[str],
     only_send_as: Optional[str] = None,
     primary_only: bool = False,
+    state: Optional[_RunState] = None,
+    ledger_note: Optional[str] = None,
 ) -> List[ResultRow]:
     rows: List[ResultRow] = []
     user_key = loaded.email.lower()
+    state = state if state is not None else _RunState()
 
     for plan in _select_plans(loaded, only_send_as, primary_only):
+        # The engine's skip (personal alias, suspended user, excluded OU)
+        # is checked before force so force can never push a company
+        # signature onto an address the rules exclude, and before the
+        # caller's alias switch so the rule's own reason is what is shown.
         if plan.status == "skipped":
             rows.append(_row(plan, "skipped", plan.reason, None, None))
             continue
-        if plan.status == "error":
-            rows.append(_row(plan, "error", plan.reason, None, None))
-            continue
+        # An alias the caller excluded is reported as excluded, whatever
+        # the engine would have said about it: its faults are not this
+        # run's errors.
         if not include_aliases and not plan.is_primary:
             rows.append(_row(plan, "skipped", "aliases not included", None, None))
+            continue
+        if plan.status == "error":
+            rows.append(_row(plan, "error", plan.reason, None, None))
             continue
 
         current_html = loaded.current_signature(plan.send_as_email)
@@ -409,8 +506,24 @@ async def _apply_loaded(
             why = "force=True" + (f" ({why})" if unchanged else f"; {why}")
 
         if dry_run:
+            if ledger_note:
+                # The ledger could not be read, so "no ledger row" would be
+                # a claim this run cannot make. Say what actually happened.
+                why = f"{ledger_note}; {why}"
             rows.append(
                 _row(plan, "would_apply", why, current_hash, plan.rendered_hash)
+            )
+            continue
+
+        if state.ledger_failed:
+            rows.append(
+                _row(
+                    plan,
+                    "error",
+                    f"{LEDGER_FAILED_REASON} ({state.ledger_failed})",
+                    current_hash,
+                    None,
+                )
             )
             continue
 
@@ -455,11 +568,12 @@ async def _apply_loaded(
                 plan.send_as_email,
                 _error_text(exc),
             )
+            state.ledger_failed = _error_text(exc)
             rows.append(
                 _row(
                     plan,
                     "error",
-                    "signature applied but the ledger append failed "
+                    f"signature applied {LEDGER_APPEND_FAILED_REASON} "
                     f"({_error_text(exc)}); record this row by hand",
                     current_hash,
                     readback_hash,
@@ -471,25 +585,37 @@ async def _apply_loaded(
     return rows
 
 
-def _gate_live(dry_run: bool, confirm: bool) -> None:
+def gate_live(dry_run: bool, confirm: bool) -> None:
+    """Refuse a live run without the second switch. Raises before any call.
+
+    Public so the tool layer can run it before building any client; the
+    operations run it again themselves, so nothing depends on the caller.
+    """
     if not dry_run and not confirm:
         raise UserInputError(LIVE_CONFIRM_MESSAGE)
 
 
+_gate_live = gate_live
+
+
 async def _resolve_ledger(
     dry_run: bool, ledger_latest: Optional[LedgerLatest], sheets, sheet_id
-) -> LedgerLatest:
-    """Live: prepare (or refuse). Dry run: best effort, empty when unavailable."""
+) -> Tuple[LedgerLatest, Optional[str]]:
+    """Live: prepare with a write probe (or refuse). Dry run: best effort.
+
+    Returns ``(latest, note)``. ``note`` is set only on a dry run whose
+    ledger could not be read or is not configured; the rows then carry it.
+    """
     if ledger_latest is not None:
         if not dry_run and (sheets is None or not (sheet_id or "").strip()):
             # The caller proved the ledger readable but gave no client to
             # write with; the row could never be recorded.
-            await prepare_ledger(sheets, sheet_id)
-        return ledger_latest
+            await prepare_ledger(sheets, sheet_id, probe_write=True)
+        return ledger_latest, None
     if not dry_run:
-        return await prepare_ledger(sheets, sheet_id)
-    rows, _ = await read_ledger_best_effort(sheets, sheet_id)
-    return rows or {}
+        return await prepare_ledger(sheets, sheet_id, probe_write=True), None
+    rows, note = await read_ledger_best_effort(sheets, sheet_id)
+    return (rows if rows is not None else {}), note
 
 
 async def apply_user(
@@ -522,8 +648,8 @@ async def apply_user(
     one address; ``primary_only`` to the primary. One row per address
     handled; see ``engine.ResultRow``.
     """
-    _gate_live(dry_run, confirm)
-    latest = await _resolve_ledger(dry_run, ledger_latest, sheets, sheet_id)
+    gate_live(dry_run, confirm)
+    latest, note = await _resolve_ledger(dry_run, ledger_latest, sheets, sheet_id)
     loaded = await _load_user(config, directory, user_key, gmail_factory)
     return await _apply_loaded(
         loaded,
@@ -537,7 +663,243 @@ async def apply_user(
         sheet_id=sheet_id,
         only_send_as=only_send_as,
         primary_only=primary_only,
+        state=_RunState(),
+        ledger_note=note,
     )
+
+
+# ---------------------------------------------------------------------------
+# Restoring one address from the ledger
+# ---------------------------------------------------------------------------
+
+
+def _pick_send_as(
+    send_as_list: List[Dict[str, Any]], user_email: str, send_as_email: Optional[str]
+) -> Dict[str, Any]:
+    if send_as_email and send_as_email.strip():
+        wanted = send_as_email.strip().lower()
+        for entry in send_as_list:
+            if str(entry.get("sendAsEmail") or "").lower() == wanted:
+                return entry
+        available = (
+            ", ".join(str(e.get("sendAsEmail") or "") for e in send_as_list) or "(none)"
+        )
+        raise UserInputError(
+            f"{user_email} has no send-as address {send_as_email.strip()}. "
+            f"Available: {available}."
+        )
+    for entry in send_as_list:
+        if entry.get("isPrimary"):
+            return entry
+    raise UserInputError(f"{user_email} has no primary send-as address in Gmail.")
+
+
+def _pick_ledger_row(
+    records: List[Dict[str, str]],
+    user_email: str,
+    send_as_email: str,
+    from_run_id: Optional[str],
+) -> Dict[str, str]:
+    key = (user_email.lower(), send_as_email.lower())
+    mine = [r for r in records if ledger_key(r) == key]
+    if not mine:
+        raise UserInputError(
+            f"The ledger has no row for {user_email} / {send_as_email}, so there "
+            "is no previous signature to restore. Nothing was changed."
+        )
+    if from_run_id and from_run_id.strip():
+        wanted = from_run_id.strip()
+        hits = [r for r in mine if (r.get("run_id") or "").strip() == wanted]
+        if not hits:
+            newest_first = sorted(mine, key=lambda r: r["applied_at"], reverse=True)
+            known = ", ".join(
+                f"{r['run_id'] or '?'} ({r['applied_at']})" for r in newest_first[:10]
+            )
+            raise UserInputError(
+                f"The ledger has no row for {user_email} / {send_as_email} with "
+                f"run_id {wanted}. Known run_ids, newest first: {known}. "
+                "Nothing was changed."
+            )
+        return hits[-1]
+    latest = mine[0]
+    for record in mine[1:]:
+        if record["applied_at"] >= latest["applied_at"]:
+            latest = record
+    return latest
+
+
+def _restore_row(
+    user_email: str,
+    send_as_email: str,
+    ledger_row: Dict[str, str],
+    action: str,
+    reason: str,
+    before_hash: Optional[str],
+    after_hash: Optional[str],
+) -> ResultRow:
+    return ResultRow(
+        user_email=user_email,
+        send_as_email=send_as_email,
+        entity=ledger_row.get("entity") or None,
+        template_version=RESTORED_VERSION,
+        action=action,
+        reason=reason,
+        before_hash=before_hash,
+        after_hash=after_hash,
+    )
+
+
+async def restore_user(
+    user_email: str,
+    send_as_email: Optional[str] = None,
+    *,
+    actor: str,
+    run_id: str,
+    from_run_id: Optional[str] = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+    sheets=None,
+    sheet_id: Optional[str] = None,
+    gmail_factory: GmailFactory = sa_auth.build_gmail_for_user,
+) -> List[ResultRow]:
+    """Put back the previous signature a ledger row recorded for one address.
+
+    The ledger row is the latest for (user, send-as), or the one with
+    ``from_run_id`` when given. Its ``previous_signature_html`` is patched
+    onto the address (an empty value clears the signature, which is what
+    "previous" meant then). Same rule as an apply: dry run by default; live
+    needs ``dry_run=False`` AND ``confirm=True`` and a writable ledger, and
+    the ledger is prepared before Gmail is touched. A dry run still needs a
+    readable ledger, because the row is what is being restored.
+
+    A live restore records a new ledger row with ``rendered_hash`` of what
+    was restored, ``readback_hash`` of what Gmail kept, both versions
+    ``restored``, and the signature it replaced in ``previous_signature_html``
+    so a restore is itself reversible. Exactly one ``ResultRow`` is returned.
+    """
+    gate_live(dry_run, confirm)
+    user_email = user_email.strip()
+    sheet_id = _require_ledger_client(sheets, sheet_id)
+    try:
+        await _prepare_ledger_tab(sheets, sheet_id, probe_write=not dry_run)
+        records = await read_ledger_rows(sheets, sheet_id)
+    except LedgerError:
+        raise
+    except Exception as exc:
+        raise LedgerError(
+            "The signature ledger could not be prepared or read "
+            f"({_error_text(exc)}). No signature was written."
+        ) from exc
+
+    gmail = gmail_factory(user_email)
+    send_as_list = await clients.list_send_as(gmail)
+    entry = _pick_send_as(send_as_list, user_email, send_as_email)
+    address = str(entry.get("sendAsEmail") or "")
+    ledger_row = _pick_ledger_row(records, user_email, address, from_run_id)
+
+    previous_html = ledger_row.get("previous_signature_html") or ""
+    target_hash = signature_hash(previous_html)
+    current_html = str(entry.get("signature") or "")
+    current_hash = signature_hash(current_html)
+    source = (
+        f"ledger row run_id {ledger_row.get('run_id') or '?'} applied "
+        f"{ledger_row.get('applied_at') or '?'}"
+    )
+    if not previous_html.strip():
+        source += " (previous signature was empty: this clears the signature)"
+
+    if current_hash == target_hash:
+        return [
+            _restore_row(
+                user_email,
+                address,
+                ledger_row,
+                "unchanged",
+                f"Gmail already holds the previous signature from {source}",
+                current_hash,
+                current_hash,
+            )
+        ]
+    if dry_run:
+        return [
+            _restore_row(
+                user_email,
+                address,
+                ledger_row,
+                "would_apply",
+                f"restore previous signature from {source}",
+                current_hash,
+                target_hash,
+            )
+        ]
+
+    try:
+        readback = await clients.patch_signature(gmail, address, previous_html)
+    except Exception as exc:
+        logger.warning(
+            "signature restore failed for %s / %s: %s",
+            user_email,
+            address,
+            _error_text(exc),
+        )
+        return [
+            _restore_row(
+                user_email,
+                address,
+                ledger_row,
+                "error",
+                _error_text(exc),
+                current_hash,
+                None,
+            )
+        ]
+    readback_hash = signature_hash(readback.get("signature"))
+    ledger_entry = {
+        "applied_at": utc_now_iso(),
+        "actor": actor,
+        "user_email": user_email,
+        "send_as_email": address,
+        "entity": ledger_row.get("entity") or "",
+        "template_version": RESTORED_VERSION,
+        "statutory_version": RESTORED_VERSION,
+        "rendered_hash": target_hash,
+        "readback_hash": readback_hash,
+        "previous_hash": current_hash,
+        "previous_signature_html": current_html,
+        "run_id": run_id,
+    }
+    try:
+        await append_ledger_rows(sheets, sheet_id, [ledger_entry])
+    except Exception as exc:
+        logger.error(
+            "signature restored for %s / %s but the ledger append failed: %s",
+            user_email,
+            address,
+            _error_text(exc),
+        )
+        return [
+            _restore_row(
+                user_email,
+                address,
+                ledger_row,
+                "error",
+                f"signature restored {LEDGER_APPEND_FAILED_REASON} "
+                f"({_error_text(exc)}); record this row by hand",
+                current_hash,
+                readback_hash,
+            )
+        ]
+    return [
+        _restore_row(
+            user_email,
+            address,
+            ledger_row,
+            "applied",
+            f"restored previous signature from {source}",
+            current_hash,
+            readback_hash,
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +923,15 @@ async def _resolve_scope_users(
     as an error triple so the caller can report it without losing the rest.
     """
     if group_email and group_email.strip():
-        emails = await clients.list_group_member_emails(directory, group_email)
+        try:
+            emails = await clients.list_group_member_emails(directory, group_email)
+        except HttpError as exc:
+            if _http_status(exc) in (403, 404):
+                raise UserInputError(
+                    f"Group {group_email.strip()} was not found or is not "
+                    "readable by the Directory admin. Nothing was changed."
+                ) from exc
+            raise
         out: List[Tuple[str, Optional[Dict[str, Any]], Optional[BaseException]]] = []
         for email in emails:
             try:
@@ -614,13 +984,14 @@ async def apply_scope(
     attachment store and ``report_meta`` carries the access line.
     """
     label = scope_label(ou_path=ou_path, domain=domain, group_email=group_email)
-    _gate_live(dry_run, confirm)
+    gate_live(dry_run, confirm)
     if not isinstance(max_users, int) or max_users < 1:
         raise UserInputError(
             f"max_users must be a positive integer, got {max_users!r}."
         )
 
-    latest = await _resolve_ledger(dry_run, None, sheets, sheet_id)
+    latest, note = await _resolve_ledger(dry_run, None, sheets, sheet_id)
+    state = _RunState()
     resolved = await _resolve_scope_users(
         directory,
         ou_path=ou_path,
@@ -653,8 +1024,12 @@ async def apply_scope(
                     ledger_latest=latest,
                     sheets=sheets,
                     sheet_id=sheet_id,
+                    state=state,
+                    ledger_note=note,
                 )
             )
+        except _SETUP_ERRORS:  # the key or config, never one user's fault
+            raise
         except Exception as exc:  # one user must not stop the scope
             logger.warning("signature run failed for %s: %s", email, _error_text(exc))
             rows.append(_user_error_row(email, exc))
@@ -669,6 +1044,8 @@ async def apply_scope(
         "dry_run": dry_run,
         "actor": actor,
         "user_count": len(resolved),
+        "ledger_note": note,
+        "ledger_failed": state.ledger_failed,
         "counts": _count_actions(rows),
         "report_filename": filename,
         "report_attachment_id": attachment_id,
@@ -762,6 +1139,8 @@ async def audit_scope(
             continue
         try:
             loaded = await _load_from_user(config, user or {}, gmail_factory)
+        except _SETUP_ERRORS:  # the key or config, never one user's fault
+            raise
         except Exception as exc:
             logger.warning("signature audit failed for %s: %s", email, _error_text(exc))
             rows.append(_audit_user_error_row(stamp, email, exc))
@@ -794,6 +1173,7 @@ AUDIT_STATUSES = (
     "unmanaged",
     "never_applied",
     "stale_template",
+    "stale_directory",
     "changed_since_apply",
     "error",
 )
@@ -801,7 +1181,13 @@ AUDIT_STATUSES = (
 # Statuses that mean a managed address is not what the ledger says it
 # should be. The CLI exits 2 when any row carries one of these.
 DRIFT_STATUSES = frozenset(
-    {"never_applied", "stale_template", "changed_since_apply", "error"}
+    {
+        "never_applied",
+        "stale_template",
+        "stale_directory",
+        "changed_since_apply",
+        "error",
+    }
 )
 
 _AUDIT_TABLE_COLUMNS = (
@@ -852,7 +1238,12 @@ __all__ = [
     "AUDIT_STATUSES",
     "DEFAULT_MAX_USERS",
     "DRIFT_STATUSES",
+    "LEDGER_APPEND_FAILED_REASON",
+    "LEDGER_FAILED_REASON",
+    "LEDGER_NOT_CONFIGURED_NOTE",
+    "LEDGER_UNAVAILABLE_NOTE_PREFIX",
     "LIVE_CONFIRM_MESSAGE",
+    "RESTORED_VERSION",
     "USER_LEVEL_SEND_AS",
     "Runtime",
     "apply_scope",
@@ -862,11 +1253,13 @@ __all__ = [
     "build_runtime",
     "format_audit_counts",
     "format_audit_table",
+    "gate_live",
     "has_drift",
     "new_run_id",
     "plan_user",
     "prepare_ledger",
     "read_ledger_best_effort",
+    "restore_user",
     "scope_label",
     "utc_now_iso",
 ]

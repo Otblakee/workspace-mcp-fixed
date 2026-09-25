@@ -1247,6 +1247,7 @@ as the record of every apply.
 | `set_email_signature` | Sets one send-as address (the primary by default). Dry run by default; live needs `dry_run=False` and `confirm=True` |
 | `apply_email_signatures` | Same across exactly one scope (OU, domain or group). Dry run by default; refuses scopes above `max_users`; JSONL report |
 | `audit_email_signatures` | Compares every send-as in a scope with the ledger. Never writes a signature; optional `Audit_<date>` tab |
+| `restore_email_signature` | Puts back the previous signature the ledger recorded for one send-as address (latest row, or a named `run_id`). Dry run by default; live needs `dry_run=False` and `confirm=True` |
 
 **Gating rule.** The feature runs on a Google service account with
 domain-wide delegation, not on the calling user's OAuth token, because a user
@@ -1264,7 +1265,9 @@ Delegation is granted for exactly three scopes (`gmail.settings.basic`,
 `admin.directory.user.readonly`, `admin.directory.group.member.readonly`);
 `gmail.settings.sharing`, which also covers forwarding and mailbox delegation,
 is never granted. The weekly audit is a Render cron running
-`python -m gsignatures.audit_cli --all`; it audits only and exits 2 on drift.
+`uv run python -m gsignatures.audit_cli --all` (the image installs into
+`/app/.venv`, so the bare `python` has no dependencies); it audits only and
+exits 2 on drift. `--read-only` removes the three write tools.
 
 Set-up steps, pilot sequence, cron schedule, rollback and key rotation are in
 [`gsignatures/RUNBOOK.md`](gsignatures/RUNBOOK.md). The template brief

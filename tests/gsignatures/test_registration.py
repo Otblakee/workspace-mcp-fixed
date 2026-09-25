@@ -1,9 +1,10 @@
 """Wiring tests for the opt-in ``gsignatures`` service.
 
-Asserts that the five tools register, sit at the core tier of the
+Asserts that the six tools register, sit at the core tier of the
 ``gsignatures`` section in ``core/tool_tiers.yaml``, that the service is
 opt-in (``main.OPT_IN_TOOLS``) and unblocked, that every write tool defaults
-to a dry run and needs a separate confirm, that neither ``fastmcp_server.py``
+to a dry run and needs a separate confirm, that ``--read-only`` removes the
+write tools at registration, that neither ``fastmcp_server.py``
 nor the start-up banner touch the feature, that no OAuth scope is requested
 for it, and that the package source never reaches the Gmail settings it must
 not (sharing scope, forwarding, delegates, vacation, send-as create/delete/
@@ -33,8 +34,13 @@ TOOLS = {
     "set_email_signature",
     "apply_email_signatures",
     "audit_email_signatures",
+    "restore_email_signature",
 }
-WRITE_TOOLS = {"set_email_signature", "apply_email_signatures"}
+WRITE_TOOLS = {
+    "set_email_signature",
+    "apply_email_signatures",
+    "restore_email_signature",
+}
 READ_TOOLS = TOOLS - WRITE_TOOLS
 
 
@@ -61,10 +67,10 @@ class TestRegistration:
 
         return get_tool_components(server)
 
-    def test_all_five_tools_registered(self, registered):
+    def test_all_six_tools_registered(self, registered):
         assert TOOLS <= set(registered)
 
-    def test_module_exposes_exactly_five_tools(self):
+    def test_module_exposes_exactly_six_tools(self):
         seen = set()
         for name, obj in vars(signature_tools).items():
             if name.startswith("_") or not callable(obj):
@@ -104,6 +110,25 @@ class TestRegistration:
             assert "confirm" not in params, name
             assert "dry_run" not in params, name
 
+    def test_write_tools_carry_the_read_only_marker(self, registered):
+        """The marker must survive every wrapper up to the function the
+        registry inspects (tool.fn), and the read tools must not carry it."""
+        for name in WRITE_TOOLS:
+            assert (
+                getattr(
+                    _unwrap(getattr(signature_tools, name)),
+                    "_workspace_write_tool",
+                    False,
+                )
+                is True
+            ), name
+            fn = registered[name].fn
+            assert getattr(fn, "_workspace_write_tool", False) is True, name
+        for name in READ_TOOLS:
+            assert not getattr(registered[name].fn, "_workspace_write_tool", False), (
+                name
+            )
+
 
 class TestTierAndPolicy:
     def test_tool_tiers_section(self):
@@ -129,6 +154,51 @@ class TestTierAndPolicy:
 
         for name in TOOLS:
             assert _service(name, "gsignatures.signature_tools") == "gsignatures"
+
+    def test_audit_resource_id_is_the_mailbox(self):
+        """Audit rows for the signature tools name the mailbox acted on; the
+        string results carry no id, so the kwargs are the only source."""
+        from core.audit import SENSITIVE, _resource_id
+
+        assert _resource_id({}, {"user_email": "a@b"}) == "a@b"
+        assert _resource_id("some text result", {"user_email": "a@b"}) == "a@b"
+        assert _resource_id({}, {"user_email": None}) == ""
+        assert _resource_id({}, {"group_email": "g@b"}) == "g@b"
+        # Nothing the tools take needs redacting: addresses and switches only.
+        for key in (
+            "user_email",
+            "send_as_email",
+            "ou_path",
+            "domain",
+            "group_email",
+            "dry_run",
+            "confirm",
+            "force",
+        ):
+            assert key not in SENSITIVE
+
+    def test_read_only_mode_removes_the_write_tools(self):
+        """``filter_server_tools`` under ``--read-only`` must drop the write
+        tools even though they carry no OAuth scope, and keep the read tools.
+        The server is restored afterwards so later tests see every tool."""
+        from auth.scopes import set_read_only
+        from core.server import server
+        from core.tool_registry import filter_server_tools, get_tool_components
+
+        before = get_tool_components(server)
+        assert TOOLS <= set(before)
+        set_read_only(True)
+        try:
+            filter_server_tools(server)
+            after = get_tool_components(server)
+            assert not (WRITE_TOOLS & set(after)), WRITE_TOOLS & set(after)
+            assert READ_TOOLS <= set(after)
+        finally:
+            set_read_only(False)
+            for name, tool in before.items():
+                if name not in get_tool_components(server):
+                    server.local_provider.add_tool(tool)
+        assert TOOLS <= set(get_tool_components(server))
 
 
 class TestMainWiring:
