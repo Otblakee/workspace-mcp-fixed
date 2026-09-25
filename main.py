@@ -56,7 +56,10 @@ configure_file_logging()
 # - appscript: per CLAUDE.md hard rule, must never be enabled until audit
 #   logging has been live and reviewed for 30 days. Keeping it out of the
 #   default load means a wiped TOOLS env var fails safe.
-OPT_IN_TOOLS = {"gadmin", "gadmin_write", "appscript"}
+# - gsignatures: managed Gmail signatures via a delegated service account
+#   that can act as any user; see gsignatures/signature_tools.py. Must never
+#   load unless TOOLS names it.
+OPT_IN_TOOLS = {"gadmin", "gadmin_write", "appscript", "gsignatures"}
 
 
 # Set to True after argparse if running with --transport stdio. In stdio
@@ -174,6 +177,7 @@ def main():
             "appscript",
             "gadmin",
             "gadmin_write",
+            "gsignatures",
         ],
         help="Specify which tools to register. If not provided, all tools are registered.",
     )
@@ -311,6 +315,7 @@ def main():
         "appscript": lambda: import_module("gappsscript.apps_script_tools"),
         "gadmin": lambda: import_module("gadmin.admin_tools"),
         "gadmin_write": lambda: import_module("gadmin.admin_group_tools"),
+        "gsignatures": lambda: import_module("gsignatures.signature_tools"),
     }
 
     tool_icons = {
@@ -328,6 +333,7 @@ def main():
         "appscript": "📜",
         "gadmin": "🛡️",
         "gadmin_write": "👥",
+        "gsignatures": "✍️",
     }
 
     def _tools_in_services(services):

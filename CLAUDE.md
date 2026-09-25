@@ -683,3 +683,152 @@ Audit: no bespoke audit call. Rows go to the MCP audit log through the
 `core/audit.py` decorator like every other tool; `drive_id` and
 `registry_spreadsheet_id` are already in `_resource_id`'s key list. The
 module never deletes or shares (asserted by a source scan).
+
+## Gmail signatures (gsignatures, v1.15.0)
+
+Centrally managed Gmail signatures for every send-as address in the tenant.
+Package `gsignatures/`: `engine.py` (pure: config, entity resolution,
+rendering, hashing, planning, drift), `sa_auth.py` (service-account auth),
+`clients.py` (thin Gmail and Directory wrappers), `ledger.py` (the Sheet),
+`operations.py` (the async orchestration, injected clients, no transport),
+`signature_tools.py` (the six MCP tools), `audit_cli.py` (the cron), plus
+`config/entities.yaml`, `templates/<CODE>/`, `TEMPLATES.md` and `RUNBOOK.md`.
+Tests in `tests/gsignatures/`; the fakes live in `tests/gsignatures/fakes.py`.
+
+**Architecture.** A tool call resolves the caller, builds a `Runtime`
+(config, Directory client, Sheets client, Gmail factory) and hands off to
+`operations`. `plan_user` reads the user (`users.get`, full projection) and
+the send-as list, and `engine.plan_for_user` decides per address: entity by
+the ordered rules, template by the pinned versions, rendered HTML and its
+hash, or a skip or error reason. `apply_user` / `apply_scope` turn the plan
+into `ResultRow`s (`applied`, `would_apply`, `unchanged`, `skipped`,
+`error`); `audit_scope` turns it into `AUDIT_HEADER` rows via
+`engine.drift_status`. Scope runs write JSONL to the attachment store rather
+than dumping rows inline. Per-address and per-user failures are rows, never
+aborts.
+
+**Auth path.** Not the user's OAuth token. A user token can only change its
+own primary signature; aliases and other mailboxes need a service account
+with domain-wide delegation. `sa_auth.build_gmail_for_user(email)` impersonates
+the user with `gmail.settings.basic` only; `build_directory_as_admin()`
+impersonates `SIGNATURE_DIRECTORY_ADMIN` (default `oliver@otbgroup.co.uk`)
+with the two Directory read-only scopes; `build_sheets_as_service_account()`
+acts as the service account itself for the ledger, which is shared with it
+as Editor. Credentials are built per call, never cached, so a rotated key
+takes effect on the next call. The key is read from
+`SIGNATURE_SERVICE_ACCOUNT_FILE` (Render secret file) or
+`SIGNATURE_SERVICE_ACCOUNT_JSON`; no message ever echoes it.
+`TOOL_SCOPES_MAP["gsignatures"]` is `[]` on purpose: nothing is added to the
+consent screen.
+
+**Why the caller gate exists.** The service account can act as anyone. Without
+a gate, any connected client that can reach the MCP could rewrite every
+signature in the tenant. So each tool's first line is
+`_require_allowed_caller()`: it reads `authenticated_user_email` from the
+FastMCP request context exactly as `core/audit.py` does, and
+`sa_auth.assert_caller_allowed` refuses `None`, an empty value, or any address
+not on `SIGNATURE_ADMIN_EMAILS` (default `oliver@otbgroup.co.uk`,
+case-insensitive). The gate then reads `authenticated_via` and accepts only
+the server's OAuth 2.1 paths, `fastmcp_oauth` and `mcp_session_binding`
+(`ACCEPTED_AUTH_PATHS`). The raw `bearer_token` path in
+`auth/auth_info_middleware.py` verifies a Google access token by introspection
+without checking which application it was minted for, and the stdio paths
+take the identity from configuration, so neither may drive a service account
+that can act as any user; the rest of the server still accepts them. The gate
+is in the function body, not a decorator, so nothing can peel it off, and it
+runs before any client is built. The cron CLI has no gate because it has no
+caller; it is a trusted process.
+
+**The dry_run + confirm rule.** `set_email_signature`,
+`apply_email_signatures` and `restore_email_signature` default to
+`dry_run=True`. A live write needs `dry_run=False` AND `confirm=True`;
+anything else raises `operations.LIVE_CONFIRM_MESSAGE` before any Google
+call, and the tool layer runs that check (and the scope check) before it
+builds any client, so the caller sees the right refusal even with no ledger
+or key configured. A live run also needs a writable ledger:
+`prepare_ledger(probe_write=True)` ensures the `Ledger` tab, re-writes the
+identical header row to prove the share is Editor, and reads it BEFORE the
+first Gmail write, refusing the whole run if it cannot. The ledger is the
+evidence; a write that cannot be recorded does not happen, and that holds
+mid-run: after the first failed ledger append, `_RunState.ledger_failed` is
+set and every further address in that user and every later user becomes an
+`error` row reading `not attempted` (`LEDGER_FAILED_REASON`), never a
+patch. A dry run whose ledger could not be read prefixes every
+`would_apply` reason with the note and the tools print a `Ledger:` header
+line; a Sheet with no `Ledger` tab yet is an empty ledger for the read
+paths. `force` never touches an address the engine skipped (personal
+alias, suspended user, excluded OU): the skip check runs before the force
+branch. `apply_scope` refuses a scope above `max_users` (default 200) with
+the count and never truncates, refuses an unknown or unreadable group by
+name, and lets `SignatureAuthError` / `SignatureConfigError` propagate
+instead of writing one error row per user.
+
+**Read-only mode.** The three write tools carry `_workspace_write_tool =
+True` (the `_write_tool` marker, innermost decorator so `functools.wraps`
+carries it out to `tool.fn`); `core.tool_registry.filter_server_tools`
+removes any tool with that marker under `--read-only`, because these tools
+hold no OAuth scope for the usual scope check to see. Each write tool also
+refuses a live run in its body via `auth.scopes.is_read_only_mode()`.
+
+**Restore.** `restore_email_signature` (`operations.restore_user`) reads
+the ledger (even for a dry run: the row is what is restored), picks the
+latest row for (user, send-as) or the one with the given `run_id`, patches
+its `previous_signature_html` back (empty clears the signature) and appends
+a ledger row with `rendered_hash` of what was restored, both versions
+`RESTORED_VERSION` (`restored`) and the replaced signature in
+`previous_signature_html`. Because `restored` never equals a pinned semver,
+the next apply re-applies and the audit reports `stale_template` for a
+restored address, which is the truth.
+
+**Drift statuses** (`engine.drift_status`, in order): `unmanaged`, `error`,
+`never_applied`, `stale_template` (pinned versions moved), `stale_directory`
+(the ledger `rendered_hash` no longer matches a fresh render: the person's
+Directory data changed since the apply, still judged against the ledger),
+`changed_since_apply` (Gmail's current hash differs from the read-back
+hash), `in_sync`. `operations.AUDIT_STATUSES` lists them all and
+`DRIFT_STATUSES` is everything but `in_sync` and `unmanaged`; a test pins
+both against the engine. `engine.MAX_SIGNATURE_CHARS` (10,000, Gmail's
+limit) is enforced in `render_signature` as a `TemplateError`, so an
+over-long render is an `error` row, never a silent send.
+
+**Ledger design.** Sheet `OTB_LOG_SignatureLedger_2026-09-25_v1`, tab
+`Ledger`, append-only, columns `LEDGER_HEADER`. One row per (live apply,
+send-as): `applied_at` (UTC ISO), `actor` (the gated caller), the entity and
+both versions, `rendered_hash` (what we sent), `readback_hash`
+(`signature_hash` of the `sendAs.signature` Gmail returned right after the
+patch; Gmail sanitises, so this differs from `rendered_hash`),
+`previous_hash` and `previous_signature_html` (for rollback), `run_id`. The
+row is appended straight after each address so partial progress is still
+recorded; if the append fails after the patch, the row is an `error` that says
+so. Drift and "unchanged" are judged against the ledger's read-back hash, never
+against a fresh render. Audit runs write an `Audit_<UTC date>` tab.
+
+**What never happens.** No `gmail.settings.sharing` scope (it also covers
+forwarding and mailbox delegation); no forwarding, delegate, vacation or
+send-as create/delete/verify call anywhere in the package, and
+`tests/gsignatures/test_registration.py` scans the source to keep it so.
+The cron never writes a signature: it audits, writes the report tab, and
+exits 0 (in sync), 2 (drift) or 1 (fatal, including a command line argparse
+rejects, mapped from argparse's own 2 so a typo is never read as drift);
+`tests/gsignatures/test_audit_cli.py` scans its source for any apply path
+and pins its option list. `blakefamily.uk` aliases are
+skipped by config. `fastmcp_server.py` does not import the service, the
+start-up banner prints no `SIGNATURE_*` value, and the service is in
+`OPT_IN_TOOLS`, so it never loads unless `TOOLS` names it.
+
+**Delegation scopes (exact, in this order):**
+
+```
+https://www.googleapis.com/auth/gmail.settings.basic
+https://www.googleapis.com/auth/admin.directory.user.readonly
+https://www.googleapis.com/auth/admin.directory.group.member.readonly
+```
+
+**Render env vars** (environment group `signatures`, attached to the web
+service and the cron): `SIGNATURE_SERVICE_ACCOUNT_FILE=/etc/secrets/signature-sa.json`,
+`SIGNATURE_DIRECTORY_ADMIN`, `SIGNATURE_ADMIN_EMAILS`,
+`SIGNATURE_LEDGER_SHEET_ID`; then `gsignatures` added to `TOOLS`. The order of
+operations, the pilot, the cron schedule, rollback and key rotation are in
+`gsignatures/RUNBOOK.md`. Outstanding live checks (Companies House
+verification, the Gmail sanitiser findings, alias visibility) are in
+`FOLLOWUPS.md` under "Gmail signatures live checks".

@@ -384,3 +384,49 @@ Found while building the banner tools (2026-09-25). The live registry's tab is
 `hub_section` column. `rebuild_hub` defaults `registry_range="Folder Registry"`
 and requires `hub_section`, so it would fail against the live sheet as it
 stands. Either add `hub_section` to the registry or change the tool.
+
+## Gmail signatures live checks
+
+Unit-scope only so far (`tests/gsignatures/`). Before the first live apply:
+
+1. **Companies House.** Verify the four company numbers and registered
+   offices in `gsignatures/config/entities.yaml` (OTB 15732792, JIT 03281238,
+   VALE 13811748, BIR 13838584) against
+   https://find-and-update.company-information.service.gov.uk/, including
+   the VAT numbers. The registered office was seeded from the trading footer
+   and may differ. Flip `statutory_verified: true` per entity only after the
+   check; `preview_email_signature` warns until then.
+2. **AHWE legal form.** `legal_form: unknown` for Art History with Emily.
+   Confirm whether it is a sole trader or a company and fill the statutory
+   block accordingly (a sole trader needs no company number, but the footer
+   must not imply one).
+3. **Gmail sanitiser findings.** After the pilot apply on the owner, compare
+   what Gmail stored with what was sent (the ledger has both hashes; the
+   HTML is visible in Gmail's signature editor). Record in `TEMPLATES.md`
+   what was stripped or rewritten (comments, `class`/`id`, styles, `dir`
+   attributes) so the branded templates are written to survive it.
+4. **Alias visibility in sendAs.** Confirm that every alias the owner sends
+   from appears in `sendAs.list` under delegation, including
+   `otb@otbgroup.co.uk` (a group-style address) and the `bir-d.co.uk` alias,
+   and that `patch` on a non-primary address succeeds with the basic scope
+   only. If an alias is missing, it is not a Gmail send-as and cannot carry
+   a signature.
+5. **Pilot on the owner first.** `preview`, `get`, `set` dry run, `set` live
+   on the primary and one alias, check Gmail web and app, `audit`. Only then
+   `apply_email_signatures` by OU, dry run first, result tables kept. The
+   full sequence is in `gsignatures/RUNBOOK.md`.
+6. **Cron.** Turn on failure notifications for the Render workspace first
+   (Render dashboard > Settings > Notifications; a failed run does not email
+   anyone by itself). After the first Monday run, confirm a notification
+   arrived on the non-zero exit and that the `Audit_<date>` tab appeared in
+   the ledger.
+7. **Secret file readability.** `entrypoint.sh` drops to the non-root `app`
+   user before the server and the cron run, and the repo has never mounted
+   a Render secret file before. On the first `preview_email_signature`
+   record whether `/etc/secrets/signature-sa.json` was readable as `app`;
+   if not, the fallback is `SIGNATURE_SERVICE_ACCOUNT_JSON` or a copy step
+   in `entrypoint.sh` (RUNBOOK step 6.1). Write the outcome here.
+8. **Restore path.** After the pilot apply, run `restore_email_signature`
+   as a dry run on the owner's `bir-d.co.uk` alias to confirm the ledger row
+   resolves and the previous HTML is the one expected; do a live restore
+   and re-apply only if the pilot signature needs pulling.
