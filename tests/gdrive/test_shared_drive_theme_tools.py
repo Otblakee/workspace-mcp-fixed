@@ -80,6 +80,9 @@ class FakeDrive:
             {"id": "bok", "backgroundImageLink": BOK_LINK, "colorRgb": "#689f38"},
         ]
         self.about_error = None
+        # Real Drive applies a colorRgb sent on drives.update; set this to
+        # simulate the colour not sticking.
+        self.ignore_color = False
 
     def drives(self):
         parent = self
@@ -105,7 +108,10 @@ class FakeDrive:
                 drive_id = kwargs["driveId"]
                 if drive_id in parent.update_error:
                     return _request(parent.update_error[drive_id])
-                changes = parent.after_update.get(drive_id, {})
+                changes = dict(parent.after_update.get(drive_id, {}))
+                body_colour = (kwargs.get("body") or {}).get("colorRgb")
+                if body_colour and not parent.ignore_color:
+                    changes["colorRgb"] = body_colour
                 for view in (parent.member_view, parent.admin_view):
                     if isinstance(view.get(drive_id), dict):
                         view[drive_id].update(changes)
@@ -607,7 +613,33 @@ class TestRegistryHelpers:
     def test_mapping_keys_are_case_insensitive(self):
         assert theme_tools.normalise_entity_images(
             {"jit": "a", "EXTERNALSHARE": "b"}
-        ) == {"JIT": "a", "ExternalShare": "b"}
+        ) == {
+            "JIT": {"image": "a", "accent": None},
+            "ExternalShare": {"image": "b", "accent": None},
+        }
+
+    def test_mapping_accepts_image_and_accent_per_category(self):
+        assert theme_tools.normalise_entity_images(
+            {"JIT": {"image": "a", "accent": "C8102E"}, "BIR": "b"},
+            default_accent="#0B2545",
+        ) == {
+            "JIT": {"image": "a", "accent": "#c8102e"},
+            "BIR": {"image": "b", "accent": "#0b2545"},
+        }
+
+    def test_mapping_rejects_unknown_keys_in_a_category(self):
+        with pytest.raises(UserInputError, match="unknown key"):
+            theme_tools.normalise_entity_images({"JIT": {"image": "a", "color": "x"}})
+
+    def test_mapping_rejects_a_bad_accent(self):
+        with pytest.raises(UserInputError, match=r"entity_images\['JIT'\]\.accent"):
+            theme_tools.normalise_entity_images(
+                {"JIT": {"image": "a", "accent": "navy"}}
+            )
+
+    def test_mapping_dict_needs_an_image(self):
+        with pytest.raises(UserInputError, match="blank image"):
+            theme_tools.normalise_entity_images({"JIT": {"accent": "#000000"}})
 
     def test_unknown_mapping_key_is_refused(self):
         with pytest.raises(UserInputError, match="Unknown category"):
@@ -782,6 +814,7 @@ class TestSetThemesFromRegistry:
 # ---------------------------------------------------------------------------
 
 THEME_TOOLS = {
+    "list_drive_themes",
     "get_shared_drive_theme",
     "set_shared_drive_theme",
     "set_shared_drive_themes_from_registry",
@@ -818,3 +851,271 @@ class TestRegistration:
         source = Path(theme_tools.__file__).read_text()
         for forbidden in (".delete(", "permissions()", ".trash"):
             assert forbidden not in source
+
+
+# ---------------------------------------------------------------------------
+# Accent colour helpers
+# ---------------------------------------------------------------------------
+
+# A mocked theme list with known colours, used for nearest-colour checks.
+COLOUR_THEMES = [
+    {
+        "id": "zulu_blue",
+        "colorRgb": "#1a237e",
+        "backgroundImageLink": "https://t/z.jpg",
+    },
+    {
+        "id": "alpha_red",
+        "colorRgb": "#c62828",
+        "backgroundImageLink": "https://t/a.jpg",
+    },
+    {"id": "mid_grey", "colorRgb": "#808080", "backgroundImageLink": "https://t/m.jpg"},
+    {
+        "id": "broken",
+        "colorRgb": "not-a-colour",
+        "backgroundImageLink": "https://t/b.jpg",
+    },
+]
+
+
+class TestAccentHelpers:
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [("#0B2545", "#0b2545"), ("0b2545", "#0b2545"), ("  #ABCDEF ", "#abcdef")],
+    )
+    def test_normalise_hex_accepts_common_forms(self, raw, expected):
+        assert theme_tools.normalise_hex(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["navy", "#fff", "#12345g", "", None, "#1234567"])
+    def test_normalise_hex_rejects_anything_else(self, raw):
+        with pytest.raises(UserInputError, match="6-digit hex"):
+            theme_tools.normalise_hex(raw)
+
+    def test_rgb_distance(self):
+        assert theme_tools.rgb_distance("#000000", "#000000") == 0
+        assert theme_tools.rgb_distance("#000000", "#ffffff") == pytest.approx(
+            441.673, abs=1e-3
+        )
+        assert theme_tools.rgb_distance("#000000", "#030400") == 5.0
+
+    def test_nearest_theme_is_the_smallest_rgb_distance(self):
+        nearest = theme_tools.nearest_stock_theme(COLOUR_THEMES, "#0b2545")
+        assert nearest["id"] == "zulu_blue"
+        assert nearest["colorRgb"] == "#1a237e"
+        assert nearest["distance"] == pytest.approx(
+            theme_tools.rgb_distance("#0b2545", "#1a237e")
+        )
+        assert (
+            theme_tools.nearest_stock_theme(COLOUR_THEMES, "#c8102e")["id"]
+            == "alpha_red"
+        )
+
+    def test_ties_go_to_the_first_id_alphabetically(self):
+        themes = [
+            {"id": "b_theme", "colorRgb": "#000010"},
+            {"id": "a_theme", "colorRgb": "#100000"},
+        ]
+        assert theme_tools.nearest_stock_theme(themes, "#000000")["id"] == "a_theme"
+
+    def test_themes_without_a_usable_colour_are_ignored(self):
+        assert theme_tools.nearest_stock_theme([{"id": "x"}], "#000000") is None
+        assert theme_tools.nearest_stock_theme(None, "#000000") is None
+        assert (
+            theme_tools.nearest_stock_theme(COLOUR_THEMES, "#7f7f7f")["id"]
+            == "mid_grey"
+        )
+
+
+# ---------------------------------------------------------------------------
+# list_drive_themes
+# ---------------------------------------------------------------------------
+
+list_drive_themes = _unwrap(theme_tools.list_drive_themes)
+
+
+class TestListDriveThemes:
+    @pytest.mark.asyncio
+    async def test_lists_every_theme_sorted_by_id(self):
+        service = FakeDrive()
+        service.themes = list(COLOUR_THEMES)
+
+        result = await list_drive_themes(service, USER)
+
+        fields = service.kwargs_for("about.get")[0]["fields"]
+        assert "driveThemes" in fields
+        for part in ("id", "colorRgb", "backgroundImageLink"):
+            assert part in fields
+        lines = result.splitlines()
+        assert lines[0].startswith("Shared drive themes (4)")
+        ids = [line.split(" | ")[0].lstrip("- ") for line in lines[1:]]
+        assert ids == ["alpha_red", "broken", "mid_grey", "zulu_blue"]
+        assert (
+            "- alpha_red | colorRgb: #c62828 | backgroundImageLink: https://t/a.jpg"
+            in lines
+        )
+
+    @pytest.mark.asyncio
+    async def test_is_read_only(self):
+        service = FakeDrive()
+        await list_drive_themes(service, USER)
+        assert service.call_names() == ["about.get"]
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_theme_list_is_an_error_not_an_empty_list(self):
+        service = FakeDrive()
+        service.about_error = _http_error(403, "forbidden")
+        with pytest.raises(HttpError):
+            await list_drive_themes(service, USER)
+
+    @pytest.mark.asyncio
+    async def test_no_themes_is_reported(self):
+        service = FakeDrive()
+        service.themes = []
+        assert "no shared drive themes" in await list_drive_themes(service, USER)
+
+
+# ---------------------------------------------------------------------------
+# accent_hex on set_shared_drive_theme
+# ---------------------------------------------------------------------------
+
+
+class TestAccentOnSetSharedDriveTheme:
+    def _service(self):
+        service = FakeDrive()
+        service.themes = list(COLOUR_THEMES)
+        service.member_view["d1"] = _drive()
+        service.images["img1"] = PNG
+        service.after_update["d1"] = {"backgroundImageLink": "https://lh3/new"}
+        return service
+
+    @pytest.mark.asyncio
+    async def test_exact_colour_goes_in_the_same_update_as_the_image(self):
+        service = self._service()
+
+        result = await set_shared_drive_theme(
+            service, USER, drive_id="d1", image_file_id="img1", accent_hex="0B2545"
+        )
+
+        updates = service.kwargs_for("drives.update")
+        assert len(updates) == 1, "one update: no stock theme applied first"
+        body = updates[0]["body"]
+        assert body["colorRgb"] == "#0b2545"
+        assert body["backgroundImageFile"]["id"] == "img1"
+        assert "themeId" not in body
+        assert "colorRgb=#0b2545" in result
+        assert "Accent: #0b2545 applied exactly" in result
+        expected = theme_tools.rgb_distance("#0b2545", "#1a237e")
+        assert (
+            f"Nearest stock theme: zulu_blue (#1a237e), RGB distance {expected:.1f}"
+            in result
+        )
+        assert "⚠️" not in result
+
+    @pytest.mark.asyncio
+    async def test_dry_run_reports_the_accent_and_changes_nothing(self):
+        service = self._service()
+        result = await set_shared_drive_theme(
+            service,
+            USER,
+            drive_id="d1",
+            image_file_id="img1",
+            accent_hex="#c8102e",
+            dry_run=True,
+        )
+        assert "drives.update" not in service.call_names()
+        assert "Would set" in result and "colorRgb=#c8102e" in result
+        assert "Nearest stock theme: alpha_red" in result
+
+    @pytest.mark.asyncio
+    async def test_omitting_accent_keeps_the_existing_behaviour(self):
+        service = self._service()
+        result = await set_shared_drive_theme(
+            service, USER, drive_id="d1", image_file_id="img1"
+        )
+        assert "colorRgb" not in service.kwargs_for("drives.update")[0]["body"]
+        assert "Accent:" not in result
+
+    @pytest.mark.asyncio
+    async def test_accent_with_a_stock_theme_is_refused(self):
+        service = self._service()
+        with pytest.raises(UserInputError, match="only applies with image_file_id"):
+            await set_shared_drive_theme(
+                service, USER, drive_id="d1", theme_id="bok", accent_hex="#000000"
+            )
+        assert service.calls == []
+
+    @pytest.mark.asyncio
+    async def test_bad_hex_is_refused_before_any_call(self):
+        service = self._service()
+        with pytest.raises(UserInputError, match="6-digit hex"):
+            await set_shared_drive_theme(
+                service, USER, drive_id="d1", image_file_id="img1", accent_hex="navy"
+            )
+        assert service.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_colour_that_did_not_stick_is_flagged(self):
+        service = self._service()
+        service.ignore_color = True
+        result = await set_shared_drive_theme(
+            service, USER, drive_id="d1", image_file_id="img1", accent_hex="#0b2545"
+        )
+        assert "not the requested #0b2545" in result
+
+    @pytest.mark.asyncio
+    async def test_unreadable_theme_list_still_applies_the_exact_colour(self):
+        service = self._service()
+        service.about_error = _http_error(403, "forbidden")
+        result = await set_shared_drive_theme(
+            service, USER, drive_id="d1", image_file_id="img1", accent_hex="#0b2545"
+        )
+        assert service.kwargs_for("drives.update")[0]["body"]["colorRgb"] == "#0b2545"
+        assert "Nearest stock theme: unknown" in result
+
+
+# ---------------------------------------------------------------------------
+# accent on set_shared_drive_themes_from_registry
+# ---------------------------------------------------------------------------
+
+
+class TestAccentFromRegistry(TestSetThemesFromRegistry):
+    @pytest.mark.asyncio
+    async def test_per_category_accent_and_default(self):
+        service, sheets = self._setup()
+        service.themes = list(COLOUR_THEMES)
+
+        result = await self._run(
+            service,
+            sheets,
+            entity_images={
+                "JIT": {"image": "img-jit", "accent": "#c8102e"},
+                "Restricted": "img-restricted",
+            },
+            accent_hex="#0b2545",
+        )
+
+        colours = {
+            kw["driveId"]: kw["body"].get("colorRgb")
+            for kw in service.kwargs_for("drives.update")
+        }
+        assert colours == {"0AJIT": "#c8102e", "0AHR": "#0b2545"}
+        assert "Nearest stock theme: alpha_red" in result
+        assert "Nearest stock theme: zulu_blue" in result
+
+    @pytest.mark.asyncio
+    async def test_no_accent_anywhere_leaves_colours_alone(self):
+        service, sheets = self._setup()
+        await self._run(service, sheets)
+        for kw in service.kwargs_for("drives.update"):
+            assert "colorRgb" not in kw["body"]
+
+    @pytest.mark.asyncio
+    async def test_a_bad_accent_stops_the_run_before_any_drive_changes(self):
+        service, sheets = self._setup()
+        with pytest.raises(UserInputError, match="6-digit hex"):
+            await self._run(
+                service,
+                sheets,
+                entity_images={"JIT": {"image": "img-jit", "accent": "blue"}},
+            )
+        assert "drives.update" not in service.call_names()
