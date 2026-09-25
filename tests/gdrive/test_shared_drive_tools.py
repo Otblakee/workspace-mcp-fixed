@@ -188,6 +188,17 @@ class TestCreateSharedDrive:
         assert create_kwargs["requestId"]
 
     @pytest.mark.asyncio
+    async def test_reports_requested_theme_not_the_unreturned_field(self):
+        """themeId is write-only: Drive's response never includes it, so the
+        result must echo the requested theme rather than claim the default."""
+        service = FakeDrive()
+        service.drives_create_result = {"id": "0AB", "name": "X"}
+        result = await create_shared_drive(service, USER, name="X", theme_id="bok")
+        assert "theme_id: bok" in result
+        result = await create_shared_drive(service, USER, name="Y")
+        assert "theme_id: (Google default)" in result
+
+    @pytest.mark.asyncio
     async def test_dry_run_creates_nothing(self):
         service = FakeDrive()
         result = await create_shared_drive(service, USER, name="OTB-Hub", dry_run=True)
@@ -357,10 +368,12 @@ class TestListSharedDrives:
         fields = service.kwargs_for("drives.list")[0]["fields"]
         for field in ("themeId", "colorRgb", "backgroundImageLink"):
             assert field in fields
-        assert "themeId: abacus" in result
         assert "colorRgb: #1a73e8" in result
         assert "backgroundImageLink: https://lh3/banner" in result
-        assert "themeId: (custom/none)" in result
+        assert "colorRgb: (none)" in result
+        # themeId is write-only in the Drive API; showing it would always read
+        # as blank and mislabel stock-themed drives as custom.
+        assert "themeId" not in result
 
     @pytest.mark.asyncio
     async def test_drives_get_does_not_send_admin_flag_by_default(self):

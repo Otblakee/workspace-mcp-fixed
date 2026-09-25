@@ -4,6 +4,23 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.14.1] - 2026-09-25
+
+### Fixed
+
+- Shared drive banner tools no longer read `themeId` back from Drive. It is
+  write-only in the Drive API, so every drive showed "(custom/none)" and every
+  successful `set_shared_drive_theme(theme_id=...)` warned "verify the banner".
+  Found on the first live read after the 1.14.0 deploy.
+- `get_shared_drive_theme` and the before/after report now name the stock
+  theme by matching the banner image against `about.get(driveThemes)`
+  (query strings ignored); a custom image shows as "none (custom image)".
+- A theme change is verified by the drive now showing that theme's image or
+  colour.
+- `list_shared_drives` shows `colorRgb` and `backgroundImageLink` only.
+- `create_shared_drive` echoes the requested `theme_id` instead of reading
+  `themeId` from the response (which always showed "(default)").
+
 ## [1.14.0] - 2026-09-25
 
 ### Added
