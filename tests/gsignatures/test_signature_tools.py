@@ -179,6 +179,11 @@ def as_owner(monkeypatch):
     monkeypatch.setattr(
         signature_tools, "_resolve_caller_email", AsyncMock(return_value=OWNER)
     )
+    monkeypatch.setattr(
+        signature_tools,
+        "_resolve_caller_auth_path",
+        AsyncMock(return_value="fastmcp_oauth"),
+    )
 
 
 def _tool_calls():
@@ -217,15 +222,18 @@ def ledger_row_for_alice(sheets):
 class _StubContext:
     """Stands in for the FastMCP request context in the resolver tests."""
 
-    def __init__(self, value=None, error=None):
+    def __init__(self, value=None, error=None, via="fastmcp_oauth"):
         self.value = value
         self.error = error
+        self.via = via
         self.keys = []
 
     async def get_state(self, key):
         self.keys.append(key)
         if self.error is not None:
             raise self.error
+        if key == "authenticated_via":
+            return self.via
         return self.value
 
 
@@ -315,7 +323,7 @@ class TestCallerGate:
         result = await call()
         assert isinstance(result, str) and result
         assert len(runtime.build_calls) == 1
-        assert context_owner.keys == ["authenticated_user_email"]
+        assert context_owner.keys == ["authenticated_user_email", "authenticated_via"]
 
     @pytest.mark.parametrize("name,call", _tool_calls())
     @pytest.mark.asyncio
@@ -384,10 +392,88 @@ class TestCallerGate:
             "_resolve_caller_email",
             AsyncMock(return_value="Oliver@OTBGroup.co.uk"),
         )
+        monkeypatch.setattr(
+            signature_tools,
+            "_resolve_caller_auth_path",
+            AsyncMock(return_value="fastmcp_oauth"),
+        )
         assert await preview_email_signature(ALICE)
         monkeypatch.setenv(sa_auth.ENV_ADMIN_EMAILS, "someone.else@otbgroup.co.uk")
         with pytest.raises(UserInputError):
             await preview_email_signature(ALICE)
+
+
+class TestCallerAuthPath:
+    """The allowlist alone is not enough: the identity must have arrived
+    through the server's OAuth 2.1 flow. The raw bearer-token path does not
+    check the token's audience and the stdio paths carry no login at all, so
+    neither may drive a service account that can act as any user."""
+
+    @pytest.mark.asyncio
+    async def test_resolver_reads_authenticated_via_from_context(self, monkeypatch):
+        import fastmcp.server.dependencies as deps
+
+        ctx = _StubContext(value=OWNER, via="mcp_session_binding")
+        monkeypatch.setattr(deps, "get_context", lambda: ctx)
+        assert (
+            await signature_tools._resolve_caller_auth_path() == "mcp_session_binding"
+        )
+        assert ctx.keys == ["authenticated_via"]
+
+    @pytest.mark.asyncio
+    async def test_resolver_returns_none_without_a_context(self):
+        assert await signature_tools._resolve_caller_auth_path() is None
+
+    def test_accepted_paths_are_exactly_the_oauth21_ones(self):
+        assert signature_tools.ACCEPTED_AUTH_PATHS == {
+            "fastmcp_oauth",
+            "mcp_session_binding",
+        }
+
+    @pytest.mark.parametrize("name,call", _tool_calls())
+    @pytest.mark.asyncio
+    async def test_session_binding_is_accepted(
+        self, runtime, monkeypatch, ledger_row_for_alice, name, call
+    ):
+        import fastmcp.server.dependencies as deps
+
+        ctx = _StubContext(value=OWNER, via="mcp_session_binding")
+        monkeypatch.setattr(deps, "get_context", lambda: ctx)
+        result = await call()
+        assert isinstance(result, str) and result
+        assert len(runtime.build_calls) == 1
+
+    @pytest.mark.parametrize(
+        "via", ["bearer_token", "stdio_session", "stdio_single_session", None, ""]
+    )
+    @pytest.mark.parametrize("name,call", _tool_calls())
+    @pytest.mark.asyncio
+    async def test_other_paths_are_refused_before_any_client(
+        self, runtime, monkeypatch, name, call, via
+    ):
+        import fastmcp.server.dependencies as deps
+
+        ctx = _StubContext(value=OWNER, via=via)
+        monkeypatch.setattr(deps, "get_context", lambda: ctx)
+        with pytest.raises(UserInputError) as excinfo:
+            await call()
+        message = str(excinfo.value)
+        assert "OAuth 2.1" in message
+        assert (via or "unknown") in message
+        assert runtime.build_calls == []
+
+    @pytest.mark.asyncio
+    async def test_identity_is_checked_before_the_path(self, runtime, monkeypatch):
+        """A stranger on the bearer path is told 'not allowed', not the path
+        message: the identity check comes first so the messages stay stable."""
+        import fastmcp.server.dependencies as deps
+
+        ctx = _StubContext(value="mallory@otbgroup.co.uk", via="bearer_token")
+        monkeypatch.setattr(deps, "get_context", lambda: ctx)
+        with pytest.raises(UserInputError) as excinfo:
+            await preview_email_signature(ALICE)
+        assert "not allowed" in str(excinfo.value)
+        assert runtime.build_calls == []
 
 
 # ---------------------------------------------------------------------------

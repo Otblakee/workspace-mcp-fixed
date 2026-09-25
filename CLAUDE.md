@@ -728,9 +728,16 @@ signature in the tenant. So each tool's first line is
 FastMCP request context exactly as `core/audit.py` does, and
 `sa_auth.assert_caller_allowed` refuses `None`, an empty value, or any address
 not on `SIGNATURE_ADMIN_EMAILS` (default `oliver@otbgroup.co.uk`,
-case-insensitive). The gate is in the function body, not a decorator, so
-nothing can peel it off, and it runs before any client is built. The cron CLI
-has no gate because it has no caller; it is a trusted process.
+case-insensitive). The gate then reads `authenticated_via` and accepts only
+the server's OAuth 2.1 paths, `fastmcp_oauth` and `mcp_session_binding`
+(`ACCEPTED_AUTH_PATHS`). The raw `bearer_token` path in
+`auth/auth_info_middleware.py` verifies a Google access token by introspection
+without checking which application it was minted for, and the stdio paths
+take the identity from configuration, so neither may drive a service account
+that can act as any user; the rest of the server still accepts them. The gate
+is in the function body, not a decorator, so nothing can peel it off, and it
+runs before any client is built. The cron CLI has no gate because it has no
+caller; it is a trusted process.
 
 **The dry_run + confirm rule.** `set_email_signature`,
 `apply_email_signatures` and `restore_email_signature` default to

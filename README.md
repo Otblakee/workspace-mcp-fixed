@@ -1254,8 +1254,10 @@ domain-wide delegation, not on the calling user's OAuth token, because a user
 token cannot set signatures on other mailboxes or on aliases. That account can
 act as any user, so every tool first resolves the authenticated caller from the
 request context and refuses anyone not on `SIGNATURE_ADMIN_EMAILS` (default
-`oliver@otbgroup.co.uk`); no context or an empty identity is refused too. The
-service is opt-in and only loads when `TOOLS` names it:
+`oliver@otbgroup.co.uk`); no context or an empty identity is refused too, and
+so is an allowlisted address that did not arrive through the server's OAuth 2.1
+flow (a raw bearer token or a stdio session). The service is opt-in and only
+loads when `TOOLS` names it:
 
 ```bash
 TOOLS="gmail drive calendar docs sheets contacts gsignatures"

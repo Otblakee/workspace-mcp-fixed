@@ -132,7 +132,10 @@ consent prompt is unchanged: the feature requests no OAuth scope of its own.
 ## 6. Pilot on the owner
 
 Do these in order, from a connected client signed in as an address on
-`SIGNATURE_ADMIN_EMAILS`. Any other caller is refused before any Google call.
+`SIGNATURE_ADMIN_EMAILS` through the server's OAuth 2.1 connector (the normal
+claude.ai connector). Any other caller is refused before any Google call, and
+so is an allowlisted address that arrives by a raw bearer token or a stdio
+session: the tools accept only the OAuth 2.1 authentication paths.
 
 1. `preview_email_signature(user_email="oliver@otbgroup.co.uk")`. Check the
    entity, versions, name, title, mobile and the HTML. Expect the

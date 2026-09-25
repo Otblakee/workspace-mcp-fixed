@@ -121,13 +121,64 @@ async def _resolve_caller_email() -> Optional[str]:
         return None
 
 
+# Authentication paths the gate accepts. Both are FastMCP OAuth 2.1: the
+# access token FastMCP validated on the request, and the MCP session binding
+# the server derives from that token on later requests in the same session.
+#
+# Two other paths exist in auth/auth_info_middleware.py and are refused here
+# on purpose. The raw "bearer_token" path verifies a Google access token by
+# introspection without checking which application the token was minted for,
+# so a token issued to some other Google app could still name an allowlisted
+# address. The stdio paths take the identity from configuration, not from a
+# login. Neither is proof enough to drive a service account that can act as
+# any user in the tenant. The rest of the server keeps accepting them; only
+# these tools are stricter.
+ACCEPTED_AUTH_PATHS = frozenset({"fastmcp_oauth", "mcp_session_binding"})
+
+AUTH_PATH_MESSAGE = (
+    "Signature tools accept only callers authenticated through the server's "
+    "OAuth 2.1 flow (authenticated_via 'fastmcp_oauth' or "
+    "'mcp_session_binding'); this request was authenticated via '{via}'. "
+    "Connect through the OAuth 2.1 connector rather than a raw bearer token "
+    "or a stdio session."
+)
+
+
+async def _resolve_caller_auth_path() -> Optional[str]:
+    """How the middleware authenticated the caller (``authenticated_via``), or ``None``.
+
+    Kept separate from ``_resolve_caller_email`` so the identity read stays a
+    single state lookup and the path read can be judged on its own.
+    """
+    try:
+        from fastmcp.server.dependencies import get_context
+
+        ctx = get_context()
+        if ctx is None:
+            return None
+        via = await ctx.get_state("authenticated_via")
+        return via or None
+    except Exception as exc:  # no live request, or a context API change
+        logger.debug("signature tools: no auth path in context (%s)", exc)
+        return None
+
+
 async def _require_allowed_caller() -> str:
-    """Refuse unless the request carries an allowlisted identity."""
+    """Refuse unless the request carries an allowlisted identity that arrived
+    through an accepted authentication path.
+
+    Order matters for the messages the caller sees: identity first (missing
+    or not allowlisted), then the path. Both checks run before any Google
+    client is built.
+    """
     email = await _resolve_caller_email()
     try:
         assert_caller_allowed(email)
     except SignatureAuthError as exc:
         raise UserInputError(str(exc)) from exc
+    via = await _resolve_caller_auth_path()
+    if via not in ACCEPTED_AUTH_PATHS:
+        raise UserInputError(AUTH_PATH_MESSAGE.format(via=via or "unknown"))
     return (email or "").strip().lower()
 
 
