@@ -347,3 +347,32 @@ code keeps failing closed on it.
 **Scope note:** this needs `admin.directory.user.readonly`, which is already in
 `ADMIN_SCOPES` alongside the group-read scopes the check was using. **No
 consent-screen change and no Render env change.**
+
+## Shared drive banners — live checks (v1.14.0)
+
+Unit-scope only so far. Before branding the estate:
+
+1. `get_shared_drive_theme` on a scratch drive; confirm the three fields.
+2. `set_shared_drive_theme(theme_id=...)` on the scratch drive; confirm the
+   theme list check and the before/after.
+3. Upload a 1920x216 PNG; `set_shared_drive_theme(image_file_id=...)`; confirm
+   the banner in the Drive UI and that `themeId` clears.
+4. Repeat 3 as a non-Manager admin to prove the `useDomainAdminAccess`
+   fallback, and as a non-Manager non-admin to prove the refusal.
+5. `set_shared_drive_themes_from_registry(..., dry_run=True)` against the live
+   registry; check every drive's category and reason before a real run.
+6. Confirm whether `imageMediaMetadata.width/height` reflect EXIF rotation.
+   The crop maths assumes they are the displayed orientation.
+
+Open question for the registry mapping: the live `hub` column is TRUE/FALSE
+per folder. If it means "surface this folder in the hub" rather than "this is
+the hub drive", the `hub` flag precedence will mislabel drives as Hub. The
+dry run shows the reason per drive; adjust `classify_registry_drive` if so.
+
+## `rebuild_hub` defaults do not match the live Folder Registry
+
+Found while building the banner tools (2026-09-25). The live registry's tab is
+`FolderRegistry` (no space) and it has a boolean `hub` column, not a
+`hub_section` column. `rebuild_hub` defaults `registry_range="Folder Registry"`
+and requires `hub_section`, so it would fail against the live sheet as it
+stands. Either add `hub_section` to the registry or change the tool.

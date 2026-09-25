@@ -90,7 +90,7 @@ async def _revoke_lock_for(target_id: str) -> asyncio.Lock:
 
 
 _DRIVE_FIELDS = (
-    "id, name, themeId, colorRgb, createdTime, hidden, "
+    "id, name, themeId, colorRgb, backgroundImageLink, createdTime, hidden, "
     "restrictions(adminManagedRestrictions, copyRequiresWriterPermission, "
     "domainUsersOnly, driveMembersOnly, sharingFoldersRequiresOrganizerPermission)"
 )
@@ -100,11 +100,22 @@ _PERMISSION_FIELDS = (
 )
 
 
-async def _get_shared_drive(service, drive_id: str) -> Optional[Dict[str, Any]]:
+async def _get_shared_drive(
+    service,
+    drive_id: str,
+    *,
+    use_domain_admin_access: bool = False,
+    fields: str = _DRIVE_FIELDS,
+) -> Optional[Dict[str, Any]]:
     """Return the shared drive resource for ``drive_id``, or None if it is a file."""
+    params: Dict[str, Any] = {"driveId": drive_id, "fields": fields}
+    # Only sent when set, so existing callers issue exactly the request they
+    # always did.
+    if use_domain_admin_access:
+        params["useDomainAdminAccess"] = True
     try:
         return await execute_with_backoff(
-            lambda: service.drives().get(driveId=drive_id, fields=_DRIVE_FIELDS),
+            lambda: service.drives().get(**params),
             label="drives.get",
         )
     except HttpError as error:
@@ -610,7 +621,9 @@ async def list_shared_drives(
         max_results (int): Cap on returned drives. Defaults to 100.
 
     Returns:
-        str: One line per shared drive with its ID, name and restrictions.
+        str: One line per shared drive with its ID, name, restrictions and
+            theme (themeId, colorRgb, backgroundImageLink). The image link is
+            short-lived, so fetch it fresh rather than storing it.
     """
     if max_results < 1:
         raise UserInputError("max_results must be at least 1.")
@@ -641,7 +654,14 @@ async def list_shared_drives(
         active = [k for k, v in restrictions.items() if v]
         suffix = f" | restrictions: {', '.join(active)}" if active else ""
         hidden = " | hidden" if drive.get("hidden") else ""
-        lines.append(f"- {drive.get('name')} (ID: {drive.get('id')}){hidden}{suffix}")
+        theme = (
+            f" | themeId: {drive.get('themeId') or '(custom/none)'}"
+            f" | colorRgb: {drive.get('colorRgb') or '(none)'}"
+            f" | backgroundImageLink: {drive.get('backgroundImageLink') or '(none)'}"
+        )
+        lines.append(
+            f"- {drive.get('name')} (ID: {drive.get('id')}){hidden}{suffix}{theme}"
+        )
     if len(drives) == max_results:
         lines.append(
             f"⚠️ Result capped at max_results={max_results}; more drives may exist."

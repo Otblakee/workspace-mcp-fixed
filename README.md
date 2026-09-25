@@ -1124,6 +1124,44 @@ Optional guardrail: set `DRIVE_PERMISSION_ALLOWED_DOMAINS` (comma-separated,
 e.g. `otbgroup.co.uk`) to refuse permission grants to principals outside those
 domains. Unset means no domain restriction.
 
+### Shared drive banners <sub>[`shared_drive_theme_tools.py`](gdrive/shared_drive_theme_tools.py)</sub>
+
+Consistent entity branding across every OTB Group shared drive.
+
+| Tool | Description |
+|------|-------------|
+| `get_shared_drive_theme` | Returns a drive's `themeId`, `colorRgb` and `backgroundImageLink`, and whether the caller can change it |
+| `set_shared_drive_theme` | Sets the banner from a Google stock `theme_id` **or** a JPG/PNG `image_file_id` (exactly one). Optional crop (`x_coordinate`, `y_coordinate`, `width`); defaults to the largest centred 80:9 area. Returns before/after. `dry_run` supported |
+| `set_shared_drive_themes_from_registry` | Bulk: reads the Folder Registry and applies `entity_images` (`OTB`, `JIT`, `VALE`, `BIR`, `Restricted`, `Hub`, `ExternalShare` → image file ID) to every drive. `dry_run` supported |
+
+`list_shared_drives` now also shows `themeId`, `colorRgb` and
+`backgroundImageLink` for each drive.
+
+**Access.** A drive Manager changes the banner as a member (checked via
+`capabilities.canChangeDriveBackground`). If the caller is not a Manager,
+the tools try `useDomainAdminAccess` automatically and refuse if that fails.
+Pass `use_domain_admin_access=True` or `False` to force one mode.
+
+**Images.** Google crops the banner at a fixed 80:9 ratio and needs the
+cropped area to be at least 1280x144 px. Use 1920x216 px (or larger, same
+ratio) so the default crop is the whole image. Images are checked for type
+(JPG/PNG), trash state and size before anything changes.
+
+**Registry mapping.** One row per folder; each drive is taken from its
+`depth` 0 row (its `folder_id` is the drive ID). Category precedence:
+`restricted` flag → Restricted, `external` flag → ExternalShare, `hub`
+flag → Hub, otherwise the `entity` column. Run with `dry_run=True` first: each
+drive line shows the category and the reason it was chosen. Default
+`registry_range` is `FolderRegistry` (the live tab name).
+
+```text
+set_shared_drive_themes_from_registry(
+  registry_spreadsheet_id="<Folder Registry ID>",
+  entity_images={"OTB": "<id>", "JIT": "<id>", "VALE": "<id>", "BIR": "<id>",
+                 "Restricted": "<id>", "Hub": "<id>", "ExternalShare": "<id>"},
+  dry_run=True)
+```
+
 ### Migration engine <sub>[`drive_migration_tools.py`](gdrive/drive_migration_tools.py)</sub>
 
 | Tool | Description |

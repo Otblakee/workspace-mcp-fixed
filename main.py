@@ -288,14 +288,15 @@ def main():
     tool_imports = {
         "gmail": lambda: import_module("gmail.gmail_tools"),
         # Drive spans several modules: the original tool set plus the
-        # shared-drive/permission/shortcut tools and the migration engine.
-        # All three must import for the "drive" service to be complete.
+        # shared-drive/permission/shortcut tools, the migration engine and the
+        # shared-drive banner tools. All four must import for the "drive" service to be complete.
         "drive": lambda: [
             import_module(name)
             for name in (
                 "gdrive.drive_tools",
                 "gdrive.shared_drive_tools",
                 "gdrive.drive_migration_tools",
+                "gdrive.shared_drive_theme_tools",
             )
         ],
         "calendar": lambda: import_module("gcalendar.calendar_tools"),
