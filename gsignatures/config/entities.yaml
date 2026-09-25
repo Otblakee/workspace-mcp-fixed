@@ -1,0 +1,128 @@
+# Entity configuration for centrally managed Gmail signatures.
+#
+# IMPORTANT: the statutory values below (legal_name, company_number,
+# vat_number, registered_office) were seeded from the OTB branding reference
+# on 2026-09-25 and have NOT been verified against Companies House. Every
+# entity therefore carries statutory_verified: false. Verify each one against
+# https://find-and-update.company-information.service.gov.uk/ before go-live
+# and only then flip the flag.
+#
+# registered_office was seeded from the trading footer address in the
+# branding reference. A company's registered office can differ from its
+# trading address, so check this field in particular.
+#
+# Rules are an ordered list: the first match wins. Suspended and archived
+# users, and users in an excluded OU, are skipped before any rule is tried.
+version: 1
+
+defaults:
+  place_of_registration: England and Wales
+  required_fields: [name, title]
+  optional_fields: [mobile]
+
+rules:
+  # /99 _SYSTEM as a whole is not excluded because the AHWE mailbox lives in
+  # /99 _SYSTEM/Personal and is managed by its domain rule below. Only the
+  # sub-OUs that hold service and break-glass accounts are excluded.
+  exclude_ou_prefixes:
+    - "/99 _SYSTEM/BREAKGLASS"
+    - "/99 _SYSTEM/_Suspended"
+    - "/Workspace Guests"
+  # Personal-domain aliases are never given a company signature.
+  skip_alias_domains:
+    - blakefamily.uk
+  primary:
+    # The AHWE domain rule sits ahead of every OU rule on purpose.
+    - match: {primary_domain: arthistorywithemily.co.uk}
+      entity: AHWE
+    - match: {ou_prefix: "/01 OTB"}
+      entity: OTB
+    - match: {ou_prefix: "/02 JIT"}
+      entity: JIT
+    - match: {ou_prefix: "/03 VALE"}
+      entity: VALE
+    - match: {ou_prefix: "/04 BIR"}
+      entity: BIR
+
+entities:
+  OTB:
+    legal_name: OTB Group Limited
+    trading_name: OTB Group
+    legal_form: limited_company
+    company_number: "15732792"
+    vat_number: "494870441"
+    registered_office: Distribution House, Building 83, Harby Road, Langar, Nottingham NG13 9HY
+    phone: "+44 (0)1949 861514"
+    website: otbgroup.co.uk
+    email: info@otbgroup.co.uk
+    domains: [otbgroup.co.uk]
+    group_branding: true
+    template_version: 1.0.0
+    statutory_version: 1.0.0
+    statutory_verified: false
+
+  JIT:
+    legal_name: JIT Logistics Ltd
+    trading_name: JIT Logistics
+    legal_form: limited_company
+    company_number: "03281238"
+    vat_number: "401 546 685"
+    registered_office: Distribution House, Building 83, Harby Road, Langar, Nottingham NG13 9HY
+    phone: "+44 (0)1949 861514"
+    website: jit-logistics.com
+    email: office.admin@jit-logistics.com
+    domains: [jit-logistics.com]
+    group_branding: true
+    template_version: 1.0.0
+    statutory_version: 1.0.0
+    statutory_verified: false
+
+  VALE:
+    legal_name: Vale Automotive Ltd
+    trading_name: Vale Automotive
+    legal_form: limited_company
+    company_number: "13811748"
+    vat_number: "407 620 713"
+    registered_office: Building 83, Langar Industrial Estate, Harby Road, Nottingham NG13 9HY
+    phone: "01949 33235"
+    website: valeautomotive.co.uk
+    email: enquiries@valeautomotive.co.uk
+    domains: [valeautomotive.co.uk]
+    group_branding: true
+    template_version: 1.0.0
+    statutory_version: 1.0.0
+    statutory_verified: false
+
+  BIR:
+    legal_name: BIR Developments Ltd
+    trading_name: BIR Developments
+    legal_form: limited_company
+    company_number: "13838584"
+    vat_number: "438 1748 74"
+    registered_office: Building 83, Langar Industrial Estate, Harby Road, Nottingham NG13 9HY
+    phone: "+44 (0)1949 861701"
+    website: bir-d.co.uk
+    email: info@bir-d.co.uk
+    domains: [bir-d.co.uk]
+    group_branding: true
+    template_version: 1.0.0
+    statutory_version: 1.0.0
+    statutory_verified: false
+
+  # Ring-fenced: its own templates, no group branding, and nothing in this
+  # block or its templates refers to the group companies.
+  AHWE:
+    legal_name: Art History with Emily
+    trading_name: Art History with Emily
+    legal_form: unknown
+    company_number: null
+    registered_office: null
+    vat_number: null
+    phone: null
+    website: arthistorywithemily.co.uk
+    email: null
+    domains: [arthistorywithemily.co.uk]
+    group_branding: false
+    template_version: 1.0.0
+    statutory_version: 1.0.0
+    statutory_verified: false

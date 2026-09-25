@@ -137,6 +137,15 @@ def filter_server_tools(server):
             if hasattr(tool_obj, "fn"):
                 func_to_check = tool_obj.fn
 
+            # Tools that write without an OAuth scope (the gsignatures write
+            # tools run on a delegated service account) mark themselves.
+            if getattr(func_to_check, "_workspace_write_tool", False):
+                logger.info(
+                    f"Read-only mode: Disabling tool '{tool_name}' (marked as a write tool)"
+                )
+                tools_to_remove.add(tool_name)
+                continue
+
             required_scopes = getattr(func_to_check, "_required_google_scopes", [])
 
             if required_scopes:

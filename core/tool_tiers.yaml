@@ -260,3 +260,22 @@ gadmin_write:
     - remove_group_member
   extended: []
   complete: []
+
+# Centrally managed Gmail signatures (opt-in service, OPT_IN_TOOLS in main.py).
+#
+# These tools do NOT use the calling user's OAuth token. A service account
+# with domain-wide delegation (gsignatures/sa_auth.py) acts as each user for
+# Gmail settings and as the configured admin for Directory reads, and every
+# tool refuses callers not on SIGNATURE_ADMIN_EMAILS. Writes default to a dry
+# run and a live write needs dry_run=False and confirm=True. See
+# gsignatures/RUNBOOK.md before enabling.
+gsignatures:
+  core:
+    - preview_email_signature
+    - get_email_signatures
+    - set_email_signature
+    - apply_email_signatures
+    - audit_email_signatures
+    - restore_email_signature
+  extended: []
+  complete: []
