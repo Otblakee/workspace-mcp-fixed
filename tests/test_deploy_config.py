@@ -182,3 +182,18 @@ class TestRenderDiskEntrypoint:
 
         mode = (REPO_ROOT / "entrypoint.sh").stat().st_mode
         assert mode & stat.S_IXUSR, "entrypoint.sh must be executable"
+
+
+class TestOAuthProxyDiskStorage:
+    """The OAuth proxy's disk backend needs the ``disk`` extra of
+    py-key-value-aio. Without it the server logs a warning and silently
+    falls back to in-memory storage, so every deploy forgets the tokens the
+    connected clients hold even though the credentials directory is on the
+    persistent disk (seen live on 2026-09-25)."""
+
+    def test_disk_extra_is_a_base_dependency(self):
+        pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+        assert '"py-key-value-aio[disk]>=' in pyproject
+
+    def test_disk_store_imports(self):
+        from key_value.aio.stores.disk import DiskStore  # noqa: F401
