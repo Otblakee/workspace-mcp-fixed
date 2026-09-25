@@ -1,6 +1,7 @@
 import functools
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import List, Optional
 from importlib import metadata
 
@@ -72,12 +73,29 @@ class SecureFastMCP(FastMCP):
         the FastMCP session_id; that path stays intact.
         """
         app = super().http_app(**kwargs)
-        app.add_event_handler("startup", _ensure_audit_started)
+        # Wrap the ASGI lifespan FastMCP installed rather than registering
+        # Starlette startup/shutdown event handlers. Starlette 1.x (pulled in
+        # by FastMCP 4) removed ``add_event_handler``; on Starlette 0.x the
+        # handlers were silently ignored anyway because FastMCP always sets
+        # its own lifespan, so only the lazy per-tool start ever ran. The
+        # wrapper starts the audit flusher before the MCP session manager
+        # comes up and drains it after the session manager has shut down.
         # Graceful-shutdown drain: Render sends SIGTERM on every redeploy;
-        # uvicorn translates that into Starlette's shutdown event. Without
-        # this hook, up to AUDIT_FLUSH_INTERVAL_S of queued audit rows plus
-        # any backlog were silently dropped on each deploy.
-        app.add_event_handler("shutdown", _ensure_audit_stopped)
+        # uvicorn turns that into the lifespan shutdown. Without the drain,
+        # up to AUDIT_FLUSH_INTERVAL_S of queued audit rows plus any backlog
+        # would be dropped on each deploy.
+        inner_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan_with_audit(asgi_app):
+            await _ensure_audit_started()
+            try:
+                async with inner_lifespan(asgi_app) as state:
+                    yield state
+            finally:
+                await _ensure_audit_stopped()
+
+        app.router.lifespan_context = lifespan_with_audit
         return app
 
 
