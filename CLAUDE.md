@@ -632,6 +632,13 @@ directory.
 The server process never runs as root. Override the mount path with
 `WORKSPACE_DATA_DIR` if a deployment ever mounts elsewhere.
 
+**v1.15.1:** the proxy's disk backend also needs the `disk` extra of
+`py-key-value-aio` (now a base dependency). Without it the server warns
+"Disk storage requested but dependencies not available", keeps the proxy's
+tokens in memory, and every deploy still logs every client out even with
+the credentials directory on `/data`. If that warning ever reappears in the
+start-up log, the disk is not doing its job.
+
 Order of operations on Render: attach the disk, then set the four `/data`
 env vars from `render.yaml`. Setting the env vars without the disk makes the
 app try to create `/data` on the container filesystem as `app`, which fails.

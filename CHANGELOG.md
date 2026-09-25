@@ -4,6 +4,19 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.15.1] - 2026-09-25
+
+### Fixed
+
+- The OAuth 2.1 proxy now really persists its state on the Render disk.
+  `WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=disk` needs the `disk` extra of
+  `py-key-value-aio`; the image did not have it, so the server logged
+  "Disk storage requested but dependencies not available" and fell back to
+  in-memory storage. The Google credentials were on `/data`, but the tokens
+  the connected clients hold were not, so every deploy still logged them
+  out. The extra is now a base dependency and
+  `tests/test_deploy_config.py::TestOAuthProxyDiskStorage` pins it.
+
 ## [1.15.0] - 2026-09-25
 
 ### Added
