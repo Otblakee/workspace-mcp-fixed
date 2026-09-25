@@ -3,8 +3,11 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install system dependencies
+# gosu lets the entrypoint start as root (to own the Render disk mount) and
+# then drop to the non-root "app" user before running the server.
 RUN apt-get update && apt-get install -y \
     curl \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for faster dependency management
@@ -22,9 +25,12 @@ RUN useradd --create-home --shell /bin/bash app \
 # Give read and write access to the store_creds volume
 RUN mkdir -p /app/store_creds \
     && chown -R app:app /app/store_creds \
-    && chmod 755 /app/store_creds
+    && chmod 755 /app/store_creds \
+    && chmod +x /app/entrypoint.sh
 
-USER app
+# No USER instruction: the container starts as root so entrypoint.sh can
+# hand a root-owned persistent disk (/data) to "app", then it drops to
+# "app" with gosu. The server never runs as root.
 
 # Expose port (use default of 8000 if PORT not set)
 EXPOSE 8000
@@ -52,6 +58,7 @@ ENV TOOLS=""
 # every cold start.
 ENV UV_NO_SYNC=1
 
-# Use entrypoint for the base command and CMD for args
-ENTRYPOINT ["/bin/sh", "-c"]
+# entrypoint.sh fixes disk ownership (if /data is mounted), drops to "app",
+# and runs CMD through /bin/sh -c so the env expansions below still work.
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
