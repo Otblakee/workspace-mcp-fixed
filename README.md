@@ -1234,6 +1234,43 @@ it. The read-only `gadmin` service is unaffected and still requests readonly
 Directory scopes only — that separation is enforced by
 `tests/test_admin_readonly.py`.
 
+### Gmail signatures (opt-in) <sub>[`signature_tools.py`](gsignatures/signature_tools.py)</sub>
+
+Centrally managed Gmail signatures for every send-as address in the tenant,
+rendered from per-entity templates and Directory data, with a ledger Sheet
+as the record of every apply.
+
+| Tool | Description |
+|------|-------------|
+| `preview_email_signature` | Renders one user's signature (primary or a named send-as) without writing: entity, versions, Directory fields, HTML |
+| `get_email_signatures` | One block per send-as address: flags, current signature hash, entity or skip reason, expected versions, drift against the ledger |
+| `set_email_signature` | Sets one send-as address (the primary by default). Dry run by default; live needs `dry_run=False` and `confirm=True` |
+| `apply_email_signatures` | Same across exactly one scope (OU, domain or group). Dry run by default; refuses scopes above `max_users`; JSONL report |
+| `audit_email_signatures` | Compares every send-as in a scope with the ledger. Never writes a signature; optional `Audit_<date>` tab |
+
+**Gating rule.** The feature runs on a Google service account with
+domain-wide delegation, not on the calling user's OAuth token, because a user
+token cannot set signatures on other mailboxes or on aliases. That account can
+act as any user, so every tool first resolves the authenticated caller from the
+request context and refuses anyone not on `SIGNATURE_ADMIN_EMAILS` (default
+`oliver@otbgroup.co.uk`); no context or an empty identity is refused too. The
+service is opt-in and only loads when `TOOLS` names it:
+
+```bash
+TOOLS="gmail drive calendar docs sheets contacts gsignatures"
+```
+
+Delegation is granted for exactly three scopes (`gmail.settings.basic`,
+`admin.directory.user.readonly`, `admin.directory.group.member.readonly`);
+`gmail.settings.sharing`, which also covers forwarding and mailbox delegation,
+is never granted. The weekly audit is a Render cron running
+`python -m gsignatures.audit_cli --all`; it audits only and exits 2 on drift.
+
+Set-up steps, pilot sequence, cron schedule, rollback and key rotation are in
+[`gsignatures/RUNBOOK.md`](gsignatures/RUNBOOK.md). The template brief
+(placeholders, layout rules, what Gmail's sanitiser keeps) is in
+[`gsignatures/TEMPLATES.md`](gsignatures/TEMPLATES.md).
+
 ---
 
 ### Connect to Claude Desktop

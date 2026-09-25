@@ -4,6 +4,61 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.15.0] - 2026-09-25
+
+### Added
+
+- Centrally managed Gmail signatures: opt-in service `gsignatures` with five
+  tools. `preview_email_signature` and `get_email_signatures` read;
+  `set_email_signature` and `apply_email_signatures` write, dry run by
+  default, and a live write needs `dry_run=False` together with
+  `confirm=True`; `audit_email_signatures` compares every send-as address
+  in a scope with the ledger and never writes a signature. Scopes are exactly
+  one of OU, domain or group (or `all_users` for audits); a scope larger
+  than `max_users` is refused with the count.
+- `python -m gsignatures.audit_cli` for the weekly Render cron: exit 0 when
+  every managed address matches the ledger, 2 on any drift, 1 on a fatal
+  error. Audits only; never re-applies.
+- The service uses a Google service account with domain-wide delegation
+  (`gsignatures/sa_auth.py`), never the user's OAuth token. Delegation
+  scopes are exactly `gmail.settings.basic`,
+  `admin.directory.user.readonly` and
+  `admin.directory.group.member.readonly`; `gmail.settings.sharing` is
+  deliberately not granted. Every tool refuses callers not on
+  `SIGNATURE_ADMIN_EMAILS` (default `oliver@otbgroup.co.uk`) before any
+  Google call.
+- New env vars, all read by the feature only: `SIGNATURE_SERVICE_ACCOUNT_FILE`
+  (or `SIGNATURE_SERVICE_ACCOUNT_JSON`), `SIGNATURE_DIRECTORY_ADMIN`,
+  `SIGNATURE_ADMIN_EMAILS`, `SIGNATURE_LEDGER_SHEET_ID`. None is printed at
+  start-up.
+- Ledger Sheet (`OTB_LOG_SignatureLedger_2026-09-25_v1`): one row per live
+  apply with the hash Gmail returned after the write and the previous
+  signature HTML; audit runs write an `Audit_<date>` tab.
+- Wiring: `gsignatures` in `OPT_IN_TOOLS`, `tool_imports`, `tool_icons` and
+  the `--tools` choices in `main.py`; a `gsignatures` section in
+  `core/tool_tiers.yaml` (all five at the core tier); empty entries in
+  `TOOL_SCOPES_MAP` and `TOOL_READONLY_SCOPES_MAP`; `gsignatures` in the
+  audit logger's module map.
+
+### Deploy notes
+
+- Follow `gsignatures/RUNBOOK.md` in order: service account (no IAM roles),
+  domain-wide delegation with the three scopes, the ledger Sheet shared with
+  the service account, the Render environment group `signatures` (secret
+  file plus four variables) attached to the web service and the cron, then
+  add `gsignatures` to `TOOLS`. The service never loads unless `TOOLS` names
+  it. No OAuth consent screen change, no new pip dependency.
+- Pilot on the owner first (`preview`, dry run, live on the primary and one
+  alias), then roll out by OU with dry runs and kept result tables.
+
+### Rollback
+
+- Drop `gsignatures` from `TOOLS` and redeploy to remove the tools. Delete
+  the domain-wide delegation entry to kill the capability outright. The
+  ledger's `previous_signature_html` column restores any signature by hand;
+  reverting the template versions in git and re-running restores them in
+  bulk.
+
 ## [1.14.3] - 2026-09-25
 
 ### Fixed

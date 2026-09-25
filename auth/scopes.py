@@ -299,6 +299,12 @@ TOOL_SCOPES_MAP = {
     # Opt-in group-write service. Separate from "gadmin" so enabling the
     # read-only admin tools never requests a write scope.
     "gadmin_write": ADMIN_WRITE_SCOPES,
+    # Managed Gmail signatures. This service uses a delegated service
+    # account (gsignatures/sa_auth.py), never the user's OAuth token, so it
+    # adds nothing to the consent screen. Its Google access is granted in the
+    # Admin console as domain-wide delegation for gsignatures.sa_auth.
+    # DELEGATED_SCOPES, not here.
+    "gsignatures": [],
 }
 
 # Tool-to-read-only-scopes mapping
@@ -320,6 +326,9 @@ TOOL_READONLY_SCOPES_MAP = {
         ADMIN_DIRECTORY_GROUP_READONLY_SCOPE,
         ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE,
     ],
+    # Managed Gmail signatures: delegated service account, never the user's
+    # OAuth token (see TOOL_SCOPES_MAP). Nothing to request in either mode.
+    "gsignatures": [],
     "search": CUSTOM_SEARCH_SCOPES,
     "appscript": [
         SCRIPT_PROJECTS_READONLY_SCOPE,
