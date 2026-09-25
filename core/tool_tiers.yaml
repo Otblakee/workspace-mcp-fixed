@@ -53,6 +53,10 @@ drive:
     - batch_copy_from_manifest
     - reconcile_folders
     - rebuild_hub
+    # Shared drive banners (entity branding).
+    - get_shared_drive_theme
+    - set_shared_drive_theme
+    - set_shared_drive_themes_from_registry
   complete:
     - get_drive_file_permissions
     - check_drive_file_public_access

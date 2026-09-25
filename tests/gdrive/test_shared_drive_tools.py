@@ -337,6 +337,40 @@ class TestListSharedDrives:
         assert "driveMembersOnly" in result
 
     @pytest.mark.asyncio
+    async def test_lists_theme_fields(self):
+        service = FakeDrive()
+        service.drives_list_result = {
+            "drives": [
+                {
+                    "id": "d1",
+                    "name": "JIT-Operations",
+                    "themeId": "abacus",
+                    "colorRgb": "#1a73e8",
+                    "backgroundImageLink": "https://lh3/banner",
+                },
+                {"id": "d2", "name": "BIR-Site"},
+            ]
+        }
+
+        result = await list_shared_drives(service, USER)
+
+        fields = service.kwargs_for("drives.list")[0]["fields"]
+        for field in ("themeId", "colorRgb", "backgroundImageLink"):
+            assert field in fields
+        assert "themeId: abacus" in result
+        assert "colorRgb: #1a73e8" in result
+        assert "backgroundImageLink: https://lh3/banner" in result
+        assert "themeId: (custom/none)" in result
+
+    @pytest.mark.asyncio
+    async def test_drives_get_does_not_send_admin_flag_by_default(self):
+        """Existing callers must keep issuing exactly the request they did."""
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "X"}
+        await shared_drive_tools._get_shared_drive(service, "d1")
+        assert "useDomainAdminAccess" not in service.kwargs_for("drives.get")[0]
+
+    @pytest.mark.asyncio
     async def test_empty_result_is_reported_clearly(self):
         result = await list_shared_drives(FakeDrive(), USER)
         assert "No shared drives found" in result

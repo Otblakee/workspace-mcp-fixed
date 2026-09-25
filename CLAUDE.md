@@ -613,3 +613,34 @@ Record real numbers in `FOLLOWUPS.md` after the first live pilot.
 The suite is unit-scope with mocked Google services. Before the architecture
 build runs for real, execute the scratch-shared-drive checks listed in
 `FOLLOWUPS.md` under "Live scratch-drive verification".
+
+## Shared drive banners (claude/serene-keller-mej65i, v1.14.0)
+
+New module `gdrive/shared_drive_theme_tools.py`, tests in
+`tests/gdrive/test_shared_drive_theme_tools.py`. Three tools, all at the
+`extended` tier: `get_shared_drive_theme`, `set_shared_drive_theme`,
+`set_shared_drive_themes_from_registry`. `list_shared_drives` now also prints
+`themeId`, `colorRgb`, `backgroundImageLink`.
+
+API facts (from the Drive v3 discovery doc bundled with googleapiclient):
+`themeId` and `backgroundImageFile` are mutually exclusive on one
+`drives.update`; `backgroundImageFile` needs all of `id`, `xCoordinate`,
+`yCoordinate`, `width` (fractions 0 to 1); crop height is fixed at 80:9 and
+the crop must be at least 1280x144 px; `backgroundImageLink` is short-lived.
+
+Access: `capabilities.canChangeDriveBackground` is the Manager check. With
+`use_domain_admin_access` unset the tool falls back to domain-admin access
+when the caller is not a Manager; `False` forbids the fallback, `True` forces
+admin mode. The post-update re-read uses the same mode as the update.
+
+Bulk mapping: one entry per `drive` value, ID from its `depth` 0 row.
+Category precedence `restricted` > `external` > `hub` > `entity`. Every image
+is validated before any drive is touched; per-drive failures are recorded and
+the run continues. Reuses `_hub_registry_service` / `_read_registry_rows` from
+the migration module. Default `registry_range` is `FolderRegistry` (the live
+tab name), not `Folder Registry`.
+
+Audit: no bespoke audit call. Rows go to the MCP audit log through the
+`core/audit.py` decorator like every other tool; `drive_id` and
+`registry_spreadsheet_id` are already in `_resource_id`'s key list. The
+module never deletes or shares (asserted by a source scan).

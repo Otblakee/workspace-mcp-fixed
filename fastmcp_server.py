@@ -143,6 +143,7 @@ import gmail.gmail_tools
 import gdrive.drive_tools
 import gdrive.shared_drive_tools
 import gdrive.drive_migration_tools
+import gdrive.shared_drive_theme_tools
 import gcalendar.calendar_tools
 import gdocs.docs_tools
 import gsheets.sheets_tools
