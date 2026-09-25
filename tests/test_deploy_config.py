@@ -129,3 +129,56 @@ class TestDeclaredDependencies:
 class TestGmailTestPackage:
     def test_init_exists(self):
         assert (REPO_ROOT / "tests" / "gmail" / "__init__.py").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Render disk ownership (Dockerfile + entrypoint.sh)
+#
+# Render mounts a persistent disk owned by root while the app runs as the
+# non-root "app" user. The container must therefore start as root, hand the
+# mount to "app" in entrypoint.sh, then drop privileges with gosu. These
+# tests pin that contract so a later Dockerfile tidy-up cannot quietly
+# reintroduce a USER instruction and crash-loop the service on first boot
+# with a disk attached.
+# ---------------------------------------------------------------------------
+
+
+class TestRenderDiskEntrypoint:
+    def _dockerfile(self) -> str:
+        return (REPO_ROOT / "Dockerfile").read_text()
+
+    def _entrypoint(self) -> str:
+        return (REPO_ROOT / "entrypoint.sh").read_text()
+
+    def test_dockerfile_uses_the_entrypoint_script(self):
+        assert 'ENTRYPOINT ["/app/entrypoint.sh"]' in self._dockerfile()
+
+    def test_dockerfile_installs_gosu(self):
+        assert "gosu" in self._dockerfile()
+
+    def test_dockerfile_has_no_user_instruction(self):
+        lines = [
+            line.strip()
+            for line in self._dockerfile().splitlines()
+            if line.strip().startswith("USER ")
+        ]
+        assert lines == [], f"USER instruction would break the disk hand-over: {lines}"
+
+    def test_cmd_still_expands_tools_and_tier(self):
+        dockerfile = self._dockerfile()
+        assert "${TOOL_TIER:+--tool-tier" in dockerfile
+        assert "${TOOLS:+--tools $TOOLS}" in dockerfile
+
+    def test_entrypoint_hands_the_disk_to_app_and_drops_privileges(self):
+        script = self._entrypoint()
+        assert script.startswith("#!/bin/sh")
+        assert "chown -R" in script
+        assert 'exec gosu "$APP_USER" /bin/sh -c "$*"' in script
+        # The non-root branch must still run the command.
+        assert 'exec /bin/sh -c "$*"' in script
+
+    def test_entrypoint_is_executable_in_git(self):
+        import stat
+
+        mode = (REPO_ROOT / "entrypoint.sh").stat().st_mode
+        assert mode & stat.S_IXUSR, "entrypoint.sh must be executable"

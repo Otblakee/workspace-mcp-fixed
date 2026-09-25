@@ -614,6 +614,28 @@ The suite is unit-scope with mocked Google services. Before the architecture
 build runs for real, execute the scratch-shared-drive checks listed in
 `FOLLOWUPS.md` under "Live scratch-drive verification".
 
+## Render disk and container start-up (v1.14.3)
+
+The live `otb-workspace-mcp` service was created by hand and never had the
+disk that `render.yaml` describes, so OAuth tokens and attachments lived in
+the container and were wiped on every deploy (each deploy logged every
+connected client out). Attaching the disk exposed a second problem: Render
+mounts it owned by root, the server runs as `app`, and the start-up
+permission check in `core/utils.py` raises on an unwritable credentials
+directory.
+
+`entrypoint.sh` fixes that: the container starts as root, hands `/data` to
+`app` when the mount exists and is not already owned by `app`, then drops to
+`app` with `gosu` and runs CMD through `/bin/sh -c` so `${TOOL_TIER}` and
+`${TOOLS}` still expand. The Dockerfile has no `USER` instruction any more;
+`tests/test_deploy_config.py::TestRenderDiskEntrypoint` pins the contract.
+The server process never runs as root. Override the mount path with
+`WORKSPACE_DATA_DIR` if a deployment ever mounts elsewhere.
+
+Order of operations on Render: attach the disk, then set the four `/data`
+env vars from `render.yaml`. Setting the env vars without the disk makes the
+app try to create `/data` on the container filesystem as `app`, which fails.
+
 ## Shared drive banners (claude/serene-keller-mej65i, v1.14.0)
 
 New module `gdrive/shared_drive_theme_tools.py`, tests in

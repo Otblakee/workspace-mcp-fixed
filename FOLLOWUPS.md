@@ -348,6 +348,14 @@ code keeps failing closed on it.
 `ADMIN_SCOPES` alongside the group-read scopes the check was using. **No
 consent-screen change and no Render env change.**
 
+## Render persistent disk (found 2026-09-25)
+
+The live service has no disk despite `render.yaml`, so every deploy logs
+every connected client out. v1.14.3 ships the entrypoint that makes a
+root-owned disk usable. Still to do in the dashboard: attach a 1 GB disk at
+`/data`, then set the four `/data` env vars, then sign in once more. Also
+still unset: a health check path (`/health` exists and is unauthenticated).
+
 ## Shared drive banners — live checks (v1.14.0)
 
 Unit-scope only so far. Before branding the estate:

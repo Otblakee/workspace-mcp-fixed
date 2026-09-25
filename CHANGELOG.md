@@ -4,6 +4,32 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.14.3] - 2026-09-25
+
+### Fixed
+
+- Container start-up now works with a Render persistent disk. Render
+  mounts the disk owned by root while the server runs as the non-root
+  `app` user, so pointing `WORKSPACE_MCP_CREDENTIALS_DIR` at `/data`
+  used to fail the start-up permission check. New `entrypoint.sh` starts
+  as root, hands `/data` to `app` (only when the mount exists and is not
+  already owned by `app`), then drops privileges with `gosu` before
+  running the server. Without a disk the behaviour is unchanged: the
+  server still runs as `app`.
+- `gosu` is installed in the image; the `USER app` instruction is removed
+  from the Dockerfile because the entrypoint now does the privilege drop.
+
+### Deploy notes
+
+- Attach the disk in the Render dashboard first (mount path `/data`),
+  then set `WORKSPACE_MCP_CREDENTIALS_DIR=/data/credentials`,
+  `WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=disk`,
+  `WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY=/data/oauth-proxy` and
+  `WORKSPACE_ATTACHMENT_DIR=/data/attachments`, as `render.yaml` already
+  describes. After that redeploys no longer log every connected client out.
+- Services with a disk cannot use zero-downtime deploys or run more than
+  one instance. Acceptable for this single-instance MCP.
+
 ## [1.14.2] - 2026-09-25
 
 ### Added
