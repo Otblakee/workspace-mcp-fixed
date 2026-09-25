@@ -4,6 +4,79 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.16.0] - 2026-09-25
+
+### Changed
+
+- FastMCP moved from the 3.x line (3.3.1) to 4.0.10; the pin is now
+  `fastmcp>=4.0.0,<5.0.0`. FastMCP 4 is built on the MCP Python SDK 2.x, so
+  the lockfile also moves `mcp` 1.26.0 to 2.2.0 (plus the new `mcp-types`
+  package), Starlette 0.52.1 to 1.7.0, FastAPI 0.128.3 to 0.141.1, and adds
+  `httpx2`, `httpcore2` and `truststore`, which FastMCP uses for its own
+  HTTP client. No other pin in `pyproject.toml` changed: the resolver moved
+  those packages within the ranges already declared. The repo's own Google
+  API calls still use `httpx`.
+- Every FastMCP import the repo uses (`FastMCP`, `GoogleProvider`,
+  `AccessToken`, `derive_jwt_key`, `Middleware`, `MiddlewareContext`,
+  `get_context`, `get_access_token`, `get_http_headers`) exists in 4.0.10
+  with the same signature, and the patched `server.tool` decorator, the
+  `local_provider._components` tool table, `remove_tool`, `Context.set_state`
+  and `get_state`, `custom_route` and `run(transport="streamable-http")`
+  behave as before. The API differences that were checked and did not need
+  code changes are listed in `CLAUDE.md` under "FastMCP 4 upgrade".
+
+### Fixed
+
+- The server could not boot on FastMCP 4. `SecureFastMCP.http_app` in
+  `core/server.py` registered the audit flusher's start and shutdown drain
+  with Starlette's `add_event_handler`, and Starlette 1.x removed that
+  method (`AttributeError: 'StarletteWithLifespan' object has no attribute
+  'add_event_handler'` on `server.run`). On Starlette 0.x the two handlers
+  were silently ignored, because FastMCP always installs its own lifespan
+  and Starlette only runs `on_startup` handlers from its default one, so
+  the documented start-on-boot and drain-on-shutdown never actually ran and
+  only the lazy per-tool start did. The app now wraps the router's lifespan
+  context: the audit flusher starts before FastMCP's session manager comes
+  up and drains after it has shut down. `tests/test_http_app_lifespan.py`
+  drives the lifespan with Starlette's test client and pins this, and a
+  source scan keeps the removed event API out of the entrypoints.
+
+### Operator notes
+
+- No new environment variable, no OAuth consent screen change, and no
+  change to the Dockerfile, `render.yaml`, the Helm chart or the `/health`
+  route. A normal Render redeploy is all that is needed.
+- Connected clients keep working through the redeploy. This was verified
+  against the disk-backed OAuth proxy state: dynamic client registrations,
+  access tokens and refresh tokens written by the 3.x proxy are read and
+  accepted by the 4.x proxy on the same `/data/oauth-proxy` directory (and
+  the reverse, should a rollback be needed). The storage collections and
+  token models are unchanged.
+- Client-visible differences, all from FastMCP's own code:
+  `/.well-known/openid-configuration` is now served alongside the two
+  existing well-known routes; the authorization server metadata advertises
+  `token_endpoint_auth_methods_supported: ["none", "private_key_jwt"]`
+  (it said `client_secret_post` and `client_secret_basic` before, but the
+  proxy has always stored registered clients as public `none` clients, so
+  the advertisement now matches what is enforced) and
+  `authorization_response_iss_parameter_supported: true`; registration
+  responses carry `application_type: native`; an `/mcp` request with no
+  token gets a 401 with an empty body and `WWW-Authenticate: Bearer
+  scope="..." resource_metadata="..."` (a bad or expired token still gets
+  `error="invalid_token"` with the same description as before, which is
+  what clients key their re-authentication on); the initialize result no
+  longer lists an empty `experimental` capability or the
+  `io.modelcontextprotocol/ui` extension, neither of which this server
+  used; and `serverInfo.version` now reads 4.0.10 (it has always been the
+  FastMCP version, not this package's).
+- FastMCP 4 clients negotiate the sessionless 2026-07-28 protocol by
+  default (no `Mcp-Session-Id`, a fresh `ctx.session_id` per request). The
+  auth middleware sets the request state on every call, so tool
+  attribution and the audit log are unaffected. The `mcp_session_binding`
+  fallback only ever helped clients that keep a session header, which the
+  current connectors still do; a sessionless client has to present its
+  bearer token on every request, which the OAuth 2.1 gate requires anyway.
+
 ## [1.15.1] - 2026-09-25
 
 ### Fixed

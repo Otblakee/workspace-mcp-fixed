@@ -839,3 +839,104 @@ operations, the pilot, the cron schedule, rollback and key rotation are in
 `gsignatures/RUNBOOK.md`. Outstanding live checks (Companies House
 verification, the Gmail sanitiser findings, alias visibility) are in
 `FOLLOWUPS.md` under "Gmail signatures live checks".
+
+## FastMCP 4 upgrade (v1.16.0)
+
+Pin moved from `fastmcp>=3.2.0,<4.0.0` (3.3.1 installed) to
+`fastmcp>=4.0.0,<5.0.0` (4.0.10). FastMCP 4 sits on the MCP Python SDK 2.x,
+so the lock also carries `mcp` 2.2.0, `mcp-types`, Starlette 1.7.0, FastAPI
+0.141.1, `httpx2`, `httpcore2` and `truststore`. No other pin in
+`pyproject.toml` changed. The suite ran green on the new pin before any code
+change, which says the mocks are thorough but not that the server boots:
+verify with a real `server.run` after any future FastMCP bump.
+
+**The one real break: Starlette 1.x has no `add_event_handler`.**
+`SecureFastMCP.http_app` used it to register the audit flusher's start and
+shutdown drain, and `server.run(transport="streamable-http")` raised
+`AttributeError: 'StarletteWithLifespan' object has no attribute
+'add_event_handler'`. Probing the same code on 3.3.1 showed the handlers had
+never run there either: FastMCP always passes its own `lifespan=` to
+Starlette, and Starlette 0.x only runs `on_startup` handlers from its
+default lifespan. `_audit_started` stayed False for the whole lifespan and
+the lazy start in `_audited_tool` did all the work. The fix wraps
+`app.router.lifespan_context` with an `asynccontextmanager` that awaits
+`_ensure_audit_started()` before entering FastMCP's lifespan and
+`_ensure_audit_stopped()` in a `finally` after it exits. Starlette reads the
+attribute at request time, so reassigning it is enough, and `app.lifespan`
+(what FastMCP tells people to pass when mounting into a parent app) returns
+the wrapper. `tests/test_http_app_lifespan.py` drives the lifespan with
+Starlette's `TestClient`, checks the flag inside and after, checks `/`,
+`/health` and `/attachments/{id}` through the built app, and scans
+`core/server.py`, `main.py` and `fastmcp_server.py` for the removed event
+API.
+
+**Checked and unchanged (no code change needed).** Every import the repo
+makes from `fastmcp`: `FastMCP`, `fastmcp.server.auth.providers.google.
+GoogleProvider`, `fastmcp.server.auth.AccessToken` (same seven fields,
+subclassed by `WorkspaceAccessToken`), `fastmcp.server.auth.jwt_issuer.
+derive_jwt_key` (same keyword-only signature), `fastmcp.server.middleware.
+Middleware` and `MiddlewareContext` (same fields; 4.x adds an `on_discover`
+hook we do not implement), `fastmcp.server.dependencies.get_context`,
+`get_access_token` and `get_http_headers`. `server.tool()(fn)` still returns
+the plain function, the `FunctionTool` in `local_provider._components` still
+exposes the audited wrapper as `.fn` (so `filter_server_tools` still finds
+`_required_google_scopes` and `_workspace_write_tool`), keys are still
+`tool:<name>@<version>`, and `local_provider.remove_tool(name)` is the same.
+`Context.set_state` / `get_state` are unchanged, including
+`serializable=False` for the access token. `GoogleProvider` keeps
+`client_storage`, `jwt_signing_key`, `required_scopes`, `valid_scopes`,
+`redirect_path`, `base_url`, `get_well_known_routes()` and `verify_token`;
+`mcp.server.auth.routes.create_protected_resource_routes`, used by
+`ExternalOAuthProvider`, is still there in `mcp` 2.x with the same
+signature. `from mcp import Resource` (three tool modules) still resolves.
+
+Signature deltas that do not touch us: `FastMCP()` lost `sampling_handler`
+and `sampling_handler_behavior` and gained `request_state_security`,
+`cache_ttl` and `cache_scope`; `tool()` lost `exclude_args` (never used);
+`http_app()` gained `host_origin_protection`, `allowed_hosts`,
+`allowed_origins` and `session_idle_timeout`, all off or `None` by default,
+so the Render hostname is not filtered and sessions still never idle out;
+`GoogleProvider` gained `fastmcp_access_token_expiry_seconds` and
+`token_expiry_threshold_seconds`. `get_http_headers()` now also strips
+`cookie`; it stripped `authorization` in 3.x already, so the raw
+`bearer_token` branch in `auth/auth_info_middleware.py`, which reads the
+header from that helper, behaves exactly as it did before the upgrade.
+
+**Sessions.** FastMCP 4 clients default to the sessionless 2026-07-28
+protocol era: no `Mcp-Session-Id`, and `ctx.session_id` is a fresh UUID per
+request (the id is now cached on the transport connection when one exists,
+so legacy stateful HTTP clients still see a stable id). The in-process probe
+confirmed: `mode="legacy"` stable across calls, `mode="auto"` not. Our
+middleware sets `authenticated_user_email` and `authenticated_via` on every
+call, so audit attribution and the signature tools' caller gate are not
+affected. `ensure_session_from_access_token` stores one MCP session mapping
+per user and drops the previous one when the id changes, so a per-request
+id does not grow the store. The `mcp_session_binding` path stays for
+clients that keep a session header.
+
+**Stored OAuth proxy state is compatible both ways.** Verified on a shared
+`DiskStore` directory wrapped in `FernetEncryptionWrapper` as production is:
+DCR clients registered by the 3.3.1 proxy authorize on 4.0.10 (302 to
+Google) and clients registered by 4.0.10 authorize on 3.3.1; access and
+refresh JWTs minted by the 3.3.1 issuer pass `load_access_token` and
+`load_refresh_token` on 4.0.10 (same `iss`, `aud`, HS256 key derivation,
+`mcp-*` collections, `UpstreamTokenSet` and `JTIMapping` models). 4.x adds
+one collection, `mcp-consent-csrf-tokens`. A redeploy therefore does not log
+anyone out, and a rollback to 1.15.1 would not either.
+
+**Client-visible differences, all inside FastMCP.** Listed in
+`CHANGELOG.md` 1.16.0: an extra `/.well-known/openid-configuration` route,
+`token_endpoint_auth_methods_supported` now `["none", "private_key_jwt"]`
+(the proxy always stored DCR clients as `none`; 4.x corrects the
+advertisement), `authorization_response_iss_parameter_supported: true`,
+`application_type: native` in registration responses, an empty 401 body
+with `WWW-Authenticate: Bearer scope=... resource_metadata=...` for a
+request with no token (a bad token still gets `error="invalid_token"`), no
+`experimental` or `io.modelcontextprotocol/ui` entries in the initialize
+capabilities, and `serverInfo.version` reading 4.0.10.
+
+**Deploy surface.** Dockerfile (`uv sync --no-dev`, `uv run main.py
+--transport streamable-http ...`, `/health` healthcheck), `render.yaml`
+(`healthCheckPath: /health`) and the Helm chart (`healthCheck.path`) have
+nothing version-specific and were not changed. `fastmcp.json` still uses the
+v1 schema and `fastmcp_server.py` as entrypoint.

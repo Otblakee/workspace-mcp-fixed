@@ -348,13 +348,26 @@ code keeps failing closed on it.
 `ADMIN_SCOPES` alongside the group-read scopes the check was using. **No
 consent-screen change and no Render env change.**
 
-## Render persistent disk (found 2026-09-25)
+## Render persistent disk (found 2026-09-25, closed 2026-09-25)
 
-The live service has no disk despite `render.yaml`, so every deploy logs
-every connected client out. v1.14.3 ships the entrypoint that makes a
-root-owned disk usable. Still to do in the dashboard: attach a 1 GB disk at
-`/data`, then set the four `/data` env vars, then sign in once more. Also
-still unset: a health check path (`/health` exists and is unauthenticated).
+Done. The 1 GB disk is attached at `/data`, the four `/data` env vars are
+set, and v1.15.1 added the `py-key-value-aio[disk]` extra the OAuth proxy
+needed (without it the proxy silently stayed in memory). Proven by a
+no-change redeploy after which the connector answered a Google call with no
+sign-in. Still unset in the dashboard: the health check path (`/health`
+exists and is unauthenticated; `render.yaml` names it but the live service
+is not blueprint-managed, so it has to be typed in under Settings).
+
+## Raw bearer-token auth path is unreachable (found during the FastMCP 4 upgrade)
+
+The `bearer_token` branch in `auth/auth_info_middleware.py` reads
+`Authorization` from `fastmcp.server.dependencies.get_http_headers()`, which
+strips that header by default on FastMCP 3.x and 4.x alike. So the branch
+never runs unless something else populates the header. Nothing depends on it
+today (the signature tools refuse it on purpose, and the OAuth 2.1 paths carry
+every live client). Decide whether to delete the branch or make it real with
+`get_http_headers(include={"authorization"})` plus an audience check; do not
+leave it half-alive.
 
 ## Shared drive banners — live checks (v1.14.0)
 
