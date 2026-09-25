@@ -4,6 +4,29 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.14.2] - 2026-09-25
+
+### Added
+
+- `list_drive_themes`: read-only list of Google's stock shared drive themes
+  (`about.get`, `fields=driveThemes`), one line per theme with `id`,
+  `colorRgb` and `backgroundImageLink`, sorted by `id`. Audited like every
+  other tool.
+- `accent_hex` on `set_shared_drive_theme`: with `image_file_id`, sets the
+  drive's exact accent colour (`colorRgb`) in the same `drives.update` as the
+  image. The report names the nearest stock theme and its RGB distance for
+  information only; no stock theme is applied. Refused with `theme_id`,
+  because Google does not accept `colorRgb` alongside `themeId`.
+- `accent` per category in `set_shared_drive_themes_from_registry`:
+  `entity_images` values may be `{"image": <file_id>, "accent": <hex>}`, and a
+  new `accent_hex` argument sets the default for categories without one.
+  Plain file-ID values still work. A bad hex stops the run before any drive
+  changes.
+
+### Unchanged
+
+- Omitting `accent_hex` leaves the drive colour alone, as before.
+
 ## [1.14.1] - 2026-09-25
 
 ### Fixed

@@ -1130,12 +1130,24 @@ Consistent entity branding across every OTB Group shared drive.
 
 | Tool | Description |
 |------|-------------|
+| `list_drive_themes` | Read-only list of Google's stock themes: `id`, `colorRgb`, `backgroundImageLink`, sorted by `id` |
 | `get_shared_drive_theme` | Returns a drive's stock theme (matched from its banner image), `colorRgb` and `backgroundImageLink`, and whether the caller can change it |
 | `set_shared_drive_theme` | Sets the banner from a Google stock `theme_id` **or** a JPG/PNG `image_file_id` (exactly one). Optional crop (`x_coordinate`, `y_coordinate`, `width`); defaults to the largest centred 80:9 area. Returns before/after. `dry_run` supported |
 | `set_shared_drive_themes_from_registry` | Bulk: reads the Folder Registry and applies `entity_images` (`OTB`, `JIT`, `VALE`, `BIR`, `Restricted`, `Hub`, `ExternalShare` → image file ID) to every drive. `dry_run` supported |
 
 `list_shared_drives` now also shows `colorRgb` and `backgroundImageLink` for
 each drive.
+
+**Exact accent colour (`accent_hex`).** With `image_file_id`, pass
+`accent_hex="#0b2545"` (any 6-digit hex, `#` optional) to set the drive's
+accent colour exactly, in the same update as the image. The result also names
+the nearest stock theme and its RGB distance, for information only; no stock
+theme is applied. `accent_hex` is refused with `theme_id`, because Google does
+not accept a colour and a stock theme in the same update.
+
+For the bulk tool, give a category an accent with
+`{"image": "<file_id>", "accent": "#c8102e"}` in `entity_images`, or pass
+`accent_hex` to set the default for every category that has none.
 
 **`themeId` is write-only.** Google accepts it on `drives.update` but never
 returns it on a read, so no tool reports it directly. The stock theme is

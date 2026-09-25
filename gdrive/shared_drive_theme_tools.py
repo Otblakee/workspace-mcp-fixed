@@ -19,6 +19,10 @@ bundled with googleapiclient, ``schemas.Drive``):
   ``yCoordinate`` and ``width``. Coordinates and width are fractions (0 to 1)
   of the source image. Crop height follows from a fixed 80:9 width:height
   ratio, and the cropped area must be at least 1280 x 144 pixels.
+* ``colorRgb`` can be set on a ``drives.update`` that does not set
+  ``themeId``, so an exact brand accent colour can go in the same call as a
+  custom ``backgroundImageFile``. That is what ``accent_hex`` does. It is exact
+  by design: no stock theme is applied to approximate it.
 * ``backgroundImageLink`` is output-only and short-lived. It is reported for
   before/after comparison, never stored.
 * ``capabilities.canChangeDriveBackground`` says whether the caller may change
@@ -34,6 +38,8 @@ banner again.
 from __future__ import annotations
 
 import logging
+import math
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from googleapiclient.errors import HttpError
@@ -189,14 +195,69 @@ def _round_crop(crop: Dict[str, float]) -> Dict[str, float]:
     return rounded
 
 
-def normalise_entity_images(entity_images: Dict[str, str]) -> Dict[str, str]:
-    """Validate the bulk mapping and key it by canonical category name."""
+_HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+
+def normalise_hex(value: Any, *, label: str = "accent_hex") -> str:
+    """Return ``value`` as ``#rrggbb`` or raise ``UserInputError``."""
+    match = _HEX_RE.match(str(value or "").strip())
+    if not match:
+        raise UserInputError(
+            f"{label} must be a 6-digit hex colour such as '#0b2545'; got {value!r}."
+        )
+    return "#" + match.group(1).lower()
+
+
+def _hex_to_rgb(value: str) -> Tuple[int, int, int]:
+    digits = normalise_hex(value).lstrip("#")
+    return int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16)
+
+
+def rgb_distance(a: str, b: str) -> float:
+    """Straight-line distance between two colours in RGB space (0 to ~441.7)."""
+    return math.dist(_hex_to_rgb(a), _hex_to_rgb(b))
+
+
+def nearest_stock_theme(
+    themes: Optional[List[Dict[str, Any]]], accent_hex: str
+) -> Optional[Dict[str, Any]]:
+    """The stock theme whose ``colorRgb`` is closest to ``accent_hex``.
+
+    Returns ``{"id", "colorRgb", "distance"}`` or None when no theme has a
+    usable colour. Ties go to the alphabetically first theme ID so the answer
+    is stable between runs.
+    """
+    best: Optional[Dict[str, Any]] = None
+    for theme in sorted(themes or [], key=lambda t: str(t.get("id"))):
+        colour = theme.get("colorRgb")
+        if not colour or not _HEX_RE.match(str(colour).strip()):
+            continue
+        distance = rgb_distance(accent_hex, colour)
+        if best is None or distance < best["distance"]:
+            best = {
+                "id": theme.get("id"),
+                "colorRgb": normalise_hex(colour),
+                "distance": distance,
+            }
+    return best
+
+
+def normalise_entity_images(
+    entity_images: Dict[str, Any], default_accent: Optional[str] = None
+) -> Dict[str, Dict[str, Optional[str]]]:
+    """Validate the bulk mapping and key it by canonical category name.
+
+    Each value is either an image file ID, or ``{"image": <file_id>,
+    "accent": <hex>}``. ``default_accent`` fills in any category that has no
+    accent of its own. Returns ``{category: {"image": id, "accent": hex|None}}``.
+    """
     if not entity_images:
         raise UserInputError(
             "entity_images is required: map at least one of "
             f"{', '.join(THEME_CATEGORIES)} to an image file ID."
         )
-    normalised: Dict[str, str] = {}
+    fallback = normalise_hex(default_accent) if default_accent else None
+    normalised: Dict[str, Dict[str, Optional[str]]] = {}
     for key, value in entity_images.items():
         category = _CATEGORY_LOOKUP.get(str(key).strip().lower())
         if category is None:
@@ -204,10 +265,24 @@ def normalise_entity_images(entity_images: Dict[str, str]) -> Dict[str, str]:
                 f"Unknown category '{key}' in entity_images. Allowed: "
                 f"{', '.join(THEME_CATEGORIES)}."
             )
-        file_id = str(value or "").strip()
+        accent: Optional[str] = fallback
+        if isinstance(value, dict):
+            unknown = set(value) - {"image", "accent"}
+            if unknown:
+                raise UserInputError(
+                    f"entity_images['{key}'] has unknown key(s) {sorted(unknown)}; "
+                    "use {'image': <file_id>, 'accent': <hex>}."
+                )
+            file_id = str(value.get("image") or "").strip()
+            if value.get("accent"):
+                accent = normalise_hex(
+                    value["accent"], label=f"entity_images['{key}'].accent"
+                )
+        else:
+            file_id = str(value or "").strip()
         if not file_id:
             raise UserInputError(f"entity_images['{key}'] has a blank image file ID.")
-        normalised[category] = file_id
+        normalised[category] = {"image": file_id, "accent": accent}
     return normalised
 
 
@@ -381,19 +456,25 @@ async def _get_banner_image(service, image_file_id: str) -> Dict[str, Any]:
     return meta
 
 
+async def fetch_drive_themes(service) -> List[Dict[str, Any]]:
+    """Google's stock themes from ``about.get``, sorted by ID. Raises on error."""
+    about = await execute_with_backoff(
+        lambda: service.about().get(
+            fields="driveThemes(id, backgroundImageLink, colorRgb)"
+        ),
+        label="about.get(driveThemes)",
+    )
+    themes = [t for t in (about.get("driveThemes") or []) if t.get("id")]
+    return sorted(themes, key=lambda t: str(t["id"]))
+
+
 async def _list_drive_themes(service) -> Optional[List[Dict[str, Any]]]:
-    """Google's stock themes from ``about.get``, or None if unreadable."""
+    """Best-effort ``fetch_drive_themes``: None when the list is unreadable."""
     try:
-        about = await execute_with_backoff(
-            lambda: service.about().get(
-                fields="driveThemes(id, backgroundImageLink, colorRgb)"
-            ),
-            label="about.get(driveThemes)",
-        )
+        return await fetch_drive_themes(service)
     except Exception as exc:  # noqa: BLE001 - theme lookup is best effort
         logger.info("[shared_drive_theme] could not list drive themes: %s", exc)
         return None
-    return [t for t in (about.get("driveThemes") or []) if t.get("id")]
 
 
 def _strip_query(link: Optional[str]) -> str:
@@ -461,11 +542,16 @@ async def apply_drive_theme(
     use_domain_admin_access: Optional[bool] = None,
     dry_run: bool = False,
     image_meta: Optional[Dict[str, Any]] = None,
+    accent_hex: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Set one drive's banner. Shared by the single and bulk tools.
 
     ``image_meta`` lets the bulk tool pass an image it already validated, so a
     shared image is fetched once per run rather than once per drive.
+
+    ``accent_hex`` sets the drive's exact ``colorRgb`` in the same update as
+    the image. Google refuses ``colorRgb`` alongside ``themeId``, so it is only
+    accepted with ``image_file_id``.
 
     Returns a dict with ``drive_id``, ``name``, ``admin_mode``, ``before``,
     ``after`` (None on dry run), ``body`` and ``notes``.
@@ -478,6 +564,13 @@ async def apply_drive_theme(
         raise UserInputError(
             "Crop values (x_coordinate, y_coordinate, width) only apply to "
             "image_file_id, not theme_id."
+        )
+    accent = normalise_hex(accent_hex) if accent_hex else None
+    if accent and theme_id:
+        raise UserInputError(
+            "accent_hex only applies with image_file_id. A stock theme carries "
+            "its own colour, and Google refuses colorRgb in the same update as "
+            "themeId."
         )
 
     drive, admin_mode = await resolve_theme_access(
@@ -514,6 +607,8 @@ async def apply_drive_theme(
         )
         notes.extend(crop_notes)
         body = {"backgroundImageFile": {"id": image_file_id, **crop}}
+        if accent:
+            body["colorRgb"] = accent
 
     result: Dict[str, Any] = {
         "drive_id": drive_id,
@@ -524,7 +619,14 @@ async def apply_drive_theme(
         "body": body,
         "notes": notes,
         "themes_known": themes is not None,
+        "accent": None,
     }
+    if accent:
+        # Reported for information only: the exact colour is what is applied.
+        result["accent"] = {
+            "hex": accent,
+            "nearest": nearest_stock_theme(themes, accent),
+        }
     if dry_run:
         return result
 
@@ -574,6 +676,11 @@ async def apply_drive_theme(
             "⚠️ The banner image link did not change after the update; verify "
             "the banner in the Drive UI."
         )
+    if accent and (after.get("colorRgb") or "").lower() != accent:
+        notes.append(
+            f"⚠️ drives.get reports colorRgb={after.get('colorRgb')!r} after the "
+            f"update, not the requested {accent}; verify the drive colour."
+        )
 
     logger.info(
         "[set_shared_drive_theme] %s on %s (%s) admin_mode=%s",
@@ -596,6 +703,8 @@ def _format_result(result: Dict[str, Any], dry_run: bool) -> List[str]:
             f"image={image['id']} crop(x={image['xCoordinate']}, "
             f"y={image['yCoordinate']}, width={image['width']})"
         )
+        if "colorRgb" in body:
+            change += f", colorRgb={body['colorRgb']}"
     head = "DRY RUN — no change applied." if dry_run else "✅ Banner updated."
     lines = [
         head,
@@ -603,6 +712,20 @@ def _format_result(result: Dict[str, Any], dry_run: bool) -> List[str]:
         f"   Access: {access}",
         f"   {'Would set' if dry_run else 'Set'}: {change}",
     ]
+    accent = result.get("accent")
+    if accent:
+        nearest = accent["nearest"]
+        if nearest:
+            lines.append(
+                f"   Accent: {accent['hex']} applied exactly. Nearest stock "
+                f"theme: {nearest['id']} ({nearest['colorRgb']}), RGB distance "
+                f"{nearest['distance']:.1f} (for information; not applied)."
+            )
+        else:
+            lines.append(
+                f"   Accent: {accent['hex']} applied exactly. Nearest stock "
+                "theme: unknown (Google's theme list could not be read)."
+            )
     known = result.get("themes_known", False)
     lines += _format_snapshot("Before", result["before"], known)
     if result["after"] is not None:
@@ -614,6 +737,35 @@ def _format_result(result: Dict[str, Any], dry_run: bool) -> List[str]:
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
+
+@server.tool()
+@handle_http_errors("list_drive_themes", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def list_drive_themes(service, user_google_email: str) -> str:
+    """
+    Lists Google's stock shared drive themes: ID, colour and image link.
+
+    Read-only (``about.get`` with ``fields=driveThemes``). Use an ID from here
+    as ``theme_id`` in set_shared_drive_theme, or compare colours before
+    choosing an ``accent_hex``.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+
+    Returns:
+        str: One line per theme, sorted by ID: id, colorRgb, backgroundImageLink.
+    """
+    themes = await fetch_drive_themes(service)
+    if not themes:
+        return "Google returned no shared drive themes."
+    lines = [f"Shared drive themes ({len(themes)}), sorted by ID:"]
+    for theme in themes:
+        lines.append(
+            f"- {theme['id']} | colorRgb: {theme.get('colorRgb') or '(none)'} | "
+            f"backgroundImageLink: {theme.get('backgroundImageLink') or '(none)'}"
+        )
+    return "\n".join(lines)
 
 
 @server.tool()
@@ -682,11 +834,16 @@ async def set_shared_drive_theme(
     width: Optional[float] = None,
     use_domain_admin_access: Optional[bool] = None,
     dry_run: bool = False,
+    accent_hex: Optional[str] = None,
 ) -> str:
     """
     Sets a shared drive's banner, from a Google stock theme or a JPG/PNG in Drive.
 
     Pass exactly one of ``theme_id`` or ``image_file_id``.
+
+    With ``image_file_id``, ``accent_hex`` also sets the drive's accent colour
+    to that exact hex in the same update. The nearest stock theme is reported
+    for information only; it is not applied.
 
     For an image, the crop is the largest centred 80:9 area of the image
     unless you pass crop values. Google needs the cropped area to be at
@@ -711,9 +868,12 @@ async def set_shared_drive_theme(
         use_domain_admin_access (Optional[bool]): True to act as a domain
             admin, False to require Manager, unset to pick automatically.
         dry_run (bool): Validate and report without changing anything.
+        accent_hex (Optional[str]): Exact drive accent colour, e.g. '#0b2545'.
+            Only with image_file_id. Omit to leave the colour unchanged.
 
     Returns:
-        str: Before and after theme ID, colour and image link.
+        str: Before and after stock theme, colour and image link, plus the
+            accent applied and the nearest stock theme when accent_hex is set.
     """
     if not drive_id or not drive_id.strip():
         raise UserInputError("drive_id is required.")
@@ -727,6 +887,7 @@ async def set_shared_drive_theme(
         width=width,
         use_domain_admin_access=use_domain_admin_access,
         dry_run=dry_run,
+        accent_hex=accent_hex,
     )
     return "\n".join(_format_result(result, dry_run))
 
@@ -738,10 +899,11 @@ async def set_shared_drive_themes_from_registry(
     service,
     user_google_email: str,
     registry_spreadsheet_id: str,
-    entity_images: Dict[str, str],
+    entity_images: Dict[str, Any],
     registry_range: str = "FolderRegistry",
     use_domain_admin_access: Optional[bool] = None,
     dry_run: bool = False,
+    accent_hex: Optional[str] = None,
 ) -> str:
     """
     Brands every shared drive in the Folder Registry with its entity's banner.
@@ -761,9 +923,11 @@ async def set_shared_drive_themes_from_registry(
     Args:
         user_google_email (str): The user's Google email address. Required.
         registry_spreadsheet_id (str): Spreadsheet ID of the Folder Registry.
-        entity_images (Dict[str, str]): Category → image file ID. Keys from
-            OTB, JIT, VALE, BIR, Restricted, Hub, ExternalShare (any case).
-            Categories left out are skipped.
+        entity_images (Dict[str, Any]): Category → image file ID, or
+            ``{"image": <file_id>, "accent": <hex>}`` to also set that
+            category's exact accent colour. Keys from OTB, JIT, VALE, BIR,
+            Restricted, Hub, ExternalShare (any case). Categories left out are
+            skipped.
         registry_range (str): Sheet name or A1 range. Defaults to
             "FolderRegistry". Needs ``drive``, ``folder_id`` and ``entity``
             columns; ``depth``, ``path``, ``restricted``, ``external`` and
@@ -771,6 +935,8 @@ async def set_shared_drive_themes_from_registry(
         use_domain_admin_access (Optional[bool]): As for
             set_shared_drive_theme. Unset picks per drive.
         dry_run (bool): Report the plan without changing any drive.
+        accent_hex (Optional[str]): Default accent colour for categories that
+            do not set their own ``accent``. Omit to leave colours unchanged.
 
     Returns:
         str: One block per drive (applied, would apply, skipped or failed)
@@ -778,12 +944,12 @@ async def set_shared_drive_themes_from_registry(
     """
     if not registry_spreadsheet_id or not registry_spreadsheet_id.strip():
         raise UserInputError("registry_spreadsheet_id is required.")
-    images = normalise_entity_images(entity_images)
+    images = normalise_entity_images(entity_images, default_accent=accent_hex)
 
     # Check every image up-front so a bad file ID stops the run before any
     # drive changes, instead of half-branding the estate.
     image_meta: Dict[str, Dict[str, Any]] = {}
-    for file_id in sorted(set(images.values())):
+    for file_id in sorted({spec["image"] for spec in images.values()}):
         meta = await _get_banner_image(service, file_id)
         dims = meta.get("imageMediaMetadata") or {}
         compute_banner_crop(dims.get("width"), dims.get("height"))
@@ -838,7 +1004,7 @@ async def set_shared_drive_themes_from_registry(
             )
             continue
 
-        file_id = images[category]
+        file_id = images[category]["image"]
         try:
             result = await apply_drive_theme(
                 service,
@@ -847,6 +1013,7 @@ async def set_shared_drive_themes_from_registry(
                 use_domain_admin_access=use_domain_admin_access,
                 dry_run=dry_run,
                 image_meta=image_meta[file_id],
+                accent_hex=images[category]["accent"],
             )
         except Exception as exc:  # noqa: BLE001 - per-drive failure, run continues
             counts["failed"] += 1
@@ -878,6 +1045,11 @@ async def set_shared_drive_themes_from_registry(
 
 
 __all__ = [
+    "list_drive_themes",
+    "fetch_drive_themes",
+    "nearest_stock_theme",
+    "normalise_hex",
+    "rgb_distance",
     "get_shared_drive_theme",
     "set_shared_drive_theme",
     "set_shared_drive_themes_from_registry",

@@ -640,6 +640,16 @@ Access: `capabilities.canChangeDriveBackground` is the Manager check. With
 when the caller is not a Manager; `False` forbids the fallback, `True` forces
 admin mode. The post-update re-read uses the same mode as the update.
 
+**Accent colour (v1.14.2).** `accent_hex` sets `colorRgb` exactly in the same
+`drives.update` as `backgroundImageFile` (the discovery doc allows `colorRgb`
+on any update that does not set `themeId`). The original ask was "pick the
+nearest stock theme, apply it, then the image"; Oli chose the exact colour
+instead on 2026-09-25, so `nearest_stock_theme` (Euclidean RGB distance, ties
+to the first ID alphabetically) is reported for information only and never
+applied. `accent_hex` with `theme_id` is refused. `list_drive_themes` is
+audited like every other tool: an audit exemption was offered and declined,
+so every MCP call is still logged.
+
 Bulk mapping: one entry per `drive` value, ID from its `depth` 0 row.
 Category precedence `restricted` > `external` > `hub` > `entity`. Every image
 is validated before any drive is touched; per-drive failures are recorded and

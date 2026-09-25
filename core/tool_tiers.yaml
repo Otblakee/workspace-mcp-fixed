@@ -54,6 +54,7 @@ drive:
     - reconcile_folders
     - rebuild_hub
     # Shared drive banners (entity branding).
+    - list_drive_themes
     - get_shared_drive_theme
     - set_shared_drive_theme
     - set_shared_drive_themes_from_registry
