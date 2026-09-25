@@ -10,6 +10,11 @@ bundled with googleapiclient, ``schemas.Drive``):
 * ``themeId`` and ``backgroundImageFile`` are write-only and mutually
   exclusive on one ``drives.update`` request. A theme sets both image and
   colour; a custom image sets only the image.
+* Because ``themeId`` is write-only, ``drives.get`` never returns it (live
+  reads on 2026-09-25 confirmed this: stock-themed drives came back with no
+  ``themeId``). The current stock theme is therefore worked out by matching
+  the drive's ``backgroundImageLink`` against ``about.get(driveThemes)``, and a
+  theme change is verified the same way, never by reading ``themeId`` back.
 * ``backgroundImageFile`` needs **all** of ``id``, ``xCoordinate``,
   ``yCoordinate`` and ``width``. Coordinates and width are fractions (0 to 1)
   of the source image. Crop height follows from a fixed 80:9 width:height
@@ -45,8 +50,7 @@ logger = logging.getLogger(__name__)
 # Fields read before and after a theme change. ``capabilities`` drives the
 # Manager check; the rest is the before/after report.
 _THEME_FIELDS = (
-    "id, name, themeId, colorRgb, backgroundImageLink, "
-    "capabilities(canChangeDriveBackground)"
+    "id, name, colorRgb, backgroundImageLink, capabilities(canChangeDriveBackground)"
 )
 
 # Google accepts JPG and PNG banners.
@@ -377,45 +381,69 @@ async def _get_banner_image(service, image_file_id: str) -> Dict[str, Any]:
     return meta
 
 
-async def _validate_theme_id(service, theme_id: str) -> str:
-    """Check ``theme_id`` against ``about.get(driveThemes)``.
-
-    Returns a note for the output. An unknown theme is refused; if the theme
-    list itself cannot be read, the call goes ahead and Drive has the final
-    word.
-    """
+async def _list_drive_themes(service) -> Optional[List[Dict[str, Any]]]:
+    """Google's stock themes from ``about.get``, or None if unreadable."""
     try:
         about = await execute_with_backoff(
-            lambda: service.about().get(fields="driveThemes(id)"),
+            lambda: service.about().get(
+                fields="driveThemes(id, backgroundImageLink, colorRgb)"
+            ),
             label="about.get(driveThemes)",
         )
-    except Exception as exc:  # noqa: BLE001 - validation is best effort
-        logger.info("[set_shared_drive_theme] could not list drive themes: %s", exc)
-        return (
-            "\n   ℹ️ Could not read the list of Google themes to check the "
-            "theme_id; Drive will reject it if it is not valid."
-        )
-    valid = sorted(t.get("id") for t in (about.get("driveThemes") or []) if t.get("id"))
-    if valid and theme_id not in valid:
-        raise UserInputError(
-            f"'{theme_id}' is not a Google shared drive theme. Valid theme IDs: "
-            f"{', '.join(valid)}."
-        )
-    return ""
+    except Exception as exc:  # noqa: BLE001 - theme lookup is best effort
+        logger.info("[shared_drive_theme] could not list drive themes: %s", exc)
+        return None
+    return [t for t in (about.get("driveThemes") or []) if t.get("id")]
 
 
-def _theme_snapshot(drive: Dict[str, Any]) -> Dict[str, Optional[str]]:
+def _strip_query(link: Optional[str]) -> str:
+    return (link or "").split("?", 1)[0].strip()
+
+
+def match_stock_theme(
+    themes: Optional[List[Dict[str, Any]]], background_image_link: Optional[str]
+) -> Optional[str]:
+    """Return the stock theme ID whose image the drive is showing, if any.
+
+    ``themeId`` is write-only in the Drive API, so this is the only way to tell
+    which stock theme a drive carries. A custom image matches nothing.
+    """
+    link = _strip_query(background_image_link)
+    if not themes or not link:
+        return None
+    for theme in themes:
+        if _strip_query(theme.get("backgroundImageLink")) == link:
+            return theme.get("id")
+    return None
+
+
+def _theme_snapshot(
+    drive: Dict[str, Any], themes: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Optional[str]]:
+    link = drive.get("backgroundImageLink")
     return {
-        "themeId": drive.get("themeId"),
+        "stockTheme": match_stock_theme(themes, link),
         "colorRgb": drive.get("colorRgb"),
-        "backgroundImageLink": drive.get("backgroundImageLink"),
+        "backgroundImageLink": link,
     }
 
 
-def _format_snapshot(label: str, snap: Dict[str, Optional[str]]) -> List[str]:
+def _describe_stock_theme(snap: Dict[str, Optional[str]], themes_known: bool) -> str:
+    if snap.get("stockTheme"):
+        return f"{snap['stockTheme']} (matched from the banner image)"
+    if not snap.get("backgroundImageLink"):
+        return "(no banner image)"
+    if not themes_known:
+        return "(unknown: Google's theme list could not be read)"
+    return "none (custom image)"
+
+
+def _format_snapshot(
+    label: str, snap: Dict[str, Optional[str]], themes_known: bool
+) -> List[str]:
     return [
         f"   {label}:",
-        f"     themeId: {snap.get('themeId') or '(custom/none)'}",
+        f"     Stock theme: {_describe_stock_theme(snap, themes_known)}",
         f"     colorRgb: {snap.get('colorRgb') or '(none)'}",
         f"     backgroundImageLink: {snap.get('backgroundImageLink') or '(none)'}",
     ]
@@ -455,13 +483,28 @@ async def apply_drive_theme(
     drive, admin_mode = await resolve_theme_access(
         service, drive_id, use_domain_admin_access
     )
-    before = _theme_snapshot(drive)
     notes: List[str] = []
+    target_theme: Optional[Dict[str, Any]] = None
+
+    # One about.get serves three purposes: validating theme_id, naming the
+    # stock theme in the before/after report, and verifying a theme change.
+    themes = await _list_drive_themes(service)
+    before = _theme_snapshot(drive, themes)
 
     if theme_id:
-        note = await _validate_theme_id(service, theme_id)
-        if note:
-            notes.append(note.strip())
+        if themes is None:
+            notes.append(
+                "ℹ️ Could not read the list of Google themes to check the "
+                "theme_id; Drive will reject it if it is not valid."
+            )
+        else:
+            by_id = {t["id"]: t for t in themes}
+            if by_id and theme_id not in by_id:
+                raise UserInputError(
+                    f"'{theme_id}' is not a Google shared drive theme. Valid "
+                    f"theme IDs: {', '.join(sorted(by_id))}."
+                )
+            target_theme = by_id.get(theme_id)
         body: Dict[str, Any] = {"themeId": theme_id}
     else:
         meta = image_meta or await _get_banner_image(service, image_file_id)
@@ -480,6 +523,7 @@ async def apply_drive_theme(
         "after": None,
         "body": body,
         "notes": notes,
+        "themes_known": themes is not None,
     }
     if dry_run:
         return result
@@ -489,7 +533,7 @@ async def apply_drive_theme(
             driveId=drive_id,
             body=body,
             useDomainAdminAccess=admin_mode,
-            fields="id, themeId, colorRgb, backgroundImageLink",
+            fields="id, colorRgb, backgroundImageLink",
         ),
         label="drives.update(theme)",
     )
@@ -499,14 +543,29 @@ async def apply_drive_theme(
     after_drive = await _get_shared_drive(
         service, drive_id, use_domain_admin_access=admin_mode, fields=_THEME_FIELDS
     )
-    after = _theme_snapshot(after_drive or {})
+    after = _theme_snapshot(after_drive or {}, themes)
     result["after"] = after
 
-    if theme_id and after.get("themeId") != theme_id:
-        notes.append(
-            f"⚠️ drives.get reports themeId={after.get('themeId')!r} after the "
-            "update; verify the banner in the Drive UI."
-        )
+    # themeId is write-only, so a theme change is verified by the image (or,
+    # failing that, the colour) now matching the requested theme's own.
+    if theme_id:
+        if target_theme is None:
+            notes.append(
+                "ℹ️ Could not verify the change against Google's theme list; "
+                "check the banner in the Drive UI."
+            )
+        else:
+            image_ok = after.get("stockTheme") == theme_id
+            colour_ok = bool(target_theme.get("colorRgb")) and (
+                (after.get("colorRgb") or "").lower()
+                == target_theme["colorRgb"].lower()
+            )
+            if not (image_ok or colour_ok):
+                notes.append(
+                    f"⚠️ After the update the drive does not show theme "
+                    f"'{theme_id}' (image and colour both differ); verify the "
+                    "banner in the Drive UI."
+                )
     if image_file_id and (
         not after.get("backgroundImageLink")
         or after.get("backgroundImageLink") == before.get("backgroundImageLink")
@@ -544,9 +603,10 @@ def _format_result(result: Dict[str, Any], dry_run: bool) -> List[str]:
         f"   Access: {access}",
         f"   {'Would set' if dry_run else 'Set'}: {change}",
     ]
-    lines += _format_snapshot("Before", result["before"])
+    known = result.get("themes_known", False)
+    lines += _format_snapshot("Before", result["before"], known)
     if result["after"] is not None:
-        lines += _format_snapshot("After", result["after"])
+        lines += _format_snapshot("After", result["after"], known)
     lines += [f"   {n}" for n in result["notes"]]
     return lines
 
@@ -566,7 +626,11 @@ async def get_shared_drive_theme(
     use_domain_admin_access: bool = False,
 ) -> str:
     """
-    Reads a shared drive's banner: its theme ID, colour and image link.
+    Reads a shared drive's banner: its stock theme, colour and image link.
+
+    Google never returns ``themeId`` when a drive is read (it is write-only),
+    so the stock theme is identified by matching the banner image against
+    Google's theme list. A custom image shows as "none (custom image)".
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -575,8 +639,8 @@ async def get_shared_drive_theme(
             caller is not a member of. Defaults to False.
 
     Returns:
-        str: themeId, colorRgb and backgroundImageLink. themeId is empty when
-            the banner is a custom image. The image link is short-lived.
+        str: Stock theme (matched), colorRgb and backgroundImageLink. The
+            image link is short-lived.
     """
     if not drive_id or not drive_id.strip():
         raise UserInputError("drive_id is required.")
@@ -591,11 +655,12 @@ async def get_shared_drive_theme(
             f"'{drive_id}' is not a shared drive you can see. If you are a "
             "Workspace admin, retry with use_domain_admin_access=True."
         )
-    snap = _theme_snapshot(drive)
+    themes = await _list_drive_themes(service)
+    snap = _theme_snapshot(drive, themes)
     can_change = (drive.get("capabilities") or {}).get("canChangeDriveBackground")
     lines = [f"Shared drive '{drive.get('name', drive_id)}' ({drive_id}) banner:"]
     lines += [
-        f"   themeId: {snap['themeId'] or '(custom/none)'}",
+        f"   Stock theme: {_describe_stock_theme(snap, themes is not None)}",
         f"   colorRgb: {snap['colorRgb'] or '(none)'}",
         f"   backgroundImageLink: {snap['backgroundImageLink'] or '(none)'}",
         f"   You can change it: {'yes' if can_change else 'no (Manager only)'}",
@@ -822,4 +887,5 @@ __all__ = [
     "drives_from_registry",
     "normalise_entity_images",
     "resolve_theme_access",
+    "match_stock_theme",
 ]

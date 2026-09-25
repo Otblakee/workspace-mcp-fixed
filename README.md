@@ -1130,12 +1130,16 @@ Consistent entity branding across every OTB Group shared drive.
 
 | Tool | Description |
 |------|-------------|
-| `get_shared_drive_theme` | Returns a drive's `themeId`, `colorRgb` and `backgroundImageLink`, and whether the caller can change it |
+| `get_shared_drive_theme` | Returns a drive's stock theme (matched from its banner image), `colorRgb` and `backgroundImageLink`, and whether the caller can change it |
 | `set_shared_drive_theme` | Sets the banner from a Google stock `theme_id` **or** a JPG/PNG `image_file_id` (exactly one). Optional crop (`x_coordinate`, `y_coordinate`, `width`); defaults to the largest centred 80:9 area. Returns before/after. `dry_run` supported |
 | `set_shared_drive_themes_from_registry` | Bulk: reads the Folder Registry and applies `entity_images` (`OTB`, `JIT`, `VALE`, `BIR`, `Restricted`, `Hub`, `ExternalShare` → image file ID) to every drive. `dry_run` supported |
 
-`list_shared_drives` now also shows `themeId`, `colorRgb` and
-`backgroundImageLink` for each drive.
+`list_shared_drives` now also shows `colorRgb` and `backgroundImageLink` for
+each drive.
+
+**`themeId` is write-only.** Google accepts it on `drives.update` but never
+returns it on a read, so no tool reports it directly. The stock theme is
+identified by matching the drive's banner image against Google's theme list.
 
 **Access.** A drive Manager changes the banner as a member (checked via
 `capabilities.canChangeDriveBackground`). If the caller is not a Manager,

@@ -467,7 +467,9 @@ async def create_shared_drive(
     return (
         f"✅ Created shared drive '{created.get('name', drive_name)}'\n"
         f"   drive_id: {drive_id}\n"
-        f"   theme_id: {created.get('themeId', '(default)')}\n"
+        # themeId is write-only in the Drive API and never comes back in the
+        # response, so echo what was requested.
+        f"   theme_id: {theme_id or '(Google default)'}\n"
         f"   Link: https://drive.google.com/drive/folders/{drive_id}\n"
         "   Next: grant group access with set_drive_permission; OU placement "
         "is an Admin console step."
@@ -622,8 +624,10 @@ async def list_shared_drives(
 
     Returns:
         str: One line per shared drive with its ID, name, restrictions and
-            theme (themeId, colorRgb, backgroundImageLink). The image link is
-            short-lived, so fetch it fresh rather than storing it.
+            banner (colorRgb, backgroundImageLink). The image link is
+            short-lived, so fetch it fresh rather than storing it. themeId is
+            write-only in the Drive API, so it is not listed; use
+            get_shared_drive_theme to identify a drive's stock theme.
     """
     if max_results < 1:
         raise UserInputError("max_results must be at least 1.")
@@ -654,8 +658,10 @@ async def list_shared_drives(
         active = [k for k, v in restrictions.items() if v]
         suffix = f" | restrictions: {', '.join(active)}" if active else ""
         hidden = " | hidden" if drive.get("hidden") else ""
+        # themeId is write-only in the Drive API and never comes back on a
+        # read, so only the colour and image link are shown. Use
+        # get_shared_drive_theme to name the stock theme a drive carries.
         theme = (
-            f" | themeId: {drive.get('themeId') or '(custom/none)'}"
             f" | colorRgb: {drive.get('colorRgb') or '(none)'}"
             f" | backgroundImageLink: {drive.get('backgroundImageLink') or '(none)'}"
         )

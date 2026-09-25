@@ -620,7 +620,14 @@ New module `gdrive/shared_drive_theme_tools.py`, tests in
 `tests/gdrive/test_shared_drive_theme_tools.py`. Three tools, all at the
 `extended` tier: `get_shared_drive_theme`, `set_shared_drive_theme`,
 `set_shared_drive_themes_from_registry`. `list_shared_drives` now also prints
-`themeId`, `colorRgb`, `backgroundImageLink`.
+`colorRgb`, `backgroundImageLink`.
+
+**`themeId` is write-only (v1.14.1 fix).** `drives.get` never returns it, which
+1.14.0 missed: every drive read as "(custom/none)" and every successful theme
+change warned. Never read `themeId` back. The stock theme is identified by
+`match_stock_theme` (banner image link vs `about.get(driveThemes)`, query
+string ignored), and a theme change is verified by the drive now showing that
+theme's image or colour.
 
 API facts (from the Drive v3 discovery doc bundled with googleapiclient):
 `themeId` and `backgroundImageFile` are mutually exclusive on one

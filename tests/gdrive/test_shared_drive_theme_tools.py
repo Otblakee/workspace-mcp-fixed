@@ -41,6 +41,9 @@ set_themes_from_registry = _unwrap(theme_tools.set_shared_drive_themes_from_regi
 
 USER = "oliver@otbgroup.co.uk"
 
+ABACUS_LINK = "https://ssl.gstatic.com/team_drive_themes/abacus_background.jpg"
+BOK_LINK = "https://ssl.gstatic.com/team_drive_themes/bok_choy_background.jpg"
+
 
 def _http_error(status: int, reason: str = "x") -> HttpError:
     resp = MagicMock()
@@ -72,7 +75,10 @@ class FakeDrive:
         self.after_update = {}
         self.update_error = {}
         self.images = {}
-        self.themes = [{"id": "abacus"}, {"id": "bok"}]
+        self.themes = [
+            {"id": "abacus", "backgroundImageLink": ABACUS_LINK, "colorRgb": "#1a73e8"},
+            {"id": "bok", "backgroundImageLink": BOK_LINK, "colorRgb": "#689f38"},
+        ]
         self.about_error = None
 
     def drives(self):
@@ -140,12 +146,13 @@ class FakeDrive:
 
 
 def _drive(drive_id="d1", name="JIT-Operations", can_change=True, **extra):
+    # No themeId: it is write-only in the Drive API and never comes back on a
+    # read. The drive shows the abacus stock theme's image and colour instead.
     return {
         "id": drive_id,
         "name": name,
-        "themeId": "abacus",
         "colorRgb": "#1a73e8",
-        "backgroundImageLink": "https://lh3/old",
+        "backgroundImageLink": ABACUS_LINK,
         "capabilities": {"canChangeDriveBackground": can_change},
         **extra,
     }
@@ -271,7 +278,9 @@ class TestSetSharedDriveTheme:
         assert set(image) == {"id", "xCoordinate", "yCoordinate", "width"}
         assert "themeId" not in update["body"]
         assert "Access: drive Manager" in result
-        assert "https://lh3/old" in result and "https://lh3/new" in result
+        assert ABACUS_LINK in result and "https://lh3/new" in result
+        assert "Stock theme: abacus (matched" in result
+        assert "Stock theme: none (custom image)" in result
         assert "#1a73e8" in result
         assert "⚠️" not in result
 
@@ -279,14 +288,49 @@ class TestSetSharedDriveTheme:
     async def test_sets_a_stock_theme(self):
         service = FakeDrive()
         service.member_view["d1"] = _drive()
-        service.after_update["d1"] = {"themeId": "bok", "colorRgb": "#aa0000"}
+        # Real Drive behaviour: the image and colour change, themeId does not
+        # come back.
+        service.after_update["d1"] = {
+            "backgroundImageLink": BOK_LINK,
+            "colorRgb": "#689f38",
+        }
 
         result = await set_shared_drive_theme(
             service, USER, drive_id="d1", theme_id="bok"
         )
 
         assert service.kwargs_for("drives.update")[0]["body"] == {"themeId": "bok"}
-        assert "abacus" in result and "bok" in result and "#aa0000" in result
+        assert "Stock theme: abacus (matched" in result
+        assert "Stock theme: bok (matched" in result
+        assert "#689f38" in result
+        # Regression: a successful theme change must not raise the
+        # "verify the banner" warning just because themeId is not readable.
+        assert "⚠️" not in result
+        assert "themeId:" not in result
+
+    @pytest.mark.asyncio
+    async def test_theme_change_verified_by_colour_when_link_differs(self):
+        """The image link may come back in a different form (signed, resized);
+        a matching colour still proves the theme applied."""
+        service = FakeDrive()
+        service.member_view["d1"] = _drive()
+        service.after_update["d1"] = {
+            "backgroundImageLink": "https://lh3.googleusercontent.com/resized",
+            "colorRgb": "#689F38",
+        }
+        result = await set_shared_drive_theme(
+            service, USER, drive_id="d1", theme_id="bok"
+        )
+        assert "⚠️" not in result
+
+    @pytest.mark.asyncio
+    async def test_reapplying_the_current_theme_is_not_flagged(self):
+        service = FakeDrive()
+        service.member_view["d1"] = _drive()
+        result = await set_shared_drive_theme(
+            service, USER, drive_id="d1", theme_id="abacus"
+        )
+        assert "⚠️" not in result
 
     @pytest.mark.asyncio
     async def test_unknown_theme_is_refused_before_update(self):
@@ -301,12 +345,14 @@ class TestSetSharedDriveTheme:
         service = FakeDrive()
         service.member_view["d1"] = _drive()
         service.about_error = _http_error(403, "forbidden")
-        service.after_update["d1"] = {"themeId": "bok"}
+        service.after_update["d1"] = {"backgroundImageLink": BOK_LINK}
 
         result = await set_shared_drive_theme(
             service, USER, drive_id="d1", theme_id="bok"
         )
         assert "Could not read the list of Google themes" in result
+        assert "Could not verify the change" in result
+        assert "Google's theme list could not be read" in result
         assert service.kwargs_for("drives.update")
 
     @pytest.mark.asyncio
@@ -459,10 +505,35 @@ class TestGetSharedDriveTheme:
         service = FakeDrive()
         service.member_view["d1"] = _drive()
         result = await get_shared_drive_theme(service, USER, drive_id="d1")
-        assert "themeId: abacus" in result
+        assert "Stock theme: abacus (matched from the banner image)" in result
         assert "colorRgb: #1a73e8" in result
-        assert "backgroundImageLink: https://lh3/old" in result
+        assert f"backgroundImageLink: {ABACUS_LINK}" in result
         assert "You can change it: yes" in result
+        assert "themeId:" not in result
+
+    @pytest.mark.asyncio
+    async def test_custom_image_is_reported_as_custom(self):
+        service = FakeDrive()
+        service.member_view["d1"] = _drive(
+            backgroundImageLink="https://lh3.googleusercontent.com/custom"
+        )
+        result = await get_shared_drive_theme(service, USER, drive_id="d1")
+        assert "Stock theme: none (custom image)" in result
+
+    @pytest.mark.asyncio
+    async def test_signed_link_still_matches_the_stock_theme(self):
+        service = FakeDrive()
+        service.member_view["d1"] = _drive(backgroundImageLink=BOK_LINK + "?sig=xyz")
+        result = await get_shared_drive_theme(service, USER, drive_id="d1")
+        assert "Stock theme: bok (matched" in result
+
+    @pytest.mark.asyncio
+    async def test_unreadable_theme_list_says_unknown(self):
+        service = FakeDrive()
+        service.member_view["d1"] = _drive()
+        service.about_error = _http_error(403, "forbidden")
+        result = await get_shared_drive_theme(service, USER, drive_id="d1")
+        assert "unknown: Google's theme list could not be read" in result
 
     @pytest.mark.asyncio
     async def test_admin_read_passes_the_flag(self):
