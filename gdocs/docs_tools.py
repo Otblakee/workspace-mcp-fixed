@@ -10,6 +10,7 @@ import io
 import re
 from typing import List, Dict, Any
 
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # Auth & server utilities
@@ -35,6 +36,8 @@ from gdocs.docs_structure import (
     parse_document_structure,
     find_tables,
     analyze_document_complexity,
+    get_body_end_index,
+    max_insertion_index,
 )
 from gdocs.docs_tables import extract_table_as_data
 from gdocs.docs_markdown import (
@@ -104,6 +107,73 @@ async def _wrong_workspace_type_hint(
         f"ID '{file_id}' (name: {name!r}) belongs to a {label}, not a "
         f"{expected_label}. Use a {tool_hint} instead."
     )
+
+
+async def _clamp_index_to_body(
+    service: Any, document_id: str, index: int
+) -> tuple[int, str]:
+    """
+    Clamp an insertion index so it stays inside the document body.
+
+    The body always ends with a newline, so the largest valid insertion index
+    is the body end index minus 1. inspect_doc_structure reports the end
+    index as total_length, and callers regularly pass that value straight
+    back, which the Docs API rejects with 400 "Index N must be less than the
+    end index of the referenced segment, N".
+
+    Returns:
+        (index_to_use, note) where note is "" when nothing changed and a
+        sentence describing the adjustment otherwise. If the document cannot
+        be read the index is returned unchanged.
+    """
+    doc = await asyncio.to_thread(
+        service.documents().get(documentId=document_id).execute
+    )
+    end_index = get_body_end_index(doc)
+    if end_index is None or index < end_index:
+        return index, ""
+    clamped = max(end_index - 1, 1)
+    note = (
+        f" Requested index {index} is at or past the document end index "
+        f"{end_index}; used {clamped}, the largest valid insertion index."
+    )
+    logger.info(
+        f"[_clamp_index_to_body] Doc={document_id}: index {index} clamped to {clamped}"
+    )
+    return clamped, note
+
+
+_IMAGE_NOT_PUBLIC_MARKERS = ("problem retrieving the image", "publicly accessible")
+
+
+def _image_not_public_message(image_source: str, detail: str) -> str:
+    """The one message every non-public image path returns."""
+    return (
+        f"Error: The Docs API can only insert an image it can fetch anonymously, and "
+        f"{detail}. This server will not create public links or change sharing on "
+        f"any file (blocked by policy), so a private Drive file cannot be inserted. "
+        f"Pass a public https URL of the image instead, or host the image somewhere "
+        f"that is already publicly readable and pass that URL. (source: {image_source})"
+    )
+
+
+def _is_image_fetch_error(error: Exception) -> bool:
+    """True for the Docs API 400 that means the image URI is not publicly readable."""
+    if not isinstance(error, HttpError):
+        return False
+    status = getattr(getattr(error, "resp", None), "status", None)
+    if status not in (400, "400"):
+        return False
+    text = str(error).lower()
+    try:
+        content = error.content
+        if isinstance(content, bytes):
+            text += content.decode("utf-8", "replace").lower()
+        elif content:
+            text += str(content).lower()
+    except Exception:
+        pass
+    return any(marker in text for marker in _IMAGE_NOT_PUBLIC_MARKERS)
 
 
 @server.tool()
@@ -502,6 +572,18 @@ async def modify_doc_text(
     """
     Modifies text in a Google Doc - can insert/replace text and/or apply formatting in a single operation.
 
+    What happens for each combination of arguments:
+    - text only, no end_index: the text is inserted at start_index.
+    - text plus end_index: the range [start_index, end_index) is replaced with the text.
+    - text plus formatting, no end_index: the text is inserted at start_index and the
+      formatting is applied to the inserted range [start_index, start_index + len(text))
+      in the same batchUpdate (insertText first, then updateTextStyle).
+    - text plus formatting plus end_index: the range is replaced and the formatting is
+      applied to the new text.
+    - formatting only: end_index is required and the existing text in
+      [start_index, end_index) is formatted without changing it.
+    - neither text nor a formatting flag: an error is returned.
+
     Args:
         user_google_email: User's Google email address
         document_id: ID of the document to update
@@ -561,11 +643,16 @@ async def modify_doc_text(
         if not is_valid:
             return f"Error: {error_msg}"
 
-        # For formatting, we need end_index
-        if end_index is None:
-            return "Error: 'end_index' is required when applying formatting."
+        # Formatting existing text needs a range. Formatting text that is
+        # being inserted in this same call does not: the range is the
+        # inserted text, computed below.
+        if end_index is None and text is None:
+            return "Error: 'end_index' is required when applying formatting to existing text. Supply 'text' as well to insert and format in one call."
 
-        is_valid, error_msg = validator.validate_index_range(start_index, end_index)
+        if end_index is None:
+            is_valid, error_msg = validator.validate_index(start_index, "start_index")
+        else:
+            is_valid, error_msg = validator.validate_index_range(start_index, end_index)
         if not is_valid:
             return f"Error: {error_msg}"
 
@@ -736,11 +823,16 @@ async def insert_doc_elements(
     """
     Inserts structural elements like tables, lists, or page breaks into a Google Doc.
 
+    The largest valid insertion index is the document's end index minus 1
+    (the body always ends with a newline). An index of 0 is moved to 1, and
+    an index at or past the end index is clamped to end index minus 1; the
+    result says when that happened.
+
     Args:
         user_google_email: User's Google email address
         document_id: ID of the document to update
         element_type: Type of element to insert ("table", "list", "page_break")
-        index: Position to insert element (0-based)
+        index: Position to insert element (0-based, at most the document end index minus 1)
         rows: Number of rows for table (required for table)
         columns: Number of columns for table (required for table)
         list_type: Type of list ("UNORDERED", "ORDERED") (required for list)
@@ -758,6 +850,9 @@ async def insert_doc_elements(
     if index == 0:
         logger.debug("Adjusting index from 0 to 1 to avoid first section break")
         index = 1
+
+    # The body ends with a newline; inserting at the end index itself is a 400.
+    index, clamp_note = await _clamp_index_to_body(service, document_id, index)
 
     requests = []
 
@@ -795,7 +890,7 @@ async def insert_doc_elements(
     )
 
     link = f"https://docs.google.com/document/d/{document_id}/edit"
-    return f"Inserted {description} at index {index} in document {document_id}. Link: {link}"
+    return f"Inserted {description} at index {index} in document {document_id}.{clamp_note} Link: {link}"
 
 
 @server.tool()
@@ -821,12 +916,23 @@ async def insert_doc_image(
     height: int = 0,
 ) -> str:
     """
-    Inserts an image into a Google Doc from Drive or a URL.
+    Inserts an image into a Google Doc from a public URL or a public Drive file.
+
+    The Docs API fetches the image itself, anonymously, so the source must be
+    publicly readable. A private Drive file (even one the caller owns) cannot
+    be inserted: Google answers 400 "There was a problem retrieving the
+    image", and this server will not change sharing or create a public link
+    for any file (blocked by policy). For a Drive file ID the tool checks the
+    file's permissions first and returns a clear message, without calling
+    the Docs API, when no "anyone" permission exists. The same message is
+    returned if Google rejects a URL for the same reason.
 
     Args:
         user_google_email: User's Google email address
         document_id: ID of the document to update
-        image_source: Drive file ID or public image URL
+        image_source: Public https URL of a PNG, JPEG or GIF (preferred), or the ID
+            of a Drive image file that already has an "anyone" (link) permission.
+            Private Drive files are refused with an explanation.
         index: Position to insert image (0-based)
         width: Image width in points (optional)
         height: Image height in points (optional)
@@ -850,25 +956,40 @@ async def insert_doc_image(
     )
 
     if is_drive_file:
-        # Verify Drive file exists and get metadata
+        # Verify Drive file exists, is an image, and is publicly readable.
         try:
             file_metadata = await asyncio.to_thread(
                 drive_service.files()
                 .get(
                     fileId=image_source,
-                    fields="id, name, mimeType",
+                    fields="id,name,mimeType,size,permissions(type,role)",
                     supportsAllDrives=True,
                 )
                 .execute
             )
-            mime_type = file_metadata.get("mimeType", "")
-            if not mime_type.startswith("image/"):
-                return f"Error: File {image_source} is not an image (MIME type: {mime_type})."
-
-            image_uri = f"https://drive.google.com/uc?id={image_source}"
-            source_description = f"Drive file {file_metadata.get('name', image_source)}"
         except Exception as e:
             return f"Error: Could not access Drive file {image_source}: {str(e)}"
+
+        mime_type = file_metadata.get("mimeType", "")
+        if not mime_type.startswith("image/"):
+            return (
+                f"Error: File {image_source} is not an image (MIME type: {mime_type})."
+            )
+
+        permissions = file_metadata.get("permissions") or []
+        is_public = any(
+            isinstance(p, dict) and p.get("type") == "anyone" for p in permissions
+        )
+        if not is_public:
+            name = file_metadata.get("name", image_source)
+            return _image_not_public_message(
+                image_source,
+                f"Drive file '{name}' ({image_source}) has no 'anyone' permission, "
+                f"so it is private",
+            )
+
+        image_uri = f"https://drive.google.com/uc?id={image_source}"
+        source_description = f"Drive file {file_metadata.get('name', image_source)}"
     else:
         image_uri = image_source
         source_description = "URL image"
@@ -876,11 +997,20 @@ async def insert_doc_image(
     # Use helper to create image request
     requests = [create_insert_image_request(index, image_uri, width, height)]
 
-    await asyncio.to_thread(
-        docs_service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
-        .execute
-    )
+    try:
+        await asyncio.to_thread(
+            docs_service.documents()
+            .batchUpdate(documentId=document_id, body={"requests": requests})
+            .execute
+        )
+    except HttpError as e:
+        if _is_image_fetch_error(e):
+            return _image_not_public_message(
+                image_source,
+                "Google could not fetch it (the Docs API reported that the image is "
+                "not publicly accessible, too large, or not PNG, JPEG or GIF)",
+            )
+        raise
 
     size_info = ""
     if width or height:
@@ -902,7 +1032,17 @@ async def update_doc_headers_footers(
     header_footer_type: str = "DEFAULT",
 ) -> str:
     """
-    Updates headers or footers in a Google Doc.
+    Updates headers or footers in a Google Doc, creating the section if needed.
+
+    If the document already has a matching header or footer, its first
+    paragraph is replaced with the new content. If it has none and
+    header_footer_type is "DEFAULT", the tool first sends a createHeader or
+    createFooter request, reads the new segment ID from the response, then
+    inserts the content into that segment at index 0. So a document this
+    server created with create_doc works first time. The Docs API has no
+    create request for FIRST_PAGE_ONLY or EVEN_PAGE sections; when one of
+    those is missing the tool returns an error asking for it to be switched
+    on in Google Docs first.
 
     Args:
         user_google_email: User's Google email address
@@ -1027,14 +1167,19 @@ async def inspect_doc_structure(
 
     WHAT THE OUTPUT SHOWS:
     - total_elements: Number of document elements
-    - total_length: Maximum safe index for insertion
+    - total_length: The document body's end index. This is NOT a valid
+      insertion index: the body always ends with a newline, so the largest
+      valid insertion index is total_length - 1.
+    - max_insertion_index: total_length - 1, the largest index at which text,
+      a table or an image can be inserted. Use this value to append.
     - tables: Number of existing tables
     - table_details: Position and dimensions of each table
 
     WORKFLOW:
     Step 1: Call this function
-    Step 2: Note the "total_length" value
-    Step 3: Use an index < total_length for table insertion
+    Step 2: Note the "max_insertion_index" value (equal to total_length - 1)
+    Step 3: Use max_insertion_index to append, or any smaller index inside a
+      paragraph to insert earlier (never a table's start index)
     Step 4: Create your table
 
     Args:
@@ -1060,6 +1205,7 @@ async def inspect_doc_structure(
         result = {
             "title": structure["title"],
             "total_length": structure["total_length"],
+            "max_insertion_index": max_insertion_index(doc),
             "statistics": {
                 "elements": len(structure["body"]),
                 "tables": len(structure["tables"]),
@@ -1151,9 +1297,16 @@ async def create_table_with_data(
     MANDATORY WORKFLOW - DO THESE STEPS IN ORDER:
 
     Step 1: ALWAYS call inspect_doc_structure first
-    Step 2: Use the 'total_length' value from inspect_doc_structure as your index
+    Step 2: Use the 'max_insertion_index' value (total_length - 1) from
+      inspect_doc_structure as your index to append the table at the end
     Step 3: Format data as 2D list: [["col1", "col2"], ["row1col1", "row1col2"]]
     Step 4: Call this function with the correct index and data
+
+    INDEX SAFETY:
+    The document body always ends with a newline, so 'total_length' itself is
+    one past the last valid insertion point. If you pass an index equal to or
+    greater than the document end index, this tool clamps it to end index - 1
+    and says so in the result, so the call still succeeds.
 
     EXAMPLE DATA FORMAT:
     table_data = [
@@ -1164,8 +1317,10 @@ async def create_table_with_data(
 
     CRITICAL INDEX REQUIREMENTS:
     - NEVER use index values like 1, 2, 10 without calling inspect_doc_structure first
-    - ALWAYS get index from inspect_doc_structure 'total_length' field
-    - Index must be a valid insertion point in the document
+    - ALWAYS get index from inspect_doc_structure 'max_insertion_index' field
+      (or 'total_length' - 1)
+    - Index must be a valid insertion point in the document (inside a paragraph,
+      not at a table's start index)
 
     DATA FORMAT REQUIREMENTS:
     - Must be 2D list of strings only
@@ -1178,7 +1333,9 @@ async def create_table_with_data(
         user_google_email: User's Google email address
         document_id: ID of the document to update
         table_data: 2D list of strings - EXACT format: [["col1", "col2"], ["row1col1", "row1col2"]]
-        index: Document position (MANDATORY: get from inspect_doc_structure 'total_length')
+        index: Document position (MANDATORY: get from inspect_doc_structure
+            'max_insertion_index', which is 'total_length' - 1; a value at or past
+            the document end index is clamped to end index - 1)
         bold_headers: Whether to make first row bold (default: true)
 
     Returns:
@@ -1200,6 +1357,9 @@ async def create_table_with_data(
     is_valid, error_msg = validator.validate_index(index, "Index")
     if not is_valid:
         return f"ERROR: {error_msg}"
+
+    # The body ends with a newline; inserting at the end index itself is a 400.
+    index, clamp_note = await _clamp_index_to_body(service, document_id, index)
 
     # Use TableOperationManager to handle the complex logic
     table_manager = TableOperationManager(service)
@@ -1223,9 +1383,7 @@ async def create_table_with_data(
         rows = metadata.get("rows", 0)
         columns = metadata.get("columns", 0)
 
-        return (
-            f"SUCCESS: {message}. Table: {rows}x{columns}, Index: {index}. Link: {link}"
-        )
+        return f"SUCCESS: {message}. Table: {rows}x{columns}, Index: {index}.{clamp_note} Link: {link}"
     else:
         return f"ERROR: {message}"
 

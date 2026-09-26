@@ -320,6 +320,35 @@ def get_next_paragraph_index(doc_data: dict[str, Any], after_index: int = 0) -> 
     return structure["total_length"] - 1 if structure["total_length"] > 0 else 1
 
 
+def get_body_end_index(doc_data: dict[str, Any]) -> Optional[int]:
+    """
+    Return the end index of the document body, or None if it cannot be read.
+
+    The body always ends with a newline, so the largest index at which text,
+    a table or an image can be inserted is this value minus 1. Inserting at
+    the end index itself makes the Docs API answer 400 "Index N must be less
+    than the end index of the referenced segment, N".
+    """
+    try:
+        content = doc_data.get("body", {}).get("content", [])
+        if not isinstance(content, list) or not content:
+            return None
+        end_index = content[-1].get("endIndex")
+    except (AttributeError, TypeError, IndexError):
+        return None
+    if isinstance(end_index, bool) or not isinstance(end_index, int):
+        return None
+    return end_index
+
+
+def max_insertion_index(doc_data: dict[str, Any]) -> Optional[int]:
+    """Largest valid insertion index for the document body, or None if unknown."""
+    end_index = get_body_end_index(doc_data)
+    if end_index is None:
+        return None
+    return max(end_index - 1, 1)
+
+
 def analyze_document_complexity(doc_data: dict[str, Any]) -> dict[str, Any]:
     """
     Analyze document complexity and provide statistics.
@@ -340,6 +369,7 @@ def analyze_document_complexity(doc_data: dict[str, Any]) -> dict[str, Any]:
             1 for e in structure["body"] if e.get("type") == "section_break"
         ),
         "total_length": structure["total_length"],
+        "max_insertion_index": max_insertion_index(doc_data),
         "has_headers": bool(structure["headers"]),
         "has_footers": bool(structure["footers"]),
     }
