@@ -4,6 +4,48 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.16.1] - 2026-09-26
+
+### Fixed
+
+Seven tool defects found by the live 121-tool battery after the FastMCP 4
+upgrade (see `FOLLOWUPS.md`, "Live tool battery"). None was caused by the
+upgrade; all are in tool code.
+
+- `update_contact_group` sent no `etag`, so every rename failed with
+  "Fingerprint is missing". It now reads the group first and sends the
+  `etag`, `updateGroupFields` and `readGroupFields` the People API expects.
+- `batch_update_contacts` sent `contacts` as a list. The People API wants a
+  map keyed by resourceName, each person carrying its `etag`, plus
+  `updateMask` and `readMask`. It now sends that shape and reports per
+  contact failures under "Not updated" instead of dropping them.
+- Contact results rendered a job title under the "Organization" label. The
+  request mapping was already right (`organizations[0].title` for the job
+  title, `organizations[0].name` for the company); the display now shows
+  "Organization" and "Job title" as separate lines.
+- `modify_doc_text` refused `text` plus a formatting flag without
+  `end_index`. It now inserts the text and styles the inserted range in one
+  batchUpdate; the replace path is unchanged.
+- `update_doc_headers_footers` could not act on a document with no header or
+  footer. It now issues `createHeader` / `createFooter` (type DEFAULT), reads
+  the new segment id from the reply and inserts into it. First-page and
+  even-page sections cannot be created through the API and are refused with
+  an explanation.
+- `create_table_with_data` and `insert_doc_elements` failed with a Google
+  400 when given the document end index, which is what `inspect_doc_structure`
+  told callers to use. Both now clamp to the last valid insertion index and
+  say so; `inspect_doc_structure` reports `max_insertion_index` and the three
+  descriptions are corrected.
+- `insert_doc_image` with a private Drive file id returned a raw 400. The
+  Docs API only fetches publicly readable images and this server will not
+  create public links, so the tool now checks the file's permissions first
+  and returns a clear message pointing at a public https URL instead; the
+  same message replaces the raw 400 on the URL path.
+
+Tests: `tests/gcontacts/test_contacts_api_shapes.py` (16) and
+`tests/gdocs/test_docs_live_battery_fixes.py` (31) pin the request bodies now
+sent. No tool, parameter or behaviour was removed.
+
 ## [1.16.0] - 2026-09-25
 
 ### Changed

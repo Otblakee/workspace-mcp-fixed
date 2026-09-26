@@ -940,3 +940,33 @@ capabilities, and `serverInfo.version` reading 4.0.10.
 (`healthCheckPath: /health`) and the Helm chart (`healthCheck.path`) have
 nothing version-specific and were not changed. `fastmcp.json` still uses the
 v1 schema and `fastmcp_server.py` as entrypoint.
+
+## Live battery fixes (v1.16.1)
+
+After 1.16.0 went live, every exposed tool was called against the deployed
+server (`FOLLOWUPS.md`, "Live tool battery after the FastMCP 4 upgrade").
+Seven tool defects came out of it, none caused by FastMCP 4, all fixed in
+1.16.1 with request-body tests. Two facts worth keeping:
+
+- **People API write shapes.** `contactGroups.update` needs the group's
+  current `etag` inside `contactGroup`; `people.batchUpdateContacts` needs
+  `contacts` as a map keyed by resourceName with each person's `etag`, plus
+  `updateMask` and `readMask`. A list body is rejected with "Cannot bind a
+  list to map". `_build_person_body` already mapped `organization` to
+  `organizations[0].name` and `job_title` to `organizations[0].title`; the
+  display in `_format_contact` was what mislabelled them.
+- **Docs API insertion limits.** The body always ends with a newline, so the
+  largest valid insertion index is `body.content[-1].endIndex - 1`;
+  `inspect_doc_structure` now reports it as `max_insertion_index` and the
+  insert tools clamp to it. `createHeader` / `createFooter` accept only type
+  `DEFAULT`; the reply carries the new segment id, which the follow-up
+  `insertText` needs as `segmentId`. `insertInlineImage` only fetches a
+  publicly readable URI; since no tool on this server creates a public link,
+  a private Drive image is refused with an explanation rather than shared.
+
+Not live-verified yet (recorded so the next battery closes them): whether
+`files.get` returns `permissions` for shared-drive images (if not, such an
+image is refused fail-closed even when public); the exact Google wording of
+the non-public image 400 (two phrases are matched); whether `getBatchGet`
+returns `etag` regardless of `personFields` (the code requests the updated
+fields plus `metadata`).
