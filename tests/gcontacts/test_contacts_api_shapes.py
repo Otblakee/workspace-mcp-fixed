@@ -11,6 +11,16 @@ B. ``batch_update_contacts`` sent ``contacts`` as a list, so
    Person carrying its current etag, plus ``updateMask`` and ``readMask``.
 C. A job title was rendered under the "Organization:" label in tool results.
 
+Two follow-ups from the adversarial review of those fixes:
+
+D. ``batch_update_contacts`` sends its field-set groups one after another.
+   An HttpError on a later group used to raise after an earlier group was
+   already committed, so a retry re-sent contacts that had changed. A
+   failing group is now recorded under "Not updated" and the run continues;
+   the call raises only when no group succeeded.
+E. A contact_id that appears twice in ``updates`` is refused up front with
+   a UserInputError, before any API call.
+
 Unit-scoped: the Google service is a MagicMock and the tools are exercised
 through the ``_unwrap`` pattern used across this suite.
 """
@@ -26,6 +36,7 @@ from googleapiclient.errors import HttpError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from core.utils import UserInputError  # noqa: E402
 from gcontacts import contacts_tools  # noqa: E402
 from gcontacts.contacts_tools import (  # noqa: E402
     CONTACT_GROUP_FIELDS,
@@ -462,3 +473,225 @@ class TestJobTitleAndOrganizationMapping:
         assert "Job title: CTO" in result
         assert "Job title: Analyst" in result
         assert "Organization: Analyst" not in result
+
+
+# ---------------------------------------------------------------------------
+# Defect D: a failing group does not raise after an earlier group committed
+# ---------------------------------------------------------------------------
+
+
+def _two_group_service(execute_side_effect):
+    """Two contacts whose updates land in different field-set groups."""
+    service = MagicMock()
+    people = service.people.return_value
+    people.getBatchGet.return_value.execute.return_value = {
+        "responses": [
+            {"person": {"resourceName": "people/c1", "etag": "etag-1"}},
+            {"person": {"resourceName": "people/c2", "etag": "etag-2"}},
+            {"person": {"resourceName": "people/c3", "etag": "etag-3"}},
+        ]
+    }
+    people.batchUpdateContacts.return_value.execute.side_effect = execute_side_effect
+    return service
+
+
+TWO_GROUP_UPDATES = [
+    # Group 1: emailAddresses
+    {"contact_id": "c1", "email": "a@example.com"},
+    # Group 2: names (two contacts, both must be reported when it fails)
+    {"contact_id": "c2", "given_name": "Bob"},
+    {"contact_id": "c3", "given_name": "Cat"},
+]
+
+
+class TestBatchUpdateContactsGroupFailureIsolation:
+    @pytest.mark.asyncio
+    async def test_second_group_http_error_is_reported_not_raised(self):
+        first_ok = {
+            "updateResult": {
+                "people/c1": {
+                    "person": {
+                        "resourceName": "people/c1",
+                        "emailAddresses": [{"value": "a@example.com"}],
+                    },
+                    "status": {"code": 0},
+                }
+            }
+        }
+        service = _two_group_service(
+            [first_ok, _http_error(429, "Quota exceeded for quota metric")]
+        )
+
+        result = await batch_update_contacts(
+            service=service,
+            user_google_email=USER,
+            updates=TWO_GROUP_UPDATES,
+        )
+
+        people = service.people.return_value
+        # Both groups were attempted; the failure did not stop the loop.
+        assert people.batchUpdateContacts.call_count == 2
+        assert "Updated 1 contacts" in result
+        assert "Not updated (2):" in result
+        assert "people/c2: batch update failed: HTTP 429" in result
+        assert "people/c3: batch update failed: HTTP 429" in result
+        assert "Quota exceeded" in result
+
+    @pytest.mark.asyncio
+    async def test_first_group_http_error_still_runs_the_second_group(self):
+        second_ok = {
+            "updateResult": {
+                "people/c2": {
+                    "person": {
+                        "resourceName": "people/c2",
+                        "names": [{"displayName": "Bob"}],
+                    },
+                    "status": {"code": 0},
+                },
+                "people/c3": {
+                    "person": {
+                        "resourceName": "people/c3",
+                        "names": [{"displayName": "Cat"}],
+                    },
+                    "status": {"code": 0},
+                },
+            }
+        }
+        service = _two_group_service([_http_error(500, "Backend Error"), second_ok])
+
+        result = await batch_update_contacts(
+            service=service,
+            user_google_email=USER,
+            updates=TWO_GROUP_UPDATES,
+        )
+
+        people = service.people.return_value
+        assert people.batchUpdateContacts.call_count == 2
+        sent_masks = [
+            call.kwargs["body"]["updateMask"]
+            for call in people.batchUpdateContacts.call_args_list
+        ]
+        assert sorted(sent_masks) == ["emailAddresses", "names"]
+        assert "Updated 2 contacts" in result
+        assert "Name: Bob" in result and "Name: Cat" in result
+        assert "Not updated (1):" in result
+        assert "people/c1: batch update failed: HTTP 500" in result
+
+    @pytest.mark.asyncio
+    async def test_every_group_failing_raises(self):
+        service = _two_group_service(
+            [_http_error(500, "Backend Error"), _http_error(500, "Backend Error")]
+        )
+
+        with pytest.raises(Exception) as excinfo:
+            await batch_update_contacts(
+                service=service,
+                user_google_email=USER,
+                updates=TWO_GROUP_UPDATES,
+            )
+
+        # Both groups were still attempted before giving up.
+        assert service.people.return_value.batchUpdateContacts.call_count == 2
+        assert "API error" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_single_group_http_error_still_raises(self):
+        """One group, it fails: nothing was committed, so the plain error
+        path (re-auth hint and all) is unchanged."""
+        service = _people_service(
+            [{"person": {"resourceName": "people/c1", "etag": "etag-1"}}]
+        )
+        service.people.return_value.batchUpdateContacts.return_value.execute.side_effect = _http_error(
+            403, "forbidden"
+        )
+
+        with pytest.raises(Exception) as excinfo:
+            await batch_update_contacts(
+                service=service,
+                user_google_email=USER,
+                updates=[{"contact_id": "c1", "email": "a@example.com"}],
+            )
+
+        assert "API error" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Defect E: duplicate contact_ids refused before any API call
+# ---------------------------------------------------------------------------
+
+
+class TestBatchUpdateContactsDuplicateIds:
+    @pytest.mark.asyncio
+    async def test_duplicate_contact_id_is_a_user_input_error(self):
+        service = _people_service(
+            [{"person": {"resourceName": "people/c1", "etag": "etag-1"}}]
+        )
+
+        with pytest.raises(UserInputError) as excinfo:
+            await batch_update_contacts(
+                service=service,
+                user_google_email=USER,
+                updates=[
+                    {"contact_id": "c1", "email": "a@example.com"},
+                    {"contact_id": "c1", "given_name": "Alice"},
+                ],
+            )
+
+        message = str(excinfo.value)
+        assert "Duplicate contact_id" in message
+        assert "people/c1" in message
+        assert "Nothing was changed" in message
+        people = service.people.return_value
+        people.getBatchGet.assert_not_called()
+        people.batchUpdateContacts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bare_and_prefixed_forms_count_as_the_same_contact(self):
+        service = _people_service([])
+
+        with pytest.raises(UserInputError) as excinfo:
+            await batch_update_contacts(
+                service=service,
+                user_google_email=USER,
+                updates=[
+                    {"contact_id": "c7", "email": "a@example.com"},
+                    {"contact_id": "people/c7", "phone": "+44 1234"},
+                ],
+            )
+
+        assert "people/c7" in str(excinfo.value)
+        service.people.return_value.getBatchGet.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_is_not_wrapped_in_a_generic_exception(self):
+        """The wrapper turns other exceptions into Exception("Unexpected
+        error: ..."); the duplicate check must surface as UserInputError."""
+        service = _people_service([])
+
+        with pytest.raises(UserInputError):
+            await batch_update_contacts(
+                service=service,
+                user_google_email=USER,
+                updates=[{"contact_id": "c1"}, {"contact_id": "c1"}],
+            )
+
+    @pytest.mark.asyncio
+    async def test_distinct_ids_pass_the_check(self):
+        service = _people_service(
+            [
+                {"person": {"resourceName": "people/c1", "etag": "etag-1"}},
+                {"person": {"resourceName": "people/c2", "etag": "etag-2"}},
+            ]
+        )
+
+        result = await batch_update_contacts(
+            service=service,
+            user_google_email=USER,
+            updates=[
+                {"contact_id": "c1", "email": "a@example.com"},
+                {"contact_id": "c2", "email": "b@example.com"},
+            ],
+        )
+
+        assert "Batch Update Results" in result
+        service.people.return_value.batchUpdateContacts.assert_called_once()

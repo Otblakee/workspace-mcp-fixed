@@ -12,9 +12,13 @@ the comparison; this module only stores and retrieves the rows.
 
 Sheet layout:
 
-* ``Ledger`` tab, append-only, one row per (apply, send-as address), columns
-  in ``LEDGER_HEADER`` order. ``applied_at`` is an ISO-8601 UTC timestamp so
-  "latest" is a plain string comparison.
+* ``Ledger`` tab, append-only, two rows per (live apply, send-as address),
+  columns in ``LEDGER_HEADER`` order: a ``pending`` row written BEFORE the
+  Gmail patch (``readback_hash`` is the literal ``pending``; the rollback
+  record ``previous_signature_html`` is already complete) and a completed
+  row written after the read-back, same ``run_id``. ``applied_at`` is an
+  ISO-8601 UTC timestamp so "latest" is a plain string comparison, and a
+  completed row always outranks the pending row of its own run.
 * One audit tab per audit run (name chosen by the caller), rewritten in full
   each time, columns in ``AUDIT_HEADER`` order.
 
@@ -46,11 +50,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from gdrive.drive_batch import execute_with_backoff
 
+from gsignatures.engine import PENDING_READBACK, is_pending_ledger_row
 from gsignatures.sa_auth import ENV_LEDGER_SHEET_ID
 
 logger = logging.getLogger(__name__)
 
 LEDGER_TAB = "Ledger"
+
+# Re-exported from the engine for callers that think in ledger terms.
+__all__ = [
+    "PENDING_READBACK",
+    "is_pending_ledger_row",
+    "outranks",
+]
 
 LEDGER_HEADER: List[str] = [
     "applied_at",
@@ -325,6 +337,29 @@ def ledger_key(record: Dict[str, Any]) -> Tuple[str, str]:
     )
 
 
+def _same_run(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    run_a = _cell(a.get("run_id")).strip()
+    run_b = _cell(b.get("run_id")).strip()
+    return bool(run_a) and run_a == run_b
+
+
+def outranks(candidate: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    """Whether ``candidate`` should replace ``current`` as the latest row
+    for one (user, send-as) key.
+
+    A completed row always outranks the ``pending`` row of the same
+    ``run_id``, whatever their timestamps or sheet order, and a pending row
+    never displaces the completed row of its own run. Otherwise the greater
+    ``applied_at`` wins and, on a tie, the row seen later (the candidate).
+    """
+    if _same_run(candidate, current):
+        candidate_pending = is_pending_ledger_row(candidate)
+        current_pending = is_pending_ledger_row(current)
+        if candidate_pending != current_pending:
+            return current_pending
+    return _cell(candidate.get("applied_at")) >= _cell(current.get("applied_at"))
+
+
 async def read_ledger_rows(sheets, sheet_id: str) -> List[Dict[str, str]]:
     """Every attributable ledger row as a dict, in sheet order.
 
@@ -376,14 +411,17 @@ async def read_ledger_latest(
     """Latest ledger row per ``(user_email, send_as_email)``, both lower-cased.
 
     "Latest" is the greatest ``applied_at`` string (ISO-8601 UTC compares
-    lexically); on a tie the later row in the sheet wins. Rows come from
-    ``read_ledger_rows`` and share its tolerance and refusals.
+    lexically); on a tie the later row in the sheet wins. The one exception
+    is the pair an apply writes: the completed row of a run outranks that
+    run's ``pending`` row whatever their order, so a pending row is only
+    ever the latest when its apply never completed (see ``outranks``). Rows
+    come from ``read_ledger_rows`` and share its tolerance and refusals.
     """
     latest: Dict[Tuple[str, str], Dict[str, str]] = {}
     for record in await read_ledger_rows(sheets, sheet_id):
         key = ledger_key(record)
         current = latest.get(key)
-        if current is None or record["applied_at"] >= current["applied_at"]:
+        if current is None or outranks(record, current):
             latest[key] = record
     return latest
 

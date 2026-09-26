@@ -4,9 +4,10 @@ Cron entry point: ``python -m gsignatures.audit_cli [scope] [--no-report]``.
 Audits Gmail signatures against the ledger and exits:
 
 * ``0`` when every row is ``in_sync`` or ``unmanaged``;
-* ``2`` when any row is ``never_applied``, ``stale_template``,
-  ``stale_directory``, ``changed_since_apply`` or ``error`` (drift: Render
-  records the failed run, and a human decides whether to re-apply);
+* ``2`` when any row is ``never_applied``, ``apply_interrupted``,
+  ``stale_template``, ``stale_directory``, ``changed_since_apply`` or
+  ``error`` (drift: Render records the failed run, and a human decides
+  whether to re-apply);
 * ``1`` on a fatal error (config, service-account auth, ledger, or a
   command line argparse rejects) with a one-line reason on stderr. A usage
   error is deliberately 1, not argparse's own 2, so a mistyped cron command

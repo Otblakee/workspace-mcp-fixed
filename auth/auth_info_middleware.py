@@ -99,6 +99,11 @@ class AuthInfoMiddleware(Middleware):
 
         authenticated_user = None
         auth_via = None
+        # Set when a FastMCP-validated token was present but failed the
+        # domain policy. Such a request must not be rescued by a later
+        # branch (bearer header, stdio, session binding): the caller
+        # presented an identity and that identity was refused.
+        policy_rejected = False
 
         # First check if FastMCP has already validated an access token
         try:
@@ -118,6 +123,7 @@ class AuthInfoMiddleware(Middleware):
                             f"Rejecting FastMCP-validated token for {user_email}: {reason}"
                         )
                         access_token = None
+                        policy_rejected = True
                     else:
                         logger.info(
                             f"✓ Using FastMCP validated token for user: {user_email}"
@@ -139,6 +145,13 @@ class AuthInfoMiddleware(Middleware):
                     )
         except Exception as e:
             logger.debug(f"Could not get FastMCP access_token: {e}")
+
+        if policy_rejected:
+            # Terminal: no identity is set and no later branch is tried.
+            logger.debug(
+                "Domain policy rejected the presented token; skipping fallback auth paths"
+            )
+            return
 
         # Try to get the HTTP request to extract Authorization header
         if not authenticated_user:

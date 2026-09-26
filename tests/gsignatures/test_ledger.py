@@ -583,3 +583,141 @@ class TestWriteAuditReport:
             )
         assert "values.clear" not in sheets.names()
         assert sheets.tabs["Audit"][1] == ["keep"] * 11
+
+
+# ---------------------------------------------------------------------------
+# pending rows: the completed row of a run always outranks its pending row
+# ---------------------------------------------------------------------------
+
+
+class TestReadLedgerLatestPendingRows:
+    @pytest.mark.asyncio
+    async def test_completed_row_outranks_pending_row_of_the_same_run(self):
+        """Pending first, completed second, same run_id, same timestamp
+        (the apply stamps to the second): the completed row is latest."""
+        sheets = FakeSheets(
+            {
+                "Ledger": [
+                    ledger.LEDGER_HEADER,
+                    _row_values(
+                        applied_at="2026-09-26T09:00:00Z",
+                        readback_hash=ledger.PENDING_READBACK,
+                        run_id="run-9",
+                    ),
+                    _row_values(
+                        applied_at="2026-09-26T09:00:00Z",
+                        readback_hash="real",
+                        run_id="run-9",
+                    ),
+                ]
+            }
+        )
+        latest = await ledger.read_ledger_latest(sheets, SHEET_ID)
+        alice = latest[("alice@otbgroup.co.uk", "alice@otbgroup.co.uk")]
+        assert alice["readback_hash"] == "real"
+        assert not ledger.is_pending_ledger_row(alice)
+
+    @pytest.mark.asyncio
+    async def test_pending_row_never_displaces_completed_row_of_its_run(self):
+        """Even listed after and stamped later, the pending row of run-9
+        loses to run-9's completed row."""
+        sheets = FakeSheets(
+            {
+                "Ledger": [
+                    ledger.LEDGER_HEADER,
+                    _row_values(
+                        applied_at="2026-09-26T09:00:00Z",
+                        readback_hash="real",
+                        run_id="run-9",
+                    ),
+                    _row_values(
+                        applied_at="2026-09-26T09:00:05Z",
+                        readback_hash=ledger.PENDING_READBACK,
+                        run_id="run-9",
+                    ),
+                ]
+            }
+        )
+        latest = await ledger.read_ledger_latest(sheets, SHEET_ID)
+        alice = latest[("alice@otbgroup.co.uk", "alice@otbgroup.co.uk")]
+        assert alice["readback_hash"] == "real"
+
+    @pytest.mark.asyncio
+    async def test_pending_row_with_no_completed_row_is_the_latest(self):
+        """An interrupted apply: the pending row stands, so the audit can
+        report it and a restore can use it."""
+        sheets = FakeSheets(
+            {
+                "Ledger": [
+                    ledger.LEDGER_HEADER,
+                    _row_values(
+                        applied_at="2026-09-25T09:00:00Z",
+                        readback_hash="older-real",
+                        run_id="run-8",
+                    ),
+                    _row_values(
+                        applied_at="2026-09-26T09:00:00Z",
+                        readback_hash=ledger.PENDING_READBACK,
+                        run_id="run-9",
+                        previous_signature_html="<div>before run-9</div>",
+                    ),
+                ]
+            }
+        )
+        latest = await ledger.read_ledger_latest(sheets, SHEET_ID)
+        alice = latest[("alice@otbgroup.co.uk", "alice@otbgroup.co.uk")]
+        assert ledger.is_pending_ledger_row(alice)
+        assert alice["run_id"] == "run-9"
+        assert alice["previous_signature_html"] == "<div>before run-9</div>"
+
+    @pytest.mark.asyncio
+    async def test_newer_run_outranks_older_run_whatever_its_state(self):
+        """Across runs the timestamp rule is unchanged: a newer completed
+        row beats an older pending one, and a newer pending row (an
+        interrupted re-apply) beats an older completed one."""
+        sheets = FakeSheets(
+            {
+                "Ledger": [
+                    ledger.LEDGER_HEADER,
+                    _row_values(
+                        applied_at="2026-09-25T09:00:00Z",
+                        readback_hash=ledger.PENDING_READBACK,
+                        run_id="run-8",
+                    ),
+                    _row_values(
+                        applied_at="2026-09-26T09:00:00Z",
+                        readback_hash="real-9",
+                        run_id="run-9",
+                    ),
+                    _row_values(
+                        applied_at="2026-09-27T09:00:00Z",
+                        readback_hash=ledger.PENDING_READBACK,
+                        run_id="run-10",
+                    ),
+                ]
+            }
+        )
+        latest = await ledger.read_ledger_latest(sheets, SHEET_ID)
+        alice = latest[("alice@otbgroup.co.uk", "alice@otbgroup.co.uk")]
+        assert alice["run_id"] == "run-10"
+        assert ledger.is_pending_ledger_row(alice)
+
+    def test_outranks_rules(self):
+        pending = _row(readback_hash=ledger.PENDING_READBACK, run_id="r")
+        completed = _row(readback_hash="h", run_id="r")
+        assert ledger.outranks(completed, pending)
+        assert not ledger.outranks(pending, completed)
+        # Same run, both pending or both completed: timestamp rule, later wins.
+        later = _row(applied_at="2026-09-25T10:00:01Z", run_id="r")
+        assert ledger.outranks(later, completed)
+        assert not ledger.outranks(completed, later)
+        assert ledger.outranks(completed, _row(run_id="r"))  # tie: candidate wins
+        # No run_id on either: plain timestamp rule, pending or not.
+        no_run_pending = _row(readback_hash=ledger.PENDING_READBACK, run_id="")
+        no_run_done = _row(readback_hash="h", run_id="")
+        assert ledger.outranks(no_run_pending, no_run_done)
+
+    def test_pending_marker_is_reexported(self):
+        from gsignatures.engine import PENDING_READBACK
+
+        assert ledger.PENDING_READBACK == PENDING_READBACK == "pending"

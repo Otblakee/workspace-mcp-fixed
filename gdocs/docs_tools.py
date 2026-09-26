@@ -143,6 +143,41 @@ async def _clamp_index_to_body(
     return clamped, note
 
 
+async def _clamp_end_index_to_body(
+    service: Any, document_id: str, end_index: int
+) -> tuple[int, str]:
+    """
+    Clamp a range end so it stays inside the document body.
+
+    Same rule as _clamp_index_to_body, for the exclusive end of a range: the
+    body's final newline cannot be deleted or restyled, so the largest valid
+    end_index is max_insertion_index (body end index minus 1). Callers copy
+    total_length straight out of inspect_doc_structure as end_index, and
+    the Docs API rejects that with 400.
+
+    Returns:
+        (end_index_to_use, note) where note is "" when nothing changed and a
+        sentence describing the adjustment otherwise. If the document cannot
+        be read the end_index is returned unchanged.
+    """
+    doc = await asyncio.to_thread(
+        service.documents().get(documentId=document_id).execute
+    )
+    limit = max_insertion_index(doc)
+    if limit is None or end_index <= limit:
+        return end_index, ""
+    body_end = get_body_end_index(doc)
+    note = (
+        f" Requested end_index {end_index} is at or past the document end index "
+        f"{body_end}; used {limit}, the largest valid insertion index."
+    )
+    logger.info(
+        f"[_clamp_end_index_to_body] Doc={document_id}: end_index {end_index} "
+        f"clamped to {limit}"
+    )
+    return limit, note
+
+
 _IMAGE_NOT_PUBLIC_MARKERS = ("problem retrieving the image", "publicly accessible")
 
 
@@ -656,6 +691,21 @@ async def modify_doc_text(
         if not is_valid:
             return f"Error: {error_msg}"
 
+    # A range end at or past the body end index is a 400 from the Docs API
+    # (the final newline cannot be deleted or restyled). Clamp it the same
+    # way the insert tools clamp their insertion index.
+    clamp_note = ""
+    if end_index is not None:
+        end_index, clamp_note = await _clamp_end_index_to_body(
+            service, document_id, end_index
+        )
+        if end_index <= start_index:
+            return (
+                f"Error: start_index {start_index} is at or past the largest valid "
+                f"index {end_index} for this document; nothing lies in the range. "
+                "Use inspect_doc_structure and its max_insertion_index."
+            )
+
     requests = []
     operations = []
 
@@ -756,7 +806,7 @@ async def modify_doc_text(
     link = f"https://docs.google.com/document/d/{document_id}/edit"
     operation_summary = "; ".join(operations)
     text_info = f" Text length: {len(text)} characters." if text else ""
-    return f"{operation_summary} in document {document_id}.{text_info} Link: {link}"
+    return f"{operation_summary} in document {document_id}.{text_info}{clamp_note} Link: {link}"
 
 
 @server.tool()
@@ -1709,6 +1759,19 @@ async def update_paragraph_style(
     if end_index <= start_index:
         return "Error: end_index must be greater than start_index"
 
+    # The body's final newline cannot be restyled, so an end_index at or past
+    # the body end index (total_length from inspect_doc_structure) is a 400.
+    # Clamp it the same way the insert tools clamp their insertion index.
+    end_index, clamp_note = await _clamp_end_index_to_body(
+        service, document_id, end_index
+    )
+    if end_index <= start_index:
+        return (
+            f"Error: start_index {start_index} is at or past the largest valid "
+            f"index {end_index} for this document; nothing lies in the range. "
+            "Use inspect_doc_structure and its max_insertion_index."
+        )
+
     # Validate list parameters
     list_type_value = list_type
     if list_type_value is not None:
@@ -1845,7 +1908,7 @@ async def update_paragraph_style(
         summary_parts.append(list_desc)
 
     link = f"https://docs.google.com/document/d/{document_id}/edit"
-    return f"Applied paragraph formatting ({', '.join(summary_parts)}) to range {start_index}-{end_index} in document {document_id}. Link: {link}"
+    return f"Applied paragraph formatting ({', '.join(summary_parts)}) to range {start_index}-{end_index} in document {document_id}.{clamp_note} Link: {link}"
 
 
 @server.tool()

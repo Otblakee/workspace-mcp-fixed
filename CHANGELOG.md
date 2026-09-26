@@ -4,6 +4,68 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.16.2] - 2026-09-26
+
+### Fixed
+
+Findings from a three-lens adversarial review of the whole code base (trust
+boundaries, correctness, data safety) run before 1.16.1 merged. The review
+found no defect in 1.16.1 itself. Policy-level findings that change what a
+connected client may do are parked in `FOLLOWUPS.md` ("Adversarial review,
+tier 3") for the owner's decision; everything below is a plain fix.
+
+- Attachment files written before a restart were never deleted: expiry was
+  tracked in memory only, so every deploy orphaned whatever had been
+  downloaded and the 1 GB Render disk that also holds the tokens would fill
+  over time. `AttachmentStorage` now sweeps its directory by file age on
+  start and on every cleanup, and enforces a total-size cap
+  (`WORKSPACE_ATTACHMENT_MAX_BYTES`, default 512 MiB, oldest evicted first).
+- The OAuth proxy `DiskStore` had no size limit; it now gets one
+  (`WORKSPACE_MCP_OAUTH_PROXY_DISK_MAX_BYTES`, default 256 MiB).
+- Audit error text was written unredacted, so a failed `create_drive_file`
+  with a presigned `fileUrl` put the whole signed URL in the Sheet. Error
+  text is now scrubbed: URLs reduced to scheme and host, Google access
+  tokens and JWTs replaced with `<token>`, then truncated as before.
+- The start-up banner printed eight characters of the OAuth client secret,
+  which also seeds the proxy's JWT and Fernet keys. It now prints only "set"
+  or "not set".
+- `validate_file_path` now refuses `/etc/secrets` and the OAuth proxy disk
+  directory outright, so the mail-attachment guard no longer depends on the
+  home-directory allowlist staying narrow.
+- A FastMCP-validated token rejected by the domain policy no longer falls
+  through to the session-binding branch; the rejection is terminal. A
+  request with no token behaves as before.
+- A failed audit start at boot left the process unaudited for its lifetime;
+  the flag now resets so the next tool call retries.
+- `update_doc_headers_footers` targeted the wrong section on a document
+  with more than one header or footer (the id patterns matched everything).
+  It now reads the ids from `documentStyle`, so first-page and even-page
+  requests hit the right segment and the DEFAULT create path fires only
+  when the default is genuinely missing.
+- The 1.16.1 index clamp covered insertions only; `modify_doc_text` (replace
+  path) and `update_paragraph_style` now clamp `end_index` to the last valid
+  index too.
+- `batch_update_contacts` could commit one field group then report the whole
+  call as failed when a later group raised; each group's failure is now
+  recorded under "Not updated" and the run continues. Duplicate contact ids
+  in one call are refused up front.
+- `get_events` and `list_spreadsheets` truncated silently at the page size;
+  both now say "More results available" when the API returns a page token
+  (`list_spreadsheets` had to request the token field to see it at all).
+- Signature apply wrote Gmail before the ledger row that holds the rollback
+  HTML, so a mid-run kill lost the record. A `pending` row is now appended
+  before the patch and the completed row after; a pending row with no
+  completed row audits as the new status `apply_interrupted` and can still
+  be restored from. The ledger-failed gating is unchanged: if the pending
+  row cannot be written, no patch happens.
+
+### Configuration applied on Render alongside this release
+
+- `OAUTH_ALLOWED_EMAIL_DOMAINS` and `DRIVE_PERMISSION_ALLOWED_DOMAINS` are
+  now set to the five tenant domains. Before this any Google account that
+  completed consent could use the server, and an individual Drive grant
+  could go to any external address.
+
 ## [1.16.1] - 2026-09-26
 
 ### Fixed

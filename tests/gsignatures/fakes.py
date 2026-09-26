@@ -88,6 +88,9 @@ class FakeGmail:
         }
         self.sanitise = lambda html: html.replace("<!-- c -->", "")
         self.fail_patch_for: Dict[str, Exception] = {}
+        # When set, every patch appends ("sendAs.patch", sendAsEmail) here.
+        # Share one list with a FakeSheets to see writes in wall-clock order.
+        self.timeline: Optional[List[tuple]] = None
 
     def call_names(self) -> List[str]:
         return [name for name, _ in self.calls]
@@ -110,6 +113,8 @@ class FakeGmail:
             def patch(self, **kwargs):
                 parent.calls.append(("sendAs.patch", kwargs))
                 address = kwargs["sendAsEmail"]
+                if parent.timeline is not None:
+                    parent.timeline.append(("sendAs.patch", address))
                 if address in parent.fail_patch_for:
                     return request(parent.fail_patch_for[address])
                 entry = parent.send_as[address]
@@ -250,7 +255,10 @@ class FakeSheets:
     """Sheets double: ``tabs`` maps a tab title to its rows.
 
     ``fail_reads`` / ``fail_writes`` make every read or write raise, for the
-    "ledger unreachable" cases.
+    "ledger unreachable" cases. ``fail_append`` makes every append raise;
+    ``fail_append_on_calls`` names the 1-based append calls that raise (for
+    example ``{2}`` fails the completed row of the first address and nothing
+    else). ``append_calls`` counts appends attempted, failed ones included.
     """
 
     def __init__(self, tabs=None):
@@ -261,6 +269,11 @@ class FakeSheets:
         self.fail_reads: Optional[Exception] = None
         self.fail_writes: Optional[Exception] = None
         self.fail_append: Optional[Exception] = None
+        self.fail_append_on_calls: Dict[int, Exception] = {}
+        self.append_calls: int = 0
+        # When set, every append records ("values.append", [send_as, ...])
+        # here. Share one list with a FakeGmail to see writes in order.
+        self.timeline: Optional[List[tuple]] = None
 
     def names(self) -> List[str]:
         return [c[0] for c in self.calls]
@@ -284,10 +297,27 @@ class FakeSheets:
 
             def append(self, **kwargs):
                 parent.calls.append(("values.append", kwargs))
+                parent.append_calls += 1
+                if parent.timeline is not None:
+                    from gsignatures.ledger import LEDGER_HEADER
+
+                    send_as_col = LEDGER_HEADER.index("send_as_email")
+                    readback_col = LEDGER_HEADER.index("readback_hash")
+                    parent.timeline.append(
+                        (
+                            "values.append",
+                            [
+                                (row[send_as_col], row[readback_col])
+                                for row in kwargs["body"]["values"]
+                            ],
+                        )
+                    )
                 if parent.fail_writes is not None:
                     return request(parent.fail_writes)
                 if parent.fail_append is not None:
                     return request(parent.fail_append)
+                if parent.append_calls in parent.fail_append_on_calls:
+                    return request(parent.fail_append_on_calls[parent.append_calls])
                 tab = _tab_of(kwargs["range"])
                 parent.tabs.setdefault(tab, []).extend(kwargs["body"]["values"])
                 return request(
@@ -345,8 +375,20 @@ class FakeSheets:
         return _Spreadsheets()
 
     def ledger_rows(self) -> List[dict]:
-        """Ledger data rows as dicts (header excluded)."""
+        """Ledger data rows as dicts (header excluded), pending rows included."""
         from gsignatures.ledger import LEDGER_HEADER, LEDGER_TAB
 
         rows = self.tabs.get(LEDGER_TAB, [])
         return [dict(zip(LEDGER_HEADER, r)) for r in rows[1:]]
+
+    def completed_ledger_rows(self) -> List[dict]:
+        """Ledger data rows whose apply completed (no ``pending`` rows)."""
+        from gsignatures.ledger import is_pending_ledger_row
+
+        return [r for r in self.ledger_rows() if not is_pending_ledger_row(r)]
+
+    def pending_ledger_rows(self) -> List[dict]:
+        """Only the ``pending`` rows an apply writes before its patch."""
+        from gsignatures.ledger import is_pending_ledger_row
+
+        return [r for r in self.ledger_rows() if is_pending_ledger_row(r)]

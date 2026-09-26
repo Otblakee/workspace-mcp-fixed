@@ -352,6 +352,7 @@ async def get_events(
     )
 
     # Handle single event retrieval
+    more_available = False
     if event_id:
         logger.info(f"[get_events] Retrieving single event with ID: {event_id}")
         event = await asyncio.to_thread(
@@ -405,6 +406,10 @@ async def get_events(
             lambda: service.events().list(**request_params).execute()
         )
         items = events_result.get("items", [])
+        # The API pages at maxResults. A nextPageToken means the range holds
+        # more events than were returned; say so instead of truncating in
+        # silence. The default page size is unchanged.
+        more_available = bool(events_result.get("nextPageToken"))
     if not items:
         if event_id:
             return f"Event with ID '{event_id}' not found in calendar '{calendar_id}' for {user_google_email}."
@@ -508,6 +513,10 @@ async def get_events(
             f"Successfully retrieved {len(items)} events from calendar '{calendar_id}' for {user_google_email}:\n"
             + "\n".join(event_details_list)
         )
+        if more_available:
+            text_output += (
+                "\nMore results available: raise max_results or narrow the range."
+            )
 
     logger.info(f"Successfully retrieved {len(items)} events for {user_google_email}.")
     return text_output

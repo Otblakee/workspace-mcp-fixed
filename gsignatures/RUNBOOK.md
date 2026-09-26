@@ -75,10 +75,19 @@ re-check the client ID and scope list once it has failed for more than a day.
    user, so this share is the only way it can write.
 3. Note the Sheet ID from the URL for step 4.
 
-The ledger is append-only by convention. Every live apply adds one row per
-send-as address with the hash Gmail returned after the write and the
-previous signature HTML. Audits compare Gmail against these rows. Do not edit
-or delete rows; if something is wrong, apply again (the new row wins).
+The ledger is append-only by convention. Every live apply adds two rows per
+send-as address, in this order: a `pending` row written before the Gmail
+patch (`readback_hash` is the word `pending`; the previous signature HTML
+and its hash are already filled in, so the rollback record exists before
+anything changes in Gmail), then a completed row written after the patch
+with the hash Gmail returned, same `run_id`. Every read prefers the
+completed row of a run over its pending row. A pending row with no
+completed row means the apply was interrupted (or its patch failed) after
+the ledger write; the audit reports that address as `apply_interrupted`
+until it is re-applied or restored, and `restore_email_signature` can
+restore from the pending row. Audits compare Gmail against these rows. Do
+not edit or delete rows; if something is wrong, apply again (the new row
+wins).
 
 ## 4. Render environment group `signatures`
 
@@ -162,8 +171,9 @@ session: the tools accept only the OAuth 2.1 authentication paths.
 4. `set_email_signature(user_email="oliver@otbgroup.co.uk", dry_run=False,
    confirm=True)`: the primary, live. Then the same with
    `send_as_email="oliver@bir-d.co.uk"` (one alias). Keep both result tables.
-5. Open the ledger Sheet: two rows, `readback_hash` filled, the old
-   signature in `previous_signature_html`.
+5. Open the ledger Sheet: four rows, a `pending` row then a completed row
+   for each address, `readback_hash` filled on the completed rows, the old
+   signature in `previous_signature_html` on all four.
 6. Check the signature in Gmail on the web (Settings > See all settings >
    General > Signature, and compose a message) and in the Gmail app on a
    phone (compose; if a plain-text mobile signature is set in the app it
@@ -214,7 +224,8 @@ Create a cron job in the same Render workspace:
 
 The cron audits only. It never re-applies a signature. Its exit code is the
 signal: `0` when every managed address matches the ledger, `2` when any row
-is `never_applied`, `stale_template`, `stale_directory` (the person's job
+is `never_applied`, `apply_interrupted` (a `pending` ledger row with no
+completed row), `stale_template`, `stale_directory` (the person's job
 title or mobile changed in the Directory since the apply, so the signature
 is out of date), `changed_since_apply` or `error`, `1` on a fatal error
 (config, key, ledger, or a mistyped command line). Render records a
@@ -240,7 +251,9 @@ Fastest to slowest:
    `restore_email_signature(user_email="...", send_as_email="...")` puts back
    the `previous_signature_html` from the latest ledger row for that address
    (pass `run_id="..."` to pick an older row; the run_id is in the result
-   table you kept and in the ledger). Dry run by default; repeat with
+   table you kept and in the ledger). A `pending` row left by an
+   interrupted apply is a valid source: its rollback record was written
+   before the patch. Dry run by default; repeat with
    `dry_run=False, confirm=True` to restore. The restore is itself a ledger
    row (versions `restored`, the replaced signature in
    `previous_signature_html`), so it can be reversed the same way. An empty

@@ -194,9 +194,9 @@ class TestHeaderFooterSegmentId:
 
         service = MagicMock()
         service.documents.return_value.get.return_value.execute.return_value = {
+            "documentStyle": {"defaultHeaderId": "hdr.abc123"},
             "headers": {
                 "hdr.abc123": {
-                    "type": "DEFAULT",
                     "content": [
                         {
                             "startIndex": 0,
@@ -205,7 +205,7 @@ class TestHeaderFooterSegmentId:
                         }
                     ],
                 }
-            }
+            },
         }
         service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
 
@@ -234,6 +234,7 @@ class TestHeaderFooterSegmentId:
 
         service = MagicMock()
         service.documents.return_value.get.return_value.execute.return_value = {
+            "documentStyle": {"defaultFooterId": "ftr.xyz789"},
             "footers": {
                 "ftr.xyz789": {
                     "content": [
@@ -244,7 +245,7 @@ class TestHeaderFooterSegmentId:
                         }
                     ],
                 }
-            }
+            },
         }
         service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
 

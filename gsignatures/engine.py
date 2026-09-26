@@ -985,6 +985,25 @@ def plan_for_user(
 # ---------------------------------------------------------------------------
 
 
+# ``readback_hash`` of the ledger row an apply writes BEFORE it patches
+# Gmail. The completed row that follows the patch carries the real read-back
+# hash. A pending row that is never followed by a completed row for the same
+# run means the process died (or the patch failed) between the two writes;
+# its ``previous_signature_html`` is still a valid rollback record.
+PENDING_READBACK = "pending"
+
+# Drift status for an address whose latest ledger row is still pending.
+APPLY_INTERRUPTED = "apply_interrupted"
+
+
+def is_pending_ledger_row(ledger_row: Optional[Dict[str, Any]]) -> bool:
+    """Whether a ledger row is the pre-patch row of an apply that never
+    recorded its completion."""
+    if not ledger_row:
+        return False
+    return str(ledger_row.get("readback_hash") or "").strip() == PENDING_READBACK
+
+
 def drift_status(
     planned: PlannedSignature,
     current_signature_html: Optional[str],
@@ -992,8 +1011,12 @@ def drift_status(
 ) -> Tuple[str, str]:
     """Compare what Gmail holds now with what the ledger says was applied.
 
-    Checked in this order: unmanaged, error, never_applied, stale_template,
-    stale_directory, changed_since_apply, in_sync. ``stale_directory`` means
+    Checked in this order: unmanaged, error, never_applied,
+    apply_interrupted, stale_template, stale_directory, changed_since_apply,
+    in_sync. ``apply_interrupted`` means the latest ledger row is the
+    pre-patch ``pending`` row and no completed row followed it: the apply
+    was cut off (or its patch failed) after the rollback record was written,
+    so nothing is known about what Gmail holds. ``stale_directory`` means
     the fresh render no longer hashes to the ledger's ``rendered_hash`` (the
     person's Directory data changed since the apply), which is still a
     judgement against the ledger, not against Gmail. The comparison for
@@ -1007,6 +1030,14 @@ def drift_status(
         return "error", planned.reason or "plan error"
     if not ledger_row:
         return "never_applied", "no ledger row for this address"
+    if is_pending_ledger_row(ledger_row):
+        return (
+            APPLY_INTERRUPTED,
+            f"ledger holds a pending row (run_id {ledger_row.get('run_id') or '?'}, "
+            f"{ledger_row.get('applied_at') or '?'}) with no completed row: the "
+            "apply was interrupted between the ledger write and the Gmail "
+            "read-back; re-apply, or restore from that row",
+        )
 
     ledger_tv = str(ledger_row.get("template_version") or "")
     ledger_sv = str(ledger_row.get("statutory_version") or "")

@@ -54,6 +54,30 @@ def get_package_version() -> str:
 _auth_provider: Optional[GoogleProvider] = None
 _legacy_callback_registered = False
 
+# Size cap for the OAuth proxy's on-disk store. diskcache evicts least
+# recently used entries once the cache reaches this size, so the store
+# cannot grow without bound on the persistent disk. Default 256 MiB.
+DEFAULT_OAUTH_PROXY_DISK_MAX_BYTES = 256 * 1024 * 1024
+
+
+def get_oauth_proxy_disk_max_bytes() -> int:
+    """Read WORKSPACE_MCP_OAUTH_PROXY_DISK_MAX_BYTES, falling back to the default."""
+    raw = os.getenv("WORKSPACE_MCP_OAUTH_PROXY_DISK_MAX_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_OAUTH_PROXY_DISK_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "WORKSPACE_MCP_OAUTH_PROXY_DISK_MAX_BYTES=%r is not an integer; using default %d",
+            raw,
+            DEFAULT_OAUTH_PROXY_DISK_MAX_BYTES,
+        )
+        return DEFAULT_OAUTH_PROXY_DISK_MAX_BYTES
+    if value <= 0:
+        return DEFAULT_OAUTH_PROXY_DISK_MAX_BYTES
+    return value
+
 
 # Custom FastMCP that adds secure middleware stack for OAuth 2.1
 class SecureFastMCP(FastMCP):
@@ -117,7 +141,14 @@ async def _ensure_audit_started() -> None:
     try:
         await audit_logger().start()
     except Exception as e:
-        logger.error("Audit logger failed to start; continuing without audit: %s", e)
+        # Reset the flag so the next tool call retries. Without this a single
+        # transient failure at boot would leave the process unaudited until
+        # the next deploy.
+        _audit_started = False
+        logger.warning(
+            "Audit logger failed to start; will retry on the next tool call: %s",
+            e,
+        )
 
 
 async def _ensure_audit_stopped() -> None:
@@ -428,7 +459,10 @@ def configure_server_for_http():
                                 "~/.fastmcp/oauth-proxy"
                             )
 
-                    client_storage = DiskStore(directory=disk_directory)
+                    client_storage = DiskStore(
+                        directory=disk_directory,
+                        max_size=get_oauth_proxy_disk_max_bytes(),
+                    )
 
                     jwt_signing_key = validate_and_derive_jwt_key(
                         jwt_signing_key_override, config.client_secret
@@ -444,8 +478,9 @@ def configure_server_for_http():
                         fernet=Fernet(key=storage_encryption_key),
                     )
                     logger.info(
-                        "OAuth 2.1: Using DiskStore for FastMCP OAuth proxy client_storage (directory=%s)",
+                        "OAuth 2.1: Using DiskStore for FastMCP OAuth proxy client_storage (directory=%s, max_size=%d)",
                         disk_directory,
+                        get_oauth_proxy_disk_max_bytes(),
                     )
                 except ImportError as exc:
                     logger.warning(

@@ -667,10 +667,15 @@ class TestSetEmailSignature:
         assert "applied" in out
         assert pool.patch_calls() == [(ALICE, ALICE)]
         rows = sheets.ledger_rows()
-        assert len(rows) == 1
-        assert rows[0]["actor"] == OWNER
-        assert rows[0]["previous_signature_html"] == OLD_PRIMARY
-        assert rows[0]["run_id"] in out
+        # The pending row (written before the patch) and the completed row.
+        assert len(rows) == 2
+        assert rows[0]["readback_hash"] == "pending"
+        assert rows[1]["readback_hash"] not in ("", "pending")
+        for row in rows:
+            assert row["actor"] == OWNER
+            assert row["previous_signature_html"] == OLD_PRIMARY
+            assert row["run_id"] in out
+        assert "pending row" in out
 
     @pytest.mark.asyncio
     async def test_force_is_passed_through(self, runtime, as_owner):
@@ -774,7 +779,8 @@ class TestApplyEmailSignatures:
         assert "applied" in out
         assert "signatures-apply-" in out
         assert set(pool.patch_calls()) == {(ALICE, ALICE), (ALICE, ALICE_JIT)}
-        assert len(sheets.ledger_rows()) == 2
+        assert len(sheets.ledger_rows()) == 4
+        assert len(sheets.completed_ledger_rows()) == 2
 
     @pytest.mark.asyncio
     async def test_max_users_refusal(self, runtime, as_owner, pool):
@@ -831,7 +837,9 @@ class TestApplyEmailSignatures:
         )
         assert "LEDGER FAILED MID-RUN" in out
         assert operations.LEDGER_FAILED_REASON in out
-        assert pool.patch_calls() == [(ALICE, ALICE)]
+        assert operations.LEDGER_PENDING_FAILED_REASON in out
+        # The pending row could not be written, so nothing was patched.
+        assert pool.patch_calls() == []
 
     @pytest.mark.asyncio
     async def test_read_only_server_refuses_a_live_write_and_allows_dry_run(
