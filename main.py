@@ -245,12 +245,9 @@ def main():
     # Active Configuration
     safe_print("⚙️ Active Configuration:")
 
-    # Redact client secret for security
-    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "Not Set")
+    # Never print any part of the client secret, not even a prefix or suffix.
     redacted_secret = (
-        f"{client_secret[:4]}...{client_secret[-4:]}"
-        if len(client_secret) > 8
-        else "Invalid or too short"
+        "set" if os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip() else "not set"
     )
 
     # Determine credentials directory (same logic as credential_store.py)

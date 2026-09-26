@@ -14,6 +14,7 @@ import gc
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -301,6 +302,35 @@ _STR_ERROR_PREFIXES = (
 )
 
 
+# Error text scrubbing. Error messages from Google and from our own tools
+# can echo the caller's input, and that input can carry secrets: a presigned
+# fileUrl (the signature is in the query string), a Google access token, or
+# a JWT. Every error string that reaches an audit row goes through
+# ``_scrub_error_text`` first.
+_ERROR_TEXT_MAX = 300
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_BEARER_RE = re.compile(r"ya29\.[A-Za-z0-9._-]+")
+_JWT_RE = re.compile(r"[A-Za-z0-9_-]{21,}\.[A-Za-z0-9_-]{21,}\.[A-Za-z0-9_-]{21,}")
+
+
+def _scrub_url(match: "re.Match[str]") -> str:
+    raw = match.group(0)
+    scheme, _, rest = raw.partition("://")
+    host = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    return f"{scheme}://{host}"
+
+
+def _scrub_error_text(text: Any, limit: int = _ERROR_TEXT_MAX) -> str:
+    """Drop URL paths and query strings, mask tokens, then truncate."""
+    if text is None:
+        return ""
+    s = text if isinstance(text, str) else str(text)
+    s = _URL_RE.sub(_scrub_url, s)
+    s = _BEARER_RE.sub("<token>", s)
+    s = _JWT_RE.sub("<token>", s)
+    return s[:limit]
+
+
 def _inspect_result_for_error(result: Any) -> tuple[bool, str]:
     """Return ``(is_error, detail)`` if ``result`` looks like an error payload.
 
@@ -316,7 +346,7 @@ def _inspect_result_for_error(result: Any) -> tuple[bool, str]:
         head = result.lstrip().lower()
         for prefix in _STR_ERROR_PREFIXES:
             if head.startswith(prefix):
-                return True, result.strip()[:300]
+                return True, _scrub_error_text(result.strip())
         return False, ""
     if isinstance(result, dict):
         err = result.get("error")
@@ -325,7 +355,7 @@ def _inspect_result_for_error(result: Any) -> tuple[bool, str]:
                 msg = err.get("message") or str(err)
             else:
                 msg = str(err)
-            return True, f"result.error: {msg}"[:300]
+            return True, _scrub_error_text(f"result.error: {msg}")
         replies = result.get("replies")
         if isinstance(replies, list):
             for i, reply in enumerate(replies):
@@ -336,7 +366,7 @@ def _inspect_result_for_error(result: Any) -> tuple[bool, str]:
                         if isinstance(detail, dict)
                         else str(detail)
                     )
-                    return True, f"replies[{i}].error: {msg}"[:300]
+                    return True, _scrub_error_text(f"replies[{i}].error: {msg}")
     return False, ""
 
 
@@ -794,7 +824,7 @@ def audit_log(user_resolver: Callable[[], str] | None = None):
                 return result
             except Exception as e:
                 status = "error"
-                err = f"{_origin_error_type(e)}: {str(e)[:300]}"
+                err = f"{_origin_error_type(e)}: {_scrub_error_text(str(e))}"
                 raise
             finally:
                 try:

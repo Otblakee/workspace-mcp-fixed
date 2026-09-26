@@ -9,6 +9,7 @@ import base64
 import logging
 import os
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import NamedTuple, Optional, Dict
@@ -25,6 +26,28 @@ _default_dir = str(Path.home() / ".workspace-mcp" / "attachments")
 STORAGE_DIR = (
     Path(os.getenv("WORKSPACE_ATTACHMENT_DIR", _default_dir)).expanduser().resolve()
 )
+
+
+# Total-size cap for the storage directory. Once the age sweep has run,
+# anything over this is evicted oldest-first. Configurable via
+# WORKSPACE_ATTACHMENT_MAX_BYTES; default 512 MiB.
+DEFAULT_MAX_BYTES = 512 * 1024 * 1024
+
+
+def _max_storage_bytes() -> int:
+    raw = os.getenv("WORKSPACE_ATTACHMENT_MAX_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "WORKSPACE_ATTACHMENT_MAX_BYTES=%r is not an integer; using default %d",
+            raw,
+            DEFAULT_MAX_BYTES,
+        )
+        return DEFAULT_MAX_BYTES
+    return value if value > 0 else DEFAULT_MAX_BYTES
 
 
 def _ensure_storage_dir() -> None:
@@ -50,6 +73,14 @@ class AttachmentStorage:
         # guard all _metadata access. RLock because cleanup paths re-enter
         # (_cleanup_file is called from locked readers).
         self._lock = threading.RLock()
+        # Files written before a restart are not in _metadata, so the
+        # metadata-driven cleanup would never remove them. Sweep the
+        # directory once at construction time so a restarted instance
+        # does not carry stale attachments forever.
+        try:
+            self.sweep_directory()
+        except Exception as e:
+            logger.warning("Attachment directory sweep at start-up failed: %s", e)
 
     def save_attachment(
         self,
@@ -294,7 +325,127 @@ class AttachmentStorage:
             for file_id in expired_ids:
                 self._cleanup_file(file_id)
 
+        # Also remove anything on disk that the metadata table does not
+        # know about (files left behind by a previous process).
+        try:
+            self.sweep_directory()
+        except Exception as e:
+            logger.warning("Attachment directory sweep failed: %s", e)
+
         return len(expired_ids)
+
+    def _live_paths(self) -> set:
+        """Paths of files still tracked in _metadata and not yet expired."""
+        now = datetime.now()
+        with self._lock:
+            return {
+                str(Path(meta["file_path"]))
+                for meta in self._metadata.values()
+                if now <= meta["expires_at"]
+            }
+
+    def _forget_path(self, path: Path) -> None:
+        """Drop any metadata entry that points at ``path``."""
+        target = str(path)
+        with self._lock:
+            stale = [
+                file_id
+                for file_id, meta in self._metadata.items()
+                if str(Path(meta["file_path"])) == target
+            ]
+            for file_id in stale:
+                del self._metadata[file_id]
+
+    def sweep_directory(self) -> int:
+        """Remove stale files directly from STORAGE_DIR.
+
+        Two passes, both non-recursive (this module never writes
+        subdirectories). Symlinks are never followed and directories are
+        never removed.
+
+        1. Age: unlink every regular file whose mtime is older than
+           ``expiration_seconds``, unless it is still tracked in
+           ``_metadata`` and not expired.
+        2. Size: if the directory is still over the cap
+           (``WORKSPACE_ATTACHMENT_MAX_BYTES``), unlink oldest files first
+           until it fits, and log a warning.
+
+        Returns the number of files removed.
+        """
+        try:
+            if not STORAGE_DIR.is_dir():
+                return 0
+            entries = list(os.scandir(STORAGE_DIR))
+        except OSError as e:
+            logger.warning("Cannot scan attachment directory %s: %s", STORAGE_DIR, e)
+            return 0
+
+        cutoff = time.time() - self.expiration_seconds
+        live = self._live_paths()
+        removed = 0
+        survivors: list[tuple[float, int, Path]] = []
+
+        for entry in entries:
+            try:
+                # follow_symlinks=False: a symlink is never a regular file here,
+                # so it is skipped rather than followed.
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            path = Path(entry.path)
+            if st.st_mtime < cutoff and str(path) not in live:
+                if self._unlink_quiet(path):
+                    removed += 1
+                    self._forget_path(path)
+                continue
+            survivors.append((st.st_mtime, st.st_size, path))
+
+        if removed:
+            logger.info(
+                "Attachment sweep removed %d stale file(s) older than %ds from %s",
+                removed,
+                self.expiration_seconds,
+                STORAGE_DIR,
+            )
+
+        cap = _max_storage_bytes()
+        total = sum(size for _, size, _ in survivors)
+        if total > cap:
+            evicted = 0
+            freed = 0
+            for _, size, path in sorted(survivors, key=lambda item: item[0]):
+                if total <= cap:
+                    break
+                if self._unlink_quiet(path):
+                    self._forget_path(path)
+                    total -= size
+                    freed += size
+                    evicted += 1
+            removed += evicted
+            logger.warning(
+                "Attachment directory %s exceeded %d bytes; evicted %d oldest "
+                "file(s) (%d bytes), now %d bytes",
+                STORAGE_DIR,
+                cap,
+                evicted,
+                freed,
+                total,
+            )
+
+        return removed
+
+    @staticmethod
+    def _unlink_quiet(path: Path) -> bool:
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            logger.warning("Failed to delete attachment file %s: %s", path, e)
+            return False
 
 
 # Global instance

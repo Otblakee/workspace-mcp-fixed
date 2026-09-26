@@ -92,6 +92,8 @@ def validate_file_path(file_path: str) -> Path:
         "/etc/passwd",
         "/private/etc/shadow",
         "/private/etc/passwd",
+        # Render mounts secret files here (service-account keys and the like).
+        "/etc/secrets",
     )
     for prefix in sensitive_prefixes:
         if resolved_str == prefix or resolved_str.startswith(prefix + "/"):
@@ -121,9 +123,12 @@ def validate_file_path(file_path: str) -> Path:
     # Block this MCP's own credential caches (refresh tokens live here).
     # Mirrors the env-var resolution in auth.google_auth.get_default_credentials_dir
     # without importing it (avoids a core<->auth import cycle).
+    # The OAuth proxy's disk store holds encrypted upstream tokens; it is a
+    # credential store too, wherever it has been pointed.
     mcp_credential_dirs = (
         os.environ.get("WORKSPACE_MCP_CREDENTIALS_DIR"),
         os.environ.get("GOOGLE_MCP_CREDENTIALS_DIR"),
+        os.environ.get("WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY"),
         str(Path.home() / ".google_workspace_mcp"),
     )
     for cred_dir in mcp_credential_dirs:
