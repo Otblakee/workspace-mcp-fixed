@@ -1184,12 +1184,64 @@ def test_drift_statuses_are_all_listed_by_operations():
         "in_sync",
         "unmanaged",
         "never_applied",
+        "apply_interrupted",
         "stale_template",
         "stale_directory",
         "changed_since_apply",
         "error",
     }
     assert DRIFT_STATUSES == set(AUDIT_STATUSES) - {"in_sync", "unmanaged"}
+    # apply_interrupted is drift: the CLI must exit 2 on it.
+    assert "apply_interrupted" in DRIFT_STATUSES
+
+
+def _pending_ledger(**overrides) -> dict:
+    """The pre-patch row an apply writes: readback_hash is the word pending."""
+    from gsignatures.engine import PENDING_READBACK
+
+    row = _ledger(**overrides)
+    row["readback_hash"] = PENDING_READBACK
+    row["previous_signature_html"] = "<p>the signature before the apply</p>"
+    return row
+
+
+def test_pending_marker_and_predicate():
+    from gsignatures.engine import PENDING_READBACK, is_pending_ledger_row
+
+    assert PENDING_READBACK == "pending"
+    assert is_pending_ledger_row(_pending_ledger())
+    assert is_pending_ledger_row({"readback_hash": " pending "})
+    assert not is_pending_ledger_row(_ledger())
+    assert not is_pending_ledger_row(None)
+    assert not is_pending_ledger_row({})
+    # A real hash can never collide with the marker.
+    assert signature_hash("pending") != PENDING_READBACK
+
+
+def test_drift_pending_only_row_is_apply_interrupted():
+    status, reason = drift_status(
+        _planned(), "<p>sig as gmail stored it</p>", _pending_ledger()
+    )
+    assert status == "apply_interrupted"
+    assert "run-1" in reason and "pending" in reason
+    assert "restore" in reason
+
+
+def test_drift_apply_interrupted_beats_stale_template_and_changed():
+    """A pending row says nothing about what Gmail holds, so it is reported
+    before any version or hash comparison."""
+    status, _ = drift_status(_planned(), "<p>edited by user</p>", _pending_ledger())
+    assert status == "apply_interrupted"
+    status, _ = drift_status(
+        _planned(), "<p>sig as gmail stored it</p>", _pending_ledger(tv="0.9.0")
+    )
+    assert status == "apply_interrupted"
+
+
+def test_drift_apply_interrupted_after_unmanaged_error_and_never_applied():
+    assert drift_status(_planned("skipped"), "", _pending_ledger())[0] == "unmanaged"
+    assert drift_status(_planned("error"), "", _pending_ledger())[0] == "error"
+    assert drift_status(_planned(), "", None)[0] == "never_applied"
 
 
 # ---------------------------------------------------------------------------

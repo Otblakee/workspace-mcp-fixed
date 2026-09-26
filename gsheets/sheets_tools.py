@@ -59,12 +59,14 @@ async def list_spreadsheets(
     """
     logger.info(f"[list_spreadsheets] Invoked. Email: '{user_google_email}'")
 
+    # nextPageToken must be asked for in the fields mask or Drive omits it,
+    # and then a truncated page is indistinguishable from a complete one.
     files_response = await asyncio.to_thread(
         service.files()
         .list(
             q="mimeType='application/vnd.google-apps.spreadsheet'",
             pageSize=max_results,
-            fields="files(id,name,modifiedTime,webViewLink)",
+            fields="nextPageToken,files(id,name,modifiedTime,webViewLink)",
             orderBy="modifiedTime desc",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
@@ -85,6 +87,8 @@ async def list_spreadsheets(
         f"Successfully listed {len(files)} spreadsheets for {user_google_email}:\n"
         + "\n".join(spreadsheets_list)
     )
+    if files_response.get("nextPageToken"):
+        text_output += "\nMore results available: raise max_results."
 
     logger.info(
         f"Successfully listed {len(files)} spreadsheets for {user_google_email}."

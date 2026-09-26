@@ -12,6 +12,15 @@ against the Docs API on 2026-09-26.
 4. insert_doc_image: a private Drive file is refused with a clear message
    before the Docs API is called, and the Docs API 400 for a URL Google
    cannot fetch returns the same message. No sharing call anywhere.
+5. update_doc_headers_footers: the target header or footer is the one
+   documentStyle names for the requested type (defaultHeaderId,
+   firstPageHeaderId, evenPageHeaderId and the footer equivalents). Header
+   and Footer objects carry no type and every id is an opaque kix string,
+   so the old pattern match and first-available fallback picked the wrong
+   section in any document with more than one.
+6. modify_doc_text and update_paragraph_style: an end_index at or past the
+   body end index is clamped to max_insertion_index, the same rule the
+   insert tools apply, with the same note in the result.
 
 All Google services are MagicMock doubles; nothing touches the network.
 """
@@ -51,6 +60,7 @@ create_table_with_data = _unwrap(docs_tools.create_table_with_data)
 insert_doc_elements = _unwrap(docs_tools.insert_doc_elements)
 insert_doc_image = _unwrap(docs_tools.insert_doc_image)
 inspect_doc_structure = _unwrap(docs_tools.inspect_doc_structure)
+update_paragraph_style = _unwrap(docs_tools.update_paragraph_style)
 
 
 def _doc_with_end_index(end_index: int) -> dict:
@@ -285,6 +295,7 @@ class TestHeaderFooterCreateWhenMissing:
     async def test_existing_header_still_replaced_without_create(self):
         service = MagicMock()
         service.documents.return_value.get.return_value.execute.return_value = {
+            "documentStyle": {"defaultHeaderId": "hdr.existing"},
             "headers": {
                 "hdr.existing": {
                     "content": [
@@ -295,7 +306,7 @@ class TestHeaderFooterCreateWhenMissing:
                         }
                     ]
                 }
-            }
+            },
         }
         service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
 
@@ -730,3 +741,371 @@ class TestInsertDocImagePublicCheck:
         assert "permissions()" not in src
         assert "anyoneWithLink" not in src
         assert '.create(body={"role"' not in src
+
+
+# ---------------------------------------------------------------------------
+# Defect 5: pick the header or footer documentStyle names for the type
+# ---------------------------------------------------------------------------
+
+
+def _section(end_index: int) -> dict:
+    return {
+        "content": [
+            {
+                "startIndex": 0,
+                "endIndex": end_index,
+                "paragraph": {"elements": []},
+            }
+        ]
+    }
+
+
+def _doc_with_default_and_first_page_headers() -> dict:
+    """A document with both a default and a first-page header.
+
+    The default header is listed first in the map, so any "first available"
+    fallback would pick it.
+    """
+    doc = _doc_with_end_index(10)
+    doc["documentStyle"] = {
+        "defaultHeaderId": "kix.default01",
+        "firstPageHeaderId": "kix.first01",
+        "defaultFooterId": "kix.dfoot01",
+    }
+    doc["headers"] = {
+        "kix.default01": _section(8),
+        "kix.first01": _section(5),
+    }
+    doc["footers"] = {"kix.dfoot01": _section(3)}
+    return doc
+
+
+class TestHeaderFooterTargetsDocumentStyleId:
+    @pytest.mark.asyncio
+    async def test_first_page_update_targets_the_first_page_id_only(self):
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = (
+            _doc_with_default_and_first_page_headers()
+        )
+        service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
+
+        manager = HeaderFooterManager(service)
+        success, message = await manager.update_header_footer_content(
+            DOC, "header", "Cover page", "FIRST_PAGE_ONLY"
+        )
+
+        assert success, message
+        (requests,) = _batch_bodies(service)
+        segment_ids = set()
+        for request in requests:
+            if "deleteContentRange" in request:
+                segment_ids.add(request["deleteContentRange"]["range"]["segmentId"])
+            else:
+                segment_ids.add(request["insertText"]["location"]["segmentId"])
+        assert segment_ids == {"kix.first01"}
+        assert "kix.default01" not in str(requests)
+        # The delete range comes from the first-page section (endIndex 5),
+        # not the default one (endIndex 8).
+        assert requests[0]["deleteContentRange"]["range"]["endIndex"] == 4
+        assert not any("createHeader" in r for r in requests)
+
+    @pytest.mark.asyncio
+    async def test_default_update_targets_the_default_id_even_when_listed_last(
+        self,
+    ):
+        doc = _doc_with_default_and_first_page_headers()
+        # Reverse the map order: the first-page header now comes first.
+        doc["headers"] = dict(reversed(list(doc["headers"].items())))
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = doc
+        service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
+
+        manager = HeaderFooterManager(service)
+        success, message = await manager.update_header_footer_content(
+            DOC, "header", "Every page", "DEFAULT"
+        )
+
+        assert success, message
+        (requests,) = _batch_bodies(service)
+        assert requests[-1]["insertText"]["location"]["segmentId"] == "kix.default01"
+        assert "kix.first01" not in str(requests)
+
+    @pytest.mark.asyncio
+    async def test_even_page_footer_missing_is_refused_not_substituted(self):
+        """A default footer exists but no even-page footer: no fallback to
+        the default, and no create (the API cannot create EVEN_PAGE)."""
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = (
+            _doc_with_default_and_first_page_headers()
+        )
+
+        manager = HeaderFooterManager(service)
+        success, message = await manager.update_header_footer_content(
+            DOC, "footer", "Even", "EVEN_PAGE"
+        )
+
+        assert not success
+        assert "EVEN_PAGE" in message and "DEFAULT" in message
+        assert not service.documents.return_value.batchUpdate.called
+
+    @pytest.mark.asyncio
+    async def test_no_header_at_all_takes_the_create_path(self):
+        """No documentStyle header id: DEFAULT is created, not looked up."""
+        doc = _doc_with_end_index(10)
+        doc["documentStyle"] = {"defaultFooterId": "kix.dfoot01"}
+        doc["footers"] = {"kix.dfoot01": _section(3)}
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = doc
+        service.documents.return_value.batchUpdate.return_value.execute.side_effect = [
+            {"replies": [{"createHeader": {"headerId": "kix.hdrnew"}}]},
+            {},
+        ]
+
+        manager = HeaderFooterManager(service)
+        success, message = await manager.update_header_footer_content(
+            DOC, "header", "Fresh", "DEFAULT"
+        )
+
+        assert success, message
+        first, second = _batch_bodies(service)
+        assert first == [{"createHeader": {"type": "DEFAULT"}}]
+        assert second[0]["insertText"]["location"]["segmentId"] == "kix.hdrnew"
+        # The footer id was never mistaken for a header.
+        assert "kix.dfoot01" not in str(first) + str(second)
+
+    @pytest.mark.asyncio
+    async def test_id_named_by_document_style_but_absent_from_map_is_missing(
+        self,
+    ):
+        doc = _doc_with_end_index(10)
+        doc["documentStyle"] = {"firstPageHeaderId": "kix.ghost"}
+        doc["headers"] = {"kix.other": _section(4)}
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = doc
+
+        manager = HeaderFooterManager(service)
+        success, message = await manager.update_header_footer_content(
+            DOC, "header", "x", "FIRST_PAGE_ONLY"
+        )
+
+        assert not success
+        assert "FIRST_PAGE_ONLY" in message
+        assert not service.documents.return_value.batchUpdate.called
+
+    def test_no_pattern_or_first_available_fallback_left_in_source(self):
+        source = (
+            REPO_ROOT / "gdocs" / "managers" / "header_footer_manager.py"
+        ).read_text()
+        assert "target_patterns" not in source
+        assert "first available section as fallback" not in source
+        for field in (
+            "defaultHeaderId",
+            "firstPageHeaderId",
+            "evenPageHeaderId",
+            "defaultFooterId",
+            "firstPageFooterId",
+            "evenPageFooterId",
+        ):
+            assert field in source, field
+
+
+# ---------------------------------------------------------------------------
+# Defect 6: end_index clamped to max_insertion_index
+# ---------------------------------------------------------------------------
+
+
+class TestEndIndexClamp:
+    @pytest.mark.asyncio
+    async def test_modify_doc_text_replace_clamps_end_index_by_one(self):
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = (
+            _doc_with_end_index(42)
+        )
+        service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
+
+        result = await modify_doc_text(
+            service=service,
+            user_google_email=USER,
+            document_id=DOC,
+            start_index=5,
+            end_index=42,
+            text="New",
+        )
+
+        assert not result.startswith("Error"), result
+        (requests,) = _batch_bodies(service)
+        delete_range = requests[0]["deleteContentRange"]["range"]
+        assert delete_range == {"startIndex": 5, "endIndex": 41}
+        assert requests[1]["insertText"]["location"]["index"] == 5
+        assert "Requested end_index 42" in result
+        assert "used 41, the largest valid insertion index" in result
+
+    @pytest.mark.asyncio
+    async def test_modify_doc_text_format_only_clamps_end_index(self):
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = (
+            _doc_with_end_index(30)
+        )
+        service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
+
+        result = await modify_doc_text(
+            service=service,
+            user_google_email=USER,
+            document_id=DOC,
+            start_index=1,
+            end_index=31,
+            bold=True,
+        )
+
+        assert not result.startswith("Error"), result
+        (requests,) = _batch_bodies(service)
+        assert requests[0]["updateTextStyle"]["range"] == {
+            "startIndex": 1,
+            "endIndex": 29,
+        }
+        assert "used 29" in result
+
+    @pytest.mark.asyncio
+    async def test_modify_doc_text_in_range_end_index_is_untouched(self):
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = (
+            _doc_with_end_index(42)
+        )
+        service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
+
+        result = await modify_doc_text(
+            service=service,
+            user_google_email=USER,
+            document_id=DOC,
+            start_index=5,
+            end_index=20,
+            text="New",
+        )
+
+        (requests,) = _batch_bodies(service)
+        assert requests[0]["deleteContentRange"]["range"]["endIndex"] == 20
+        assert "Requested end_index" not in result
+
+    @pytest.mark.asyncio
+    async def test_modify_doc_text_insert_without_end_index_does_not_read_doc(
+        self,
+    ):
+        service = MagicMock()
+        service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
+
+        await modify_doc_text(
+            service=service,
+            user_google_email=USER,
+            document_id=DOC,
+            start_index=5,
+            text="Hi",
+        )
+
+        service.documents.return_value.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_modify_doc_text_start_index_at_end_is_a_clean_error(self):
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = (
+            _doc_with_end_index(10)
+        )
+
+        result = await modify_doc_text(
+            service=service,
+            user_google_email=USER,
+            document_id=DOC,
+            start_index=9,
+            end_index=10,
+            bold=True,
+        )
+
+        assert result.startswith("Error")
+        assert "max_insertion_index" in result
+        assert not service.documents.return_value.batchUpdate.called
+
+    @pytest.mark.asyncio
+    async def test_update_paragraph_style_clamps_end_index_by_one(self):
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = (
+            _doc_with_end_index(25)
+        )
+        service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
+
+        result = await update_paragraph_style(
+            service=service,
+            user_google_email=USER,
+            document_id=DOC,
+            start_index=1,
+            end_index=25,
+            heading_level=1,
+        )
+
+        assert not result.startswith("Error"), result
+        (requests,) = _batch_bodies(service)
+        assert requests[0]["updateParagraphStyle"]["range"] == {
+            "startIndex": 1,
+            "endIndex": 24,
+        }
+        assert "range 1-24" in result
+        assert "Requested end_index 25" in result
+        assert "used 24, the largest valid insertion index" in result
+
+    @pytest.mark.asyncio
+    async def test_update_paragraph_style_list_range_is_clamped_too(self):
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = (
+            _doc_with_end_index(25)
+        )
+        service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
+
+        result = await update_paragraph_style(
+            service=service,
+            user_google_email=USER,
+            document_id=DOC,
+            start_index=1,
+            end_index=30,
+            list_type="UNORDERED",
+        )
+
+        assert not result.startswith("Error"), result
+        (requests,) = _batch_bodies(service)
+        bullets = [r for r in requests if "createParagraphBullets" in r]
+        assert bullets, requests
+        assert bullets[0]["createParagraphBullets"]["range"]["endIndex"] == 24
+
+    @pytest.mark.asyncio
+    async def test_update_paragraph_style_keeps_start_index_validation(self):
+        service = MagicMock()
+
+        result = await update_paragraph_style(
+            service=service,
+            user_google_email=USER,
+            document_id=DOC,
+            start_index=0,
+            end_index=5,
+            heading_level=1,
+        )
+
+        assert result == "Error: start_index must be >= 1"
+        service.documents.return_value.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_paragraph_style_in_range_end_index_is_untouched(self):
+        service = MagicMock()
+        service.documents.return_value.get.return_value.execute.return_value = (
+            _doc_with_end_index(25)
+        )
+        service.documents.return_value.batchUpdate.return_value.execute.return_value = {}
+
+        result = await update_paragraph_style(
+            service=service,
+            user_google_email=USER,
+            document_id=DOC,
+            start_index=1,
+            end_index=10,
+            alignment="CENTER",
+        )
+
+        (requests,) = _batch_bodies(service)
+        assert requests[0]["updateParagraphStyle"]["range"]["endIndex"] == 10
+        assert "Requested end_index" not in result

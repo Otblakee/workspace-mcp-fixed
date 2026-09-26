@@ -52,6 +52,9 @@ from gdrive.drive_batch import write_jsonl_report
 
 from gsignatures import clients, sa_auth
 from gsignatures.engine import (
+    APPLY_INTERRUPTED,
+    PENDING_READBACK,
+    is_pending_ledger_row,
     PlannedSignature,
     ResultRow,
     SignatureConfig,
@@ -67,6 +70,7 @@ from gsignatures.ledger import (
     LEDGER_TAB,
     LedgerError,
     append_ledger_rows,
+    outranks,
     assert_tab_writable,
     ensure_tab,
     ledger_key,
@@ -109,10 +113,24 @@ LEDGER_FAILED_REASON = "not attempted: ledger append failed earlier in this run"
 # patch went through. Tested verbatim (prefix).
 LEDGER_APPEND_FAILED_REASON = "but the ledger append failed"
 
+# Reason on a live address whose pending ledger row (the one written before
+# the Gmail patch) could not be appended. No patch happens for it.
+LEDGER_PENDING_FAILED_REASON = (
+    "not applied: the pending ledger row could not be written before the patch"
+)
+
 # The two notes a dry run carries when the ledger could not be consulted.
 # ``read_ledger_best_effort`` produces them; the tool layer recognises them
 # on the rows to print one header line.
 LEDGER_NOT_CONFIGURED_NOTE = "ledger not configured"
+
+# The live apply order for one address, kept in one place:
+#   1. pending ledger row (readback_hash = PENDING_READBACK, rollback record
+#      complete) so a kill after the patch never loses the previous signature;
+#   2. Gmail patch and read-back;
+#   3. completed ledger row (same run_id, real readback_hash).
+# ledger.outranks makes the completed row win on every read.
+LIVE_APPLY_ORDER = ("ledger_pending", "gmail_patch", "ledger_completed")
 LEDGER_UNAVAILABLE_NOTE_PREFIX = "ledger unavailable ("
 
 # Setup errors that are never one user's fault. They propagate out of a
@@ -373,6 +391,11 @@ def _ledger_match(
     """
     if not ledger_row:
         return False, "no ledger row for this address"
+    if is_pending_ledger_row(ledger_row):
+        return False, (
+            f"ledger row for run {ledger_row.get('run_id') or '?'} is pending "
+            "(the apply was interrupted before the read-back was recorded)"
+        )
     ledger_tv = str(ledger_row.get("template_version") or "")
     ledger_sv = str(ledger_row.get("statutory_version") or "")
     if ledger_tv != (plan.template_version or "") or ledger_sv != (
@@ -527,8 +550,48 @@ async def _apply_loaded(
             )
             continue
 
-        # Live path. Patch, read back, record. The ledger row goes in
-        # straight after each address so partial progress is still evidence.
+        # Live path, in this order: pending ledger row, patch, completed
+        # ledger row. The pending row carries the full rollback record
+        # (previous_hash, previous_signature_html) with readback_hash set
+        # to the literal "pending", so a process killed between the patch
+        # and the second append leaves the previous signature on record.
+        # Nothing is patched until the pending row is on the sheet.
+        ledger_entry = {
+            "applied_at": utc_now_iso(),
+            "actor": actor,
+            "user_email": plan.user_email,
+            "send_as_email": plan.send_as_email,
+            "entity": plan.entity,
+            "template_version": plan.template_version,
+            "statutory_version": plan.statutory_version,
+            "rendered_hash": plan.rendered_hash,
+            "readback_hash": PENDING_READBACK,
+            "previous_hash": current_hash,
+            "previous_signature_html": current_html,
+            "run_id": run_id,
+        }
+        try:
+            await append_ledger_rows(sheets, sheet_id or "", [ledger_entry])
+        except Exception as exc:
+            logger.error(
+                "pending ledger row for %s / %s could not be written; "
+                "signature not applied: %s",
+                plan.user_email,
+                plan.send_as_email,
+                _error_text(exc),
+            )
+            state.ledger_failed = _error_text(exc)
+            rows.append(
+                _row(
+                    plan,
+                    "error",
+                    f"{LEDGER_PENDING_FAILED_REASON} ({_error_text(exc)})",
+                    current_hash,
+                    None,
+                )
+            )
+            continue
+
         readback_hash: Optional[str] = None
         try:
             readback = await clients.patch_signature(
@@ -542,23 +605,26 @@ async def _apply_loaded(
                 plan.send_as_email,
                 _error_text(exc),
             )
-            rows.append(_row(plan, "error", _error_text(exc), current_hash, None))
+            rows.append(
+                _row(
+                    plan,
+                    "error",
+                    f"{_error_text(exc)}; a pending ledger row for run "
+                    f"{run_id} remains and the audit reports apply_interrupted "
+                    "until the address is re-applied",
+                    current_hash,
+                    None,
+                )
+            )
             continue
 
-        ledger_entry = {
-            "applied_at": utc_now_iso(),
-            "actor": actor,
-            "user_email": plan.user_email,
-            "send_as_email": plan.send_as_email,
-            "entity": plan.entity,
-            "template_version": plan.template_version,
-            "statutory_version": plan.statutory_version,
-            "rendered_hash": plan.rendered_hash,
-            "readback_hash": readback_hash,
-            "previous_hash": current_hash,
-            "previous_signature_html": current_html,
-            "run_id": run_id,
-        }
+        # The completed row: same run_id, the real read-back hash. It
+        # outranks the pending row on every read (ledger.outranks).
+        ledger_entry = dict(
+            ledger_entry,
+            applied_at=utc_now_iso(),
+            readback_hash=readback_hash,
+        )
         try:
             await append_ledger_rows(sheets, sheet_id or "", [ledger_entry])
         except Exception as exc:
@@ -720,10 +786,14 @@ def _pick_ledger_row(
                 f"run_id {wanted}. Known run_ids, newest first: {known}. "
                 "Nothing was changed."
             )
-        return hits[-1]
+        chosen = hits[0]
+        for record in hits[1:]:
+            if outranks(record, chosen):
+                chosen = record
+        return chosen
     latest = mine[0]
     for record in mine[1:]:
-        if record["applied_at"] >= latest["applied_at"]:
+        if outranks(record, latest):
             latest = record
     return latest
 
@@ -765,9 +835,12 @@ async def restore_user(
     """Put back the previous signature a ledger row recorded for one address.
 
     The ledger row is the latest for (user, send-as), or the one with
-    ``from_run_id`` when given. Its ``previous_signature_html`` is patched
-    onto the address (an empty value clears the signature, which is what
-    "previous" meant then). Same rule as an apply: dry run by default; live
+    ``from_run_id`` when given; within one run the completed row is preferred
+    over its ``pending`` row, and a pending row with no completed row (an
+    interrupted apply) is a valid source, because its
+    ``previous_signature_html`` was written before the patch. That HTML is
+    patched onto the address (an empty value clears the signature, which is
+    what "previous" meant then). Same rule as an apply: dry run by default; live
     needs ``dry_run=False`` AND ``confirm=True`` and a writable ledger, and
     the ledger is prepared before Gmail is touched. A dry run still needs a
     readable ledger, because the row is what is being restored.
@@ -1172,6 +1245,7 @@ AUDIT_STATUSES = (
     "in_sync",
     "unmanaged",
     "never_applied",
+    APPLY_INTERRUPTED,
     "stale_template",
     "stale_directory",
     "changed_since_apply",
@@ -1183,6 +1257,7 @@ AUDIT_STATUSES = (
 DRIFT_STATUSES = frozenset(
     {
         "never_applied",
+        APPLY_INTERRUPTED,
         "stale_template",
         "stale_directory",
         "changed_since_apply",
@@ -1236,6 +1311,8 @@ def format_audit_counts(rows: List[Dict[str, Any]]) -> str:
 
 __all__ = [
     "AUDIT_STATUSES",
+    "LEDGER_PENDING_FAILED_REASON",
+    "LIVE_APPLY_ORDER",
     "DEFAULT_MAX_USERS",
     "DRIFT_STATUSES",
     "LEDGER_APPEND_FAILED_REASON",

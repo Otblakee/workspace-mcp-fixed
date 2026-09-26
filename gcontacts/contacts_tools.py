@@ -13,7 +13,7 @@ from mcp import Resource
 
 from auth.service_decorator import require_google_service
 from core.server import server
-from core.utils import handle_http_errors
+from core.utils import handle_http_errors, UserInputError
 
 logger = logging.getLogger(__name__)
 
@@ -893,6 +893,49 @@ async def batch_create_contacts(
         raise Exception(message)
 
 
+def _normalise_contact_id(contact_id: str) -> str:
+    """People resource name for a bare id or a full ``people/...`` name."""
+    contact_id = (contact_id or "").strip()
+    if contact_id and not contact_id.startswith("people/"):
+        contact_id = f"people/{contact_id}"
+    return contact_id
+
+
+def _reject_duplicate_contact_ids(updates: List[Dict[str, Any]]) -> None:
+    """Raise UserInputError when one contact appears more than once.
+
+    ``c1`` and ``people/c1`` name the same contact and count as a duplicate.
+    Updates without a contact_id are left to the per-update validation.
+    """
+    seen: Dict[str, int] = {}
+    duplicates: List[str] = []
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        resource_name = _normalise_contact_id(str(update.get("contact_id") or ""))
+        if not resource_name:
+            continue
+        seen[resource_name] = seen.get(resource_name, 0) + 1
+        if seen[resource_name] == 2:
+            duplicates.append(resource_name)
+    if duplicates:
+        raise UserInputError(
+            "Duplicate contact_id in updates: "
+            + ", ".join(duplicates)
+            + ". Each contact may appear once per batch; merge the fields for "
+            "that contact into a single update and call again. Nothing was "
+            "changed."
+        )
+
+
+def _http_error_text(error: HttpError) -> str:
+    """Short, single-line description of an HttpError for a failure row."""
+    status = getattr(getattr(error, "resp", None), "status", None)
+    reason = getattr(error, "reason", None) or str(error)
+    reason = " ".join(str(reason).split())
+    return f"HTTP {status}: {reason}" if status else reason
+
+
 @server.tool()
 @require_google_service("people", "contacts")
 @handle_http_errors("batch_update_contacts", service_type="people")
@@ -908,7 +951,13 @@ async def batch_update_contacts(
     People API), then issues one batchUpdateContacts call per distinct set of
     fields being changed, with `contacts` as a map keyed by resource name.
     Contacts that cannot be fetched or that the API rejects are listed under
-    "Not updated" in the result instead of failing the whole batch.
+    "Not updated" in the result instead of failing the whole batch. The
+    field-set groups are sent one after another; a group the API rejects
+    outright is also listed under "Not updated" (with the error) and the
+    remaining groups still run, because an earlier group is already
+    committed and must not be retried. The call raises only when no group
+    succeeded. A contact_id that appears more than once is refused before
+    any API call.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -927,6 +976,11 @@ async def batch_update_contacts(
     logger.info(
         f"[batch_update_contacts] Invoked. Email: '{user_google_email}', Count: {len(updates)}"
     )
+
+    # Two updates for one contact would race inside a single batch (the
+    # second carries a stale etag) or land in different field-set groups
+    # with an unclear winner. Refuse up front, before any API call.
+    _reject_duplicate_contact_ids(updates or [])
 
     try:
         if not updates:
@@ -1024,7 +1078,15 @@ async def batch_update_contacts(
         # that group's mask and contacts. Request body shape:
         #   {"contacts": {"people/c1": {"etag": ..., <fields>}, ...},
         #    "updateMask": "emailAddresses,names", "readMask": ...}
+        # The groups go out one after another, and a group that has been
+        # sent is committed whatever happens to the next one. So an HttpError
+        # on a later group must not raise (the caller would retry contacts
+        # that already changed): its contacts are recorded under "Not
+        # updated" with the error text and the remaining groups still run.
+        # Only a run in which no group at all succeeded raises.
         update_results: Dict[str, Any] = {}
+        groups_succeeded = 0
+        last_group_error: Optional[HttpError] = None
         for update_fields, contacts_map in update_groups.items():
             batch_body = {
                 "contacts": contacts_map,
@@ -1032,9 +1094,22 @@ async def batch_update_contacts(
                 "readMask": DEFAULT_PERSON_FIELDS,
             }
 
-            result = await asyncio.to_thread(
-                service.people().batchUpdateContacts(body=batch_body).execute
-            )
+            try:
+                result = await asyncio.to_thread(
+                    service.people().batchUpdateContacts(body=batch_body).execute
+                )
+            except HttpError as group_error:
+                last_group_error = group_error
+                error_text = _http_error_text(group_error)
+                logger.warning(
+                    f"batchUpdateContacts failed for the "
+                    f"{','.join(sorted(update_fields))} group "
+                    f"({len(contacts_map)} contacts): {error_text}"
+                )
+                for resource_name in contacts_map:
+                    failures[resource_name] = f"batch update failed: {error_text}"
+                continue
+            groups_succeeded += 1
             for resource_name, update_result in result.get("updateResult", {}).items():
                 # Each entry is a PersonResponse; a non-zero status code is a
                 # per-contact failure inside an otherwise successful batch.
@@ -1045,6 +1120,10 @@ async def batch_update_contacts(
                     )
                     continue
                 update_results[resource_name] = update_result
+
+        if groups_succeeded == 0 and last_group_error is not None:
+            # Nothing was committed, so the plain error path is the truth.
+            raise last_group_error
 
         response = f"Batch Update Results for {user_google_email}:\n\n"
         response += f"Updated {len(update_results)} contacts:\n\n"

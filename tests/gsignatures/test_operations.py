@@ -17,6 +17,10 @@ Covers:
   per-user isolation;
 * the run-wide ledger rule: after one failed ledger append nothing further
   is patched, in that user or any later one;
+* the live write order per address: pending ledger row (rollback record,
+  readback_hash "pending"), then the Gmail patch, then the completed row; a
+  failed pending append means no patch; a pending row with no completed row
+  audits as apply_interrupted and can be restored from;
 * ``force`` never touches an address the engine skipped;
 * ``restore_user``: the previous signature from a ledger row goes back,
   under the same dry-run and confirm rule, and is itself recorded.
@@ -617,7 +621,9 @@ class TestApplyUserLive:
         )
         assert _rows_by_send_as(rows)[ALICE].action == "applied"
         assert sheets.tabs["Ledger"][0] == LEDGER_HEADER
-        assert len(sheets.ledger_rows()) == 1
+        # One address applied: its pending row, then its completed row.
+        assert len(sheets.ledger_rows()) == 2
+        assert len(sheets.completed_ledger_rows()) == 1
 
     @pytest.mark.asyncio
     async def test_unchanged_detection_skips_the_patch(self, config, directory, pool):
@@ -637,7 +643,13 @@ class TestApplyUserLive:
         assert by[ALICE].before_hash == by[ALICE].after_hash
         assert by[ALICE_JIT].action == "applied"
         assert pool.patch_calls() == [(ALICE, ALICE_JIT)]
+        # The seeded row, then the alias's pending and completed rows.
         assert [r["send_as_email"] for r in sheets.ledger_rows()] == [
+            ALICE,
+            ALICE_JIT,
+            ALICE_JIT,
+        ]
+        assert [r["send_as_email"] for r in sheets.completed_ledger_rows()] == [
             ALICE,
             ALICE_JIT,
         ]
@@ -789,9 +801,10 @@ class TestApplyUserLive:
     async def test_ledger_append_failure_stops_further_patches_in_the_run(
         self, config, directory, pool
     ):
-        """Two planned addresses, the append fails from the first: exactly one
-        patch. The second address is an error row that says it was not
-        attempted, so no write happens without its ledger row."""
+        """Two planned addresses, every append fails: no patch at all. The
+        pending row for the first address cannot be written, so it is not
+        patched; the second address is an error row that says it was not
+        attempted. No write happens without its ledger row."""
         sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
         sheets.fail_append = http_error(500, "backendError")
         rows = await _apply_alice(
@@ -805,14 +818,19 @@ class TestApplyUserLive:
         )
         by = _rows_by_send_as(rows)
         assert by[ALICE].action == "error"
-        assert operations.LEDGER_APPEND_FAILED_REASON in by[ALICE].reason
+        assert by[ALICE].reason.startswith(operations.LEDGER_PENDING_FAILED_REASON)
+        assert "HttpError" in by[ALICE].reason
+        assert by[ALICE].after_hash is None
         assert by[ALICE_JIT].action == "error"
         assert by[ALICE_JIT].reason.startswith(operations.LEDGER_FAILED_REASON)
         assert "HttpError" in by[ALICE_JIT].reason
         assert by[ALICE_JIT].after_hash is None
         assert by[ALICE_HOME].action == "skipped"
-        assert pool.patch_calls() == [(ALICE, ALICE)]
+        assert pool.patch_calls() == []
+        assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == OLD_PRIMARY
         assert pool.mailboxes[ALICE].send_as[ALICE_JIT]["signature"] == OLD_ALIAS
+        # Exactly one append was attempted (the first pending row).
+        assert sheets.append_calls == 1
 
     @pytest.mark.asyncio
     async def test_one_failing_send_as_does_not_stop_the_others(
@@ -834,16 +852,31 @@ class TestApplyUserLive:
         by = _rows_by_send_as(rows)
         assert by[ALICE].action == "error"
         assert by[ALICE].reason.startswith("HttpError:")
+        # The failed patch leaves the pending row on record and says so.
+        assert "pending ledger row" in by[ALICE].reason
+        assert "apply_interrupted" in by[ALICE].reason
         assert by[ALICE_JIT].action == "applied"
-        assert [r["send_as_email"] for r in sheets.ledger_rows()] == [ALICE_JIT]
+        assert [r["send_as_email"] for r in sheets.ledger_rows()] == [
+            ALICE,
+            ALICE_JIT,
+            ALICE_JIT,
+        ]
+        assert [r["send_as_email"] for r in sheets.pending_ledger_rows()] == [
+            ALICE,
+            ALICE_JIT,
+        ]
+        assert [r["send_as_email"] for r in sheets.completed_ledger_rows()] == [
+            ALICE_JIT
+        ]
 
     @pytest.mark.asyncio
     async def test_ledger_append_failure_after_patch_is_an_error_row(
         self, config, directory, pool
     ):
-        # Reads and the tab check work; only the append fails.
+        # Reads, the tab check and the pending append work; only the second
+        # append (the completed row) fails.
         sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
-        sheets.fail_append = http_error(500, "backendError")
+        sheets.fail_append_on_calls = {2: http_error(500, "backendError")}
         rows = await _apply_alice(
             config,
             directory,
@@ -858,10 +891,364 @@ class TestApplyUserLive:
         assert alice.action == "error"
         assert "ledger" in alice.reason.lower()
         assert "applied" in alice.reason.lower()
+        assert operations.LEDGER_APPEND_FAILED_REASON in alice.reason
         assert alice.after_hash == signature_hash(
             pool.mailboxes[ALICE].send_as[ALICE]["signature"]
         )
         assert (ALICE, ALICE) in pool.patch_calls()
+        # The pending row is still there: the rollback record survived.
+        pending = sheets.pending_ledger_rows()
+        assert [r["send_as_email"] for r in pending] == [ALICE]
+        assert pending[0]["previous_signature_html"] == OLD_PRIMARY
+        assert sheets.completed_ledger_rows() == []
+
+
+# ---------------------------------------------------------------------------
+# the pending ledger row: written before the patch, completed after
+# ---------------------------------------------------------------------------
+
+
+def _pending_row(send_as_email, previous_html, applied_at, run_id, entity="OTB"):
+    """A pending row as an interrupted apply leaves it."""
+    from gsignatures.ledger import PENDING_READBACK
+
+    return [
+        applied_at,
+        ACTOR,
+        ALICE,
+        send_as_email,
+        entity,
+        "1.0.0",
+        "1.0.0",
+        "rendered-" + run_id,
+        PENDING_READBACK,
+        signature_hash(previous_html),
+        previous_html,
+        run_id,
+    ]
+
+
+class TestPendingLedgerRow:
+    @pytest.mark.asyncio
+    async def test_pending_row_is_appended_before_the_patch(
+        self, config, directory, pool
+    ):
+        """One shared timeline across the Sheets and Gmail fakes: for each
+        address the order is append(pending), patch, append(completed)."""
+        from gsignatures.ledger import PENDING_READBACK
+
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        timeline: list = []
+        sheets.timeline = timeline
+        pool.mailboxes[ALICE].timeline = timeline
+        rows = await _apply_alice(
+            config,
+            directory,
+            pool,
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+        )
+        by = _rows_by_send_as(rows)
+        assert by[ALICE].action == "applied"
+        assert by[ALICE_JIT].action == "applied"
+
+        # Reduce each event to (kind, address, readback marker or None).
+        events = []
+        for name, payload in timeline:
+            if name == "sendAs.patch":
+                events.append(("patch", payload, None))
+            else:
+                ((send_as, readback),) = payload
+                events.append(
+                    (
+                        "append",
+                        send_as,
+                        "pending" if readback == PENDING_READBACK else "completed",
+                    )
+                )
+        assert events == [
+            ("append", ALICE, "pending"),
+            ("patch", ALICE, None),
+            ("append", ALICE, "completed"),
+            ("append", ALICE_JIT, "pending"),
+            ("patch", ALICE_JIT, None),
+            ("append", ALICE_JIT, "completed"),
+        ]
+        assert operations.LIVE_APPLY_ORDER == (
+            "ledger_pending",
+            "gmail_patch",
+            "ledger_completed",
+        )
+
+    @pytest.mark.asyncio
+    async def test_pending_row_carries_the_full_rollback_record(
+        self, config, directory, pool
+    ):
+        """The pending row is a complete rollback record on its own: the
+        planned hash, the previous hash and HTML, the run_id; only the
+        read-back is the marker. The completed row that follows has the
+        same run_id and the real read-back hash."""
+        from gsignatures.ledger import PENDING_READBACK
+
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        _, _, planned = await operations.plan_user(
+            config, directory, ALICE, gmail_factory=pool.factory
+        )
+        plan = next(p for p in planned if p.send_as_email == ALICE)
+        await _apply_alice(
+            config,
+            directory,
+            pool,
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            include_aliases=False,
+        )
+        pending, completed = sheets.ledger_rows()
+        assert pending["readback_hash"] == PENDING_READBACK
+        assert pending["rendered_hash"] == plan.rendered_hash
+        assert pending["previous_hash"] == signature_hash(OLD_PRIMARY)
+        assert pending["previous_signature_html"] == OLD_PRIMARY
+        assert pending["run_id"] == RUN
+        assert pending["actor"] == ACTOR
+        assert pending["entity"] == "OTB"
+        assert pending["template_version"] == "1.0.0"
+        assert pending["statutory_version"] == "1.0.0"
+        assert pending["applied_at"].endswith("+00:00")
+
+        stored = pool.mailboxes[ALICE].send_as[ALICE]["signature"]
+        assert completed["readback_hash"] == signature_hash(stored)
+        assert completed["readback_hash"] != PENDING_READBACK
+        assert completed["rendered_hash"] == plan.rendered_hash
+        assert completed["previous_signature_html"] == OLD_PRIMARY
+        assert completed["run_id"] == RUN
+        assert completed["applied_at"] >= pending["applied_at"]
+        # Every field but the read-back and the stamp is identical.
+        for key in LEDGER_HEADER:
+            if key not in ("readback_hash", "applied_at"):
+                assert pending[key] == completed[key], key
+
+    @pytest.mark.asyncio
+    async def test_failed_pending_append_means_no_patch(self, config, directory, pool):
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        sheets.fail_append_on_calls = {1: http_error(503, "backendError")}
+        timeline: list = []
+        sheets.timeline = timeline
+        pool.mailboxes[ALICE].timeline = timeline
+        rows = await _apply_alice(
+            config,
+            directory,
+            pool,
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            include_aliases=False,
+        )
+        alice = _rows_by_send_as(rows)[ALICE]
+        assert alice.action == "error"
+        assert alice.reason.startswith(operations.LEDGER_PENDING_FAILED_REASON)
+        assert alice.after_hash is None
+        assert pool.patch_calls() == []
+        assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == OLD_PRIMARY
+        assert [name for name, _ in timeline] == ["values.append"]
+        assert sheets.ledger_rows() == []
+
+    @pytest.mark.asyncio
+    async def test_completed_row_is_read_as_latest_after_a_full_apply(
+        self, config, directory, pool
+    ):
+        """After apply the next apply reads the completed row: unchanged."""
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        await _apply_alice(
+            config,
+            directory,
+            pool,
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+        )
+        rows = await _apply_alice(
+            config, directory, pool, sheets=sheets, sheet_id=SHEET_ID
+        )
+        by = _rows_by_send_as(rows)
+        assert by[ALICE].action == "unchanged"
+        assert by[ALICE_JIT].action == "unchanged"
+        latest = await operations.prepare_ledger(sheets, SHEET_ID)
+        audit = await operations.audit_scope(
+            config,
+            directory,
+            ou_path="/01 OTB",
+            ledger_latest=latest,
+            gmail_factory=pool.factory,
+        )
+        statuses = {r["send_as_email"]: r["status"] for r in audit}
+        assert statuses[ALICE] == "in_sync"
+        assert statuses[ALICE_JIT] == "in_sync"
+
+    @pytest.mark.asyncio
+    async def test_pending_only_row_audits_as_apply_interrupted(
+        self, config, directory, pool
+    ):
+        sheets = _ledger_with_rows(
+            [_pending_row(ALICE, OLD_PRIMARY, "2026-09-20T09:00:00+00:00", "run-x")]
+        )
+        latest = await operations.prepare_ledger(sheets, SHEET_ID)
+        audit = await operations.audit_scope(
+            config,
+            directory,
+            ou_path="/01 OTB",
+            ledger_latest=latest,
+            gmail_factory=pool.factory,
+        )
+        alice = {r["send_as_email"]: r for r in audit}[ALICE]
+        assert alice["status"] == "apply_interrupted"
+        assert "run-x" in alice["reason"]
+        assert alice["status"] in operations.AUDIT_STATUSES
+        assert alice["status"] in operations.DRIFT_STATUSES
+        assert operations.has_drift(audit)
+        assert "apply_interrupted: 1" in operations.format_audit_counts(audit)
+
+    @pytest.mark.asyncio
+    async def test_pending_only_row_means_the_next_apply_reapplies(
+        self, config, directory, pool
+    ):
+        """A pending row never counts as 'unchanged', whatever Gmail holds."""
+        row = await _ledger_row_for_current_state(config, directory, pool, ALICE)
+        from gsignatures.ledger import PENDING_READBACK
+
+        row[LEDGER_HEADER.index("readback_hash")] = PENDING_READBACK
+        rows = await _apply_alice(
+            config,
+            directory,
+            pool,
+            sheets=_ledger_with_rows([row]),
+            sheet_id=SHEET_ID,
+            primary_only=True,
+        )
+        assert rows[0].action == "would_apply"
+        assert "pending" in rows[0].reason
+
+    @pytest.mark.asyncio
+    async def test_restore_from_a_pending_row(self, pool):
+        """An interrupted apply left only the pending row: its
+        previous_signature_html goes back and the restore is recorded."""
+        before = "<div>what was there before the interrupted apply</div>"
+        sheets = _ledger_with_rows(
+            [_pending_row(ALICE, before, "2026-09-20T09:00:00+00:00", "run-x")]
+        )
+        rows = await operations.restore_user(
+            ALICE,
+            None,
+            actor=ACTOR,
+            run_id="restore-1",
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            gmail_factory=pool.factory,
+        )
+        assert rows[0].action == "would_apply"
+        assert "run-x" in rows[0].reason
+        assert rows[0].after_hash == signature_hash(before)
+
+        rows = await operations.restore_user(
+            ALICE,
+            None,
+            actor=ACTOR,
+            run_id="restore-1",
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            gmail_factory=pool.factory,
+        )
+        assert rows[0].action == "applied"
+        assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == before
+        new = sheets.ledger_rows()[-1]
+        assert new["run_id"] == "restore-1"
+        assert new["template_version"] == operations.RESTORED_VERSION
+        assert new["previous_signature_html"] == OLD_PRIMARY
+
+    @pytest.mark.asyncio
+    async def test_restore_prefers_the_completed_row_of_a_run(self, pool):
+        """Both rows of run-y exist; by run_id or by latest, the completed
+        row is the source (same previous HTML either way, but the reason
+        must not name a pending row)."""
+        older = "<div>older</div>"
+        prev = "<div>previous</div>"
+        sheets = _ledger_with_rows(
+            [
+                _pending_row(ALICE, older, "2026-09-19T09:00:00+00:00", "run-x"),
+                _pending_row(ALICE, prev, "2026-09-20T09:00:00+00:00", "run-y"),
+                _applied_row(ALICE, prev, "2026-09-20T09:00:00+00:00", "run-y"),
+            ]
+        )
+        rows = await operations.restore_user(
+            ALICE,
+            None,
+            actor=ACTOR,
+            run_id="restore-2",
+            from_run_id="run-y",
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            gmail_factory=pool.factory,
+        )
+        assert rows[0].after_hash == signature_hash(prev)
+        rows = await operations.restore_user(
+            ALICE,
+            None,
+            actor=ACTOR,
+            run_id="restore-2",
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            gmail_factory=pool.factory,
+        )
+        assert rows[0].after_hash == signature_hash(prev)
+        assert "run-y" in rows[0].reason
+        rows = await operations.restore_user(
+            ALICE,
+            None,
+            actor=ACTOR,
+            run_id="restore-2",
+            from_run_id="run-x",
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            gmail_factory=pool.factory,
+        )
+        assert rows[0].after_hash == signature_hash(older)
+
+    @pytest.mark.asyncio
+    async def test_pending_row_from_a_failed_patch_audits_as_interrupted(
+        self, config, directory, pool
+    ):
+        """Patch fails after the pending row: the row stays, the audit says
+        apply_interrupted, and restore can still use it."""
+        pool.mailboxes[ALICE].fail_patch_for[ALICE] = http_error(403, "forbidden")
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        await _apply_alice(
+            config,
+            directory,
+            pool,
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+            include_aliases=False,
+        )
+        latest = await operations.prepare_ledger(sheets, SHEET_ID)
+        audit = await operations.audit_scope(
+            config,
+            directory,
+            ou_path="/01 OTB",
+            ledger_latest=latest,
+            gmail_factory=pool.factory,
+        )
+        alice = {r["send_as_email"]: r for r in audit}[ALICE]
+        assert alice["status"] == "apply_interrupted"
+        assert RUN in alice["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -998,7 +1385,8 @@ class TestApplyScope:
         assert by[CAROL].action == "error"
         assert meta["dry_run"] is False
         assert meta["report_filename"] == f"signatures-apply-{RUN}.jsonl"
-        assert len(sheets.ledger_rows()) == 2
+        assert len(sheets.ledger_rows()) == 4
+        assert len(sheets.completed_ledger_rows()) == 2
         assert meta["counts"]["applied"] == 2
 
     @pytest.mark.asyncio
@@ -1027,7 +1415,8 @@ class TestApplyScope:
         assert sorted(pool.factory_calls) == [ALICE, BOB]
         owner_of = {ALICE: ALICE, ALICE_JIT: ALICE, BOB: BOB}
         ledger = sheets.ledger_rows()
-        assert len(ledger) == 3
+        assert len(ledger) == 6
+        assert len(sheets.completed_ledger_rows()) == 3
         for entry in ledger:
             assert entry["user_email"] == owner_of[entry["send_as_email"]]
             assert entry["run_id"] == RUN
@@ -1042,8 +1431,9 @@ class TestApplyScope:
     async def test_ledger_append_failure_stops_later_users_in_the_scope(
         self, config, directory, pool
     ):
-        """Alice's first append fails; Alice's alias and Bob are then not
-        attempted. One patch for the whole scope."""
+        """Alice's first (pending) append fails; Alice is not patched, and
+        Alice's alias and Bob are then not attempted. No patch for the whole
+        scope."""
         sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
         sheets.fail_append = http_error(500, "backendError")
         rows, meta = await _apply_scope(
@@ -1056,9 +1446,10 @@ class TestApplyScope:
             sheets=sheets,
             sheet_id=SHEET_ID,
         )
-        assert pool.patch_calls() == [(ALICE, ALICE)]
+        assert pool.patch_calls() == []
         by = _rows_by_send_as(rows)
         assert by[ALICE].action == "error"
+        assert by[ALICE].reason.startswith(operations.LEDGER_PENDING_FAILED_REASON)
         assert by[ALICE_JIT].action == "error"
         assert by[ALICE_JIT].reason.startswith(operations.LEDGER_FAILED_REASON)
         assert by[BOB].action == "error"

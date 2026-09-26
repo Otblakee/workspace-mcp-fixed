@@ -167,6 +167,10 @@ class TestExitCodes:
             lambda rt, pool, sheets: rt.directory.users_by_email[ALICE][
                 "organizations"
             ][0].__setitem__("title", "Chair"),
+            # Interrupted apply: Alice's latest row is still pending.
+            lambda rt, pool, sheets: sheets.tabs["Ledger"][1].__setitem__(
+                LEDGER_HEADER.index("readback_hash"), "pending"
+            ),
         ],
         ids=[
             "changed_since_apply",
@@ -174,6 +178,7 @@ class TestExitCodes:
             "stale_template",
             "error",
             "stale_directory",
+            "apply_interrupted",
         ],
     )
     def test_any_drift_exits_two(self, world, capsys, mutate):

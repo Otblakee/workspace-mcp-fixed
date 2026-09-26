@@ -179,49 +179,68 @@ class HeaderFooterManager:
         """
         Find the target header or footer section.
 
+        The Header and Footer objects in ``doc["headers"]`` / ``doc["footers"]``
+        carry no type, and every segment id is an opaque ``kix.`` string, so
+        neither can say which one is the first-page or even-page variant. The
+        only place that mapping lives is ``doc["documentStyle"]``:
+        ``defaultHeaderId`` / ``firstPageHeaderId`` / ``evenPageHeaderId`` and
+        the three footer equivalents. Read the id for the requested type
+        there, then look it up in the headers / footers map.
+
         Args:
             doc: Document data
             section_type: "header" or "footer"
-            header_footer_type: Type of header/footer
+            header_footer_type: "DEFAULT", "FIRST_PAGE_ONLY" or "EVEN_PAGE"
 
         Returns:
-            Tuple of (section_data, section_id) or (None, None) if not found
+            Tuple of (section_data, section_id), or (None, None) when the
+            document has no header / footer of that type. There is no
+            fallback to another type or to "the first one found": a
+            missing id means the section does not exist, and the caller
+            decides whether it can be created (DEFAULT) or must be switched
+            on in Google Docs first (FIRST_PAGE_ONLY, EVEN_PAGE).
         """
-        if section_type == "header":
-            sections = doc.get("headers", {})
-        else:
-            sections = doc.get("footers", {})
+        section_id = self._section_id_from_document_style(
+            doc, section_type, header_footer_type
+        )
+        if not section_id:
+            return None, None
 
-        # Try to match section based on header_footer_type
-        # Google Docs API typically uses section IDs that correspond to types
+        sections = doc.get("headers" if section_type == "header" else "footers") or {}
+        section_data = sections.get(section_id)
+        if section_data is None:
+            # documentStyle names an id the map does not carry. Treat it as
+            # missing rather than guessing at another section.
+            logger.warning(
+                f"documentStyle names {section_type} {section_id} for "
+                f"{header_footer_type} but the document has no such {section_type}"
+            )
+            return None, None
+        return section_data, section_id
 
-        # First, try to find an exact match based on common patterns
-        for section_id, section_data in sections.items():
-            # Check if section_data contains type information
-            if "type" in section_data and section_data["type"] == header_footer_type:
-                return section_data, section_id
+    # documentStyle field per (section_type, header_footer_type).
+    _DOCUMENT_STYLE_ID_FIELDS = {
+        ("header", "DEFAULT"): "defaultHeaderId",
+        ("header", "FIRST_PAGE_ONLY"): "firstPageHeaderId",
+        ("header", "EVEN_PAGE"): "evenPageHeaderId",
+        ("footer", "DEFAULT"): "defaultFooterId",
+        ("footer", "FIRST_PAGE_ONLY"): "firstPageFooterId",
+        ("footer", "EVEN_PAGE"): "evenPageFooterId",
+    }
 
-        # If no exact match, try pattern matching on section ID
-        # Google Docs often uses predictable section ID patterns
-        target_patterns = {
-            "DEFAULT": ["default", "kix"],  # DEFAULT headers often have these patterns
-            "FIRST_PAGE": ["first", "firstpage"],
-            "EVEN_PAGE": ["even", "evenpage"],
-            "FIRST_PAGE_ONLY": ["first", "firstpage"],  # Legacy support
-        }
-
-        patterns = target_patterns.get(header_footer_type, [])
-        for pattern in patterns:
-            for section_id, section_data in sections.items():
-                if pattern.lower() in section_id.lower():
-                    return section_data, section_id
-
-        # If still no match, return the first available section as fallback
-        # This maintains backward compatibility
-        for section_id, section_data in sections.items():
-            return section_data, section_id
-
-        return None, None
+    @classmethod
+    def _section_id_from_document_style(
+        cls, doc: dict[str, Any], section_type: str, header_footer_type: str
+    ) -> Optional[str]:
+        """The segment id documentStyle records for this header/footer type."""
+        field = cls._DOCUMENT_STYLE_ID_FIELDS.get((section_type, header_footer_type))
+        if field is None:
+            return None
+        style = doc.get("documentStyle") or {}
+        if not isinstance(style, dict):
+            return None
+        value = style.get(field)
+        return value if isinstance(value, str) and value else None
 
     async def _replace_section_content(
         self,

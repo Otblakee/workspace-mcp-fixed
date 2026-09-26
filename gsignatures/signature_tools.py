@@ -391,8 +391,10 @@ async def _set(
         )
     else:
         lines.append(
-            "Notes: every applied row has a matching ledger row (Ledger tab) "
-            "with the previous signature HTML for rollback. Keep this table."
+            "Notes: every applied row has two ledger rows (Ledger tab): a "
+            "pending row written before the patch, with the previous signature "
+            "HTML for rollback, and a completed row with the read-back hash. "
+            "Keep this table."
         )
     return "\n".join(lines)
 
@@ -705,7 +707,9 @@ async def audit_email_signatures(
     Compares every send-as in one scope with the ledger. Never writes a signature.
 
     Exactly one scope (all_users=True counts as one). Statuses: in_sync,
-    unmanaged, never_applied, stale_template, stale_directory (the person's
+    unmanaged, never_applied, apply_interrupted (the ledger holds the
+    pre-patch pending row of an apply that never recorded its read-back;
+    re-apply or restore), stale_template, stale_directory (the person's
     Directory data changed since the apply, so the signature is out of
     date), changed_since_apply, error. With write_report=True the rows are
     also written to an 'Audit_<UTC date>' tab of the ledger Sheet. Caller
