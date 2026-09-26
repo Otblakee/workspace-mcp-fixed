@@ -77,9 +77,24 @@ class HeaderFooterManager:
             )
 
             if not target_section:
+                # Nothing to update yet. The Docs API can create a DEFAULT
+                # header or footer (createHeader / createFooter); first page
+                # and even page variants have no create request, so those
+                # still need to be switched on in Google Docs first.
+                if header_footer_type != "DEFAULT":
+                    return (
+                        False,
+                        f"No {section_type} found in document and the Docs API can only "
+                        f"create a DEFAULT {section_type}, not {header_footer_type}. "
+                        f"Turn on the {header_footer_type} {section_type} in Google Docs "
+                        f"first (File > Page setup or the header/footer options), then call again.",
+                    )
+
+                section_id = await self._create_section(document_id, section_type)
+                await self._insert_into_new_section(document_id, section_id, content)
                 return (
-                    False,
-                    f"No {section_type} found in document. Please create a {section_type} first in Google Docs.",
+                    True,
+                    f"Created {section_type} ({section_id}) and set its content in document {document_id}",
                 )
 
             # Update the content
@@ -98,6 +113,59 @@ class HeaderFooterManager:
         except Exception as e:
             logger.error(f"Failed to update {section_type}: {str(e)}")
             return False, f"Failed to update {section_type}: {str(e)}"
+
+    async def _create_section(self, document_id: str, section_type: str) -> str:
+        """
+        Create a DEFAULT header or footer and return its segment ID.
+
+        Sends a single createHeader / createFooter request and reads the new
+        ID from the batchUpdate response (replies[0].createHeader.headerId or
+        replies[0].createFooter.footerId).
+
+        Raises:
+            KeyError: if the response carries no ID for the new section.
+        """
+        request_key = "createHeader" if section_type == "header" else "createFooter"
+        id_key = "headerId" if section_type == "header" else "footerId"
+
+        response = await asyncio.to_thread(
+            self.service.documents()
+            .batchUpdate(
+                documentId=document_id,
+                body={"requests": [{request_key: {"type": "DEFAULT"}}]},
+            )
+            .execute
+        )
+
+        replies = (response or {}).get("replies") or []
+        section_id = None
+        for reply in replies:
+            if isinstance(reply, dict) and request_key in reply:
+                section_id = reply[request_key].get(id_key)
+                break
+        if not section_id:
+            raise KeyError(
+                f"{request_key} succeeded but the response carried no {id_key}: {response!r}"
+            )
+        logger.info(f"Created {section_type} {section_id} in document {document_id}")
+        return section_id
+
+    async def _insert_into_new_section(
+        self, document_id: str, section_id: str, content: str
+    ) -> None:
+        """Insert content at index 0 of a freshly created (empty) header or footer."""
+        await asyncio.to_thread(
+            self.service.documents()
+            .batchUpdate(
+                documentId=document_id,
+                body={
+                    "requests": [
+                        create_insert_text_segment_request(0, content, section_id)
+                    ]
+                },
+            )
+            .execute
+        )
 
     async def _get_document(self, document_id: str) -> dict[str, Any]:
         """Get the full document data."""

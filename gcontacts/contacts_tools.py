@@ -71,17 +71,16 @@ def _format_contact(person: Dict[str, Any], detailed: bool = False) -> str:
         if phone_list:
             lines.append(f"Phone: {', '.join(phone_list)}")
 
-    # Organizations
+    # Organizations. The People API keeps the company in `name` and the job
+    # title in `title`; each gets its own label so a title-only contact is
+    # never shown as an organization.
     orgs = person.get("organizations", [])
     if orgs:
         org = orgs[0]
-        org_parts = []
-        if org.get("title"):
-            org_parts.append(org["title"])
         if org.get("name"):
-            org_parts.append(f"at {org['name']}")
-        if org_parts:
-            lines.append(f"Organization: {' '.join(org_parts)}")
+            lines.append(f"Organization: {org['name']}")
+        if org.get("title"):
+            lines.append(f"Job title: {org['title']}")
 
     if detailed:
         # Addresses
@@ -905,6 +904,12 @@ async def batch_update_contacts(
     """
     Update multiple contacts in a batch operation.
 
+    Fetches the current contacts first (their etags are required by the
+    People API), then issues one batchUpdateContacts call per distinct set of
+    fields being changed, with `contacts` as a map keyed by resource name.
+    Contacts that cannot be fetched or that the API rejects are listed under
+    "Not updated" in the result instead of failing the whole batch.
+
     Args:
         user_google_email (str): The user's Google email address. Required.
         updates (List[Dict[str, str]]): List of update dictionaries with fields:
@@ -917,7 +922,7 @@ async def batch_update_contacts(
             - job_title: New job title
 
     Returns:
-        str: Confirmation with updated contacts.
+        str: Confirmation with updated contacts and any per-contact failures.
     """
     logger.info(
         f"[batch_update_contacts] Invoked. Email: '{user_google_email}', Count: {len(updates)}"
@@ -940,29 +945,40 @@ async def batch_update_contacts(
                 contact_id = f"people/{contact_id}"
             resource_names.append(contact_id)
 
-        # Batch get contacts for etags
+        # Batch get the current contacts. Every Person body sent to
+        # batchUpdateContacts must carry the contact's current etag, and
+        # getBatchGet returns it for each resolved contact in one round trip.
         batch_get_result = await asyncio.to_thread(
             service.people()
             .getBatchGet(
                 resourceNames=resource_names,
-                personFields="metadata",
+                personFields=DEFAULT_PERSON_FIELDS + ",metadata",
             )
             .execute
         )
 
-        etags = {}
+        etags: Dict[str, str] = {}
+        # resourceName -> reason the contact could not be updated
+        failures: Dict[str, str] = {}
         for response in batch_get_result.get("responses", []):
             person = response.get("person", {})
-            resource_name = person.get("resourceName")
+            resource_name = person.get("resourceName") or response.get(
+                "requestedResourceName"
+            )
             etag = person.get("etag")
             if resource_name and etag:
                 etags[resource_name] = etag
+            elif resource_name:
+                status = response.get("status", {})
+                failures[resource_name] = (
+                    status.get("message") or "contact could not be fetched"
+                )
 
         # Group updates by their exact field-set. The People API clears any
         # masked field that is absent from a person's body, so a single union
         # updateMask across heterogeneous updates would wipe fields on every
         # contact that doesn't set them.
-        update_groups: Dict[frozenset, List[Dict[str, Any]]] = {}
+        update_groups: Dict[frozenset, Dict[str, Dict[str, Any]]] = {}
 
         for update in updates:
             contact_id = update.get("contact_id", "")
@@ -972,6 +988,7 @@ async def batch_update_contacts(
             etag = etags.get(contact_id)
             if not etag:
                 logger.warning(f"No etag found for {contact_id}, skipping")
+                failures.setdefault(contact_id, "contact not found or no etag")
                 continue
 
             body = _build_person_body(
@@ -994,19 +1011,23 @@ async def batch_update_contacts(
                     )
                     if field in body
                 )
-                body["resourceName"] = contact_id
                 body["etag"] = etag
-                update_groups.setdefault(update_fields, []).append({"person": body})
+                # `contacts` is a map keyed by resourceName, not a list.
+                update_groups.setdefault(update_fields, {})[contact_id] = body
+            else:
+                failures.setdefault(contact_id, "no update fields supplied")
 
         if not update_groups:
             raise Exception("No valid update data provided.")
 
         # One batchUpdateContacts call per distinct field-set, each with only
-        # that group's mask and contacts.
+        # that group's mask and contacts. Request body shape:
+        #   {"contacts": {"people/c1": {"etag": ..., <fields>}, ...},
+        #    "updateMask": "emailAddresses,names", "readMask": ...}
         update_results: Dict[str, Any] = {}
-        for update_fields, update_bodies in update_groups.items():
+        for update_fields, contacts_map in update_groups.items():
             batch_body = {
-                "contacts": update_bodies,
+                "contacts": contacts_map,
                 "updateMask": ",".join(sorted(update_fields)),
                 "readMask": DEFAULT_PERSON_FIELDS,
             }
@@ -1014,7 +1035,16 @@ async def batch_update_contacts(
             result = await asyncio.to_thread(
                 service.people().batchUpdateContacts(body=batch_body).execute
             )
-            update_results.update(result.get("updateResult", {}))
+            for resource_name, update_result in result.get("updateResult", {}).items():
+                # Each entry is a PersonResponse; a non-zero status code is a
+                # per-contact failure inside an otherwise successful batch.
+                status = update_result.get("status") or {}
+                if status.get("code", 0):
+                    failures[resource_name] = (
+                        status.get("message") or f"status code {status['code']}"
+                    )
+                    continue
+                update_results[resource_name] = update_result
 
         response = f"Batch Update Results for {user_google_email}:\n\n"
         response += f"Updated {len(update_results)} contacts:\n\n"
@@ -1023,8 +1053,14 @@ async def batch_update_contacts(
             person = update_result.get("person", {})
             response += _format_contact(person) + "\n\n"
 
+        if failures:
+            response += f"Not updated ({len(failures)}):\n"
+            for resource_name, reason in failures.items():
+                response += f"- {resource_name}: {reason}\n"
+
         logger.info(
             f"Batch updated {len(update_results)} contacts for {user_google_email}"
+            + (f" ({len(failures)} not updated)" if failures else "")
         )
         return response
 
@@ -1161,6 +1197,9 @@ async def update_contact_group(
     """
     Update a contact group's name.
 
+    Fetches the group first so its current etag can be sent with the update,
+    which the People API requires for contactGroups.update.
+
     Args:
         user_google_email (str): The user's Google email address. Required.
         group_id (str): The contact group ID to update.
@@ -1180,7 +1219,33 @@ async def update_contact_group(
     )
 
     try:
-        body = {"contactGroup": {"name": name}}
+        # contactGroups.update needs the group's current etag inside the
+        # contactGroup body; without it the API answers 400 "Fingerprint is
+        # missing". Fetch the group first to get it.
+        try:
+            current = await asyncio.to_thread(
+                service.contactGroups()
+                .get(resourceName=resource_name, groupFields="name,metadata")
+                .execute
+            )
+        except HttpError as error:
+            if error.resp.status == 404:
+                raise
+            raise Exception(
+                f"Could not fetch contact group {group_id} before renaming it: {error}"
+            )
+
+        etag = current.get("etag")
+        if not etag:
+            raise Exception(
+                f"Contact group {group_id} was fetched but carried no etag, so it cannot be renamed."
+            )
+
+        body = {
+            "contactGroup": {"etag": etag, "name": name},
+            "updateGroupFields": "name",
+            "readGroupFields": CONTACT_GROUP_FIELDS,
+        }
 
         result = await asyncio.to_thread(
             service.contactGroups()

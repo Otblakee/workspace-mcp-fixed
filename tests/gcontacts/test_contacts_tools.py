@@ -45,7 +45,9 @@ class TestFormatContact:
         result = _format_contact(person)
 
         assert "Name: Jane Smith" in result
-        assert "Organization: Engineer at Acme Corp" in result
+        assert "Organization: Acme Corp" in result
+        assert "Job title: Engineer" in result
+        assert "at Acme Corp" not in result
 
     def test_format_contact_organization_name_only(self):
         """Test formatting a contact with only organization name."""
@@ -56,7 +58,8 @@ class TestFormatContact:
 
         result = _format_contact(person)
 
-        assert "Organization: at Acme Corp" in result
+        assert "Organization: Acme Corp" in result
+        assert "Job title" not in result
 
     def test_format_contact_job_title_only(self):
         """Test formatting a contact with only job title."""
@@ -67,7 +70,11 @@ class TestFormatContact:
 
         result = _format_contact(person)
 
-        assert "Organization: CEO" in result
+        # A title-only contact must never be shown under the Organization label
+        # (the live battery saw "Organization: MCP test fixture" for a
+        # job_title-only update).
+        assert "Job title: CEO" in result
+        assert "Organization" not in result
 
     def test_format_contact_detailed(self):
         """Test formatting a contact with detailed fields."""

@@ -64,14 +64,14 @@ class TestBatchUpdateContactsMaskGrouping:
 
         for body in bodies:
             contacts = body["contacts"]
+            assert isinstance(contacts, dict)
             assert len(contacts) == 1
-            person = contacts[0]["person"]
             if body["updateMask"] == "emailAddresses":
-                assert person["resourceName"] == "people/c1"
+                person = contacts["people/c1"]
                 assert person["etag"] == "etag-1"
                 assert "phoneNumbers" not in person
             else:
-                assert person["resourceName"] == "people/c2"
+                person = contacts["people/c2"]
                 assert person["etag"] == "etag-2"
                 assert "emailAddresses" not in person
 
@@ -107,7 +107,7 @@ class TestBatchUpdateContactsMaskGrouping:
         assert batch_update.call_count == 1
         body = batch_update.call_args.kwargs["body"]
         assert body["updateMask"] == "emailAddresses"
-        assert len(body["contacts"]) == 2
+        assert set(body["contacts"]) == {"people/c1", "people/c2"}
 
 
 # ---------------------------------------------------------------------------
