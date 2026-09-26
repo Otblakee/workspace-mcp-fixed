@@ -970,3 +970,45 @@ image is refused fail-closed even when public); the exact Google wording of
 the non-public image 400 (two phrases are matched); whether `getBatchGet`
 returns `etag` regardless of `personFields` (the code requests the updated
 fields plus `metadata`).
+
+## Adversarial review fixes (v1.16.2)
+
+Three read-only reviewers (trust boundaries, correctness, data safety) went
+over the whole tree on 2026-09-26. 1.16.1 itself was clean. What changed:
+
+- **Attachment storage sweeps the disk, not just its memory table.**
+  `AttachmentStorage.sweep_directory` runs on init and inside
+  `cleanup_expired`: age-based unlink of regular files (no symlinks, no
+  directories), then oldest-first eviction above `WORKSPACE_ATTACHMENT_MAX_BYTES`
+  (default 512 MiB). The proxy `DiskStore` gets `max_size` from
+  `WORKSPACE_MCP_OAUTH_PROXY_DISK_MAX_BYTES` (default 256 MiB). Both share the
+  1 GB Render disk with the credentials directory, so the caps matter.
+- **Audit error text is scrubbed** (`core/audit._scrub_error_text`): URLs to
+  scheme and host, `ya29.` tokens and JWTs to `<token>`, then the 300-char
+  cut. Applied to the exception path and to result strings that begin with
+  "Error:" or "Failed:".
+- **Domain-policy rejection is terminal** in `auth/auth_info_middleware.py`.
+  A validated token that fails `OAUTH_ALLOWED_EMAIL_DOMAINS` sets no identity
+  and returns; it no longer reaches the session-binding branch. No-token
+  requests are unchanged.
+- **Header and footer targeting** uses `documentStyle.*HeaderId` /
+  `*FooterId`. Header and Footer objects carry no type, and every id starts
+  with `kix.`, so the old pattern match always hit the first one.
+- **Signature ledger order is pending, patch, completed.** `engine.PENDING_READBACK`
+  marks the pending row's `readback_hash`; `ledger.outranks` makes a run's
+  completed row beat its pending row; `engine.APPLY_INTERRUPTED` is the audit
+  status for a pending row with no completed row. `restore_user` still writes
+  its single row after its patch (small follow-up if wanted).
+- **Env vars set on Render on 2026-09-26:** `OAUTH_ALLOWED_EMAIL_DOMAINS` and
+  `DRIVE_PERMISSION_ALLOWED_DOMAINS`, both
+  `otbgroup.co.uk,jit-logistics.com,valeautomotive.co.uk,bir-d.co.uk,arthistorywithemily.co.uk`.
+  The owner's sign-in carries `hd=otbgroup.co.uk`. If a staff member on a
+  secondary domain is refused, check which `hd` Google sends for them
+  before widening the list.
+
+Policy findings (share_calendar owner grants, filter actions, unguarded
+moves, single-message trash loops, restriction loosening, scope-wide
+signature undo, label delete, whole-tab clears, display-name spoofing, audit
+redaction of names and phones) are parked in `FOLLOWUPS.md`, "Adversarial
+review, tier 3", awaiting the owner's decision. They are not bugs; each one
+narrows what a connected client can do.

@@ -413,6 +413,53 @@ by hand): Gmail draft "ZZ_MCPTEST_2026-09-26 draft (safe to delete)", label
 2026-11-10, two contacts named ZZ_MCPTEST and an empty contact group of the
 same name. The Drive scratch folder is in the holding folder.
 
+## Adversarial review, tier 3 (parked 2026-09-26, owner decision)
+
+Findings from the 2026-09-26 review that change what a connected AI client
+can do. None is a bug; each is a policy narrowing. Recommendation in
+brackets. Decide, then implement in one PR with confirm flags and tests.
+
+1. `share_calendar` can grant an external address owner rights on any
+   calendar and there is no acl list or delete tool to undo it. [Cap the
+   role at reader or writer and apply `DRIVE_PERMISSION_ALLOWED_DOMAINS`.]
+2. `create_gmail_filter` passes a raw action through: it can trash, archive
+   or forward all future mail, and `delete_gmail_filter` is blocked so the AI
+   cannot undo its own filter. [Refuse forward, TRASH and SPAM actions;
+   unblock `delete_gmail_filter`.]
+3. `update_drive_file` `add_parents` / `remove_parents` is an unguarded move,
+   including out of a shared drive, with no record of the source.
+   [Write previous parents to appProperties as soft delete does; refuse a
+   cross-drive move without an explicit flag.]
+4. `modify_gmail_message_labels` can apply TRASH one message at a time with
+   no cap, so a loop empties an inbox. [Refuse TRASH and SPAM; archive by
+   removing INBOX stays.]
+5. `update_shared_drive` can loosen the three sharing restriction flags on a
+   restricted drive. [Require `confirm=True` to loosen.]
+6. `apply_email_signatures` has no scope-wide undo and confirm is a bare
+   boolean. [Add restore by `run_id` over a scope; make confirm take the user
+   count the dry run printed.]
+7. `manage_gmail_label` delete, `modify_sheet_values` with `clear_values` on a
+   bare sheet name, `find_and_replace_doc` with a very short `find_text`.
+   [Confirm flag for each.]
+8. `send_gmail_message` `from_name` is free text, so mail can go out under
+   another person's display name. [Restrict to the sender's Directory name.]
+9. The audit Sheet stores contact names, phones, event attendees and
+   find/replace text in the clear. [Add them to `SENSITIVE`.]
+10. `/attachments/{file_id}` serves without auth or an audit row within the
+    hour; ids are uuid4. [Log a row from the route.]
+11. `set_drive_permission` with `allow_individual=True` should refuse
+    organizer and fileOrganizer for individuals even inside the allowlist.
+
+Closed by configuration on 2026-09-26: `OAUTH_ALLOWED_EMAIL_DOMAINS` and
+`DRIVE_PERMISSION_ALLOWED_DOMAINS` set on Render. Still worth doing at the
+IdP: set the OAuth client to Internal in the Workspace org.
+
+Still open from the 1.16.1 live re-run: whether `files.get` returns
+`permissions` for shared-drive images (the fixture was in My Drive), and the
+exact wording of Google's non-public image 400 (the permission pre-check
+fired first, as designed). The `getBatchGet` etag question is closed: the
+live batch update succeeded.
+
 ## Raw bearer-token auth path is unreachable (found during the FastMCP 4 upgrade)
 
 The `bearer_token` branch in `auth/auth_info_middleware.py` reads
