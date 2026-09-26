@@ -358,6 +358,61 @@ sign-in. Still unset in the dashboard: the health check path (`/health`
 exists and is unauthenticated; `render.yaml` names it but the live service
 is not blueprint-managed, so it has to be typed in under Settings).
 
+## Live tool battery after the FastMCP 4 upgrade (2026-09-26)
+
+Every tool the live service exposes (121 on v1.16.0: drive, gmail, calendar,
+docs, sheets, contacts, gadmin, gsignatures) was called against the deployed
+server through the OAuth 2.1 connector. Read tools were called as-is; write
+tools ran against scratch fixtures prefixed `ZZ_MCPTEST_2026-09-26_`, which
+were soft-deleted into the holding folder at the end. Result: no failure
+attributable to the upgrade. Audit rows landed in the Sheet with the right
+user, redaction and latency; both attachment download paths issued working
+URLs; the denylist, the groups-only permission guardrail, the signature
+caller gate and the confirm gate all held. The signature tools returned the
+expected "no service account configured" error because the key is not on
+Render yet.
+
+Seven pre-existing tool defects surfaced (none related to FastMCP; the code
+paths date from June and August):
+
+1. `modify_doc_text` with `text` plus a formatting flag returns
+   "'end_index' is required when applying formatting" even though the
+   description says insert-and-format works in one call. Plain insert works.
+2. `update_doc_headers_footers` cannot create a header or footer on a fresh
+   document (no `createHeader` / `createFooter` request), so it is unusable
+   on documents this server created until the header exists.
+3. `create_table_with_data` at the index `inspect_doc_structure` reports as
+   `total_length` gets a 400 from Google (index must be less than the segment
+   end); `total_length - 1` works. Off-by-one in the documented workflow.
+4. `insert_doc_image` with a Drive file ID only works for publicly readable
+   files, which this server refuses to create. A public https URL works. The
+   description should say so, or the tool should fall back to a short-lived
+   copy the caller owns.
+5. `update_contact_group` (rename) gets "Fingerprint is missing": the update
+   body does not carry the group's `etag`.
+6. `batch_update_contacts` gets "Cannot bind a list to map for field
+   'contacts'": People `batchUpdateContacts` wants a map keyed by
+   resourceName, the tool sends a list.
+7. `update_contact` with `job_title` only echoed the value under
+   Organization; check which People field it writes.
+
+Cosmetic, from the read-only pass: `get_drive_file_content` on a spreadsheet
+whose first tab is empty returns an empty content block; permission listings
+print a blank email for one inherited shared-drive organizer;
+`check_drive_file_public_access` still prints a "Share, Anyone with the link"
+fix hint although sharing tools are blocked here; `debug_table_structure`
+returns "Error: ..." as text rather than raising; `create_event` prints only
+the calendar link, not the event id, so a follow-up `modify_event` has to
+decode it; `create_doc` and `create_spreadsheet` have no folder parameter and
+land in My Drive root.
+
+Fixtures left in place because the delete tools are blocked by design (tidy
+by hand): Gmail draft "ZZ_MCPTEST_2026-09-26 draft (safe to delete)", label
+`ZZ_MCPTEST_2026-09-26_renamed`, an inert filter on
+`from:zz-mcptest-nobody@example.invalid`, one event on the Claude calendar on
+2026-11-10, two contacts named ZZ_MCPTEST and an empty contact group of the
+same name. The Drive scratch folder is in the holding folder.
+
 ## Raw bearer-token auth path is unreachable (found during the FastMCP 4 upgrade)
 
 The `bearer_token` branch in `auth/auth_info_middleware.py` reads
