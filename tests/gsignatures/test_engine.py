@@ -307,7 +307,7 @@ def test_shipped_config_seed_values(shipped_config):
     assert otb.company_number == "15732792"
     assert otb.place_of_registration == "England and Wales"
     assert otb.group_branding is True
-    assert otb.statutory_verified is False
+    assert otb.statutory_verified is True
     assert otb.required_fields == ["name", "title"]
     assert otb.optional_fields == ["mobile"]
     assert cfg.entities["JIT"].company_number == "03281238"
@@ -337,9 +337,20 @@ def test_shipped_config_seed_values(shipped_config):
     assert [r.entity for r in cfg.primary_rules[1:]] == ["OTB", "JIT", "VALE", "BIR"]
 
 
-def test_shipped_config_has_verified_flag_false_everywhere(shipped_config):
-    for ent in shipped_config.entities.values():
-        assert ent.statutory_verified is False
+def test_shipped_config_verified_flags(shipped_config):
+    """OTB, JIT, VALE and BIR were confirmed against Companies House by the
+    owner on 2026-09-28. AHWE stays unverified until its legal form and
+    registration are known."""
+    verified = {
+        code: ent.statutory_verified for code, ent in shipped_config.entities.items()
+    }
+    assert verified == {
+        "OTB": True,
+        "JIT": True,
+        "VALE": True,
+        "BIR": True,
+        "AHWE": False,
+    }
 
 
 # ---------------------------------------------------------------------------

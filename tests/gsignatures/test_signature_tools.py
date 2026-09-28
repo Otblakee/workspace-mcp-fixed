@@ -491,7 +491,8 @@ class TestPreview:
         assert "Alice Able" in out
         assert "Director" in out
         assert "Mobile: (none)" in out
-        assert "statutory_verified" in out and "WARNING" in out
+        # OTB is verified, so no statutory warning appears in the preview.
+        assert "WARNING" not in out
         assert "<table" in out
         assert pool.patch_calls() == []
         # Read-only: the ledger is not needed for a preview.

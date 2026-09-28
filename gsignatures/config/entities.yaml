@@ -1,11 +1,12 @@
 # Entity configuration for centrally managed Gmail signatures.
 #
-# IMPORTANT: the statutory values below (legal_name, company_number,
-# vat_number, registered_office) were seeded from the OTB branding reference
-# on 2026-09-25 and have NOT been verified against Companies House. Every
-# entity therefore carries statutory_verified: false. Verify each one against
-# https://find-and-update.company-information.service.gov.uk/ before go-live
-# and only then flip the flag.
+# The statutory values below (legal_name, company_number, vat_number,
+# registered_office) were seeded from the OTB branding reference on
+# 2026-09-25 and confirmed by the owner against Companies House on
+# 2026-09-28 for OTB, JIT, VALE and BIR (statutory_verified: true). AHWE
+# stays false: its legal form and registration are not yet known. Re-verify
+# against https://find-and-update.company-information.service.gov.uk/ after
+# any change of registered office or company status.
 #
 # registered_office was seeded from the trading footer address in the
 # branding reference. A company's registered office can differ from its
@@ -64,7 +65,7 @@ entities:
     group_branding: true
     template_version: 1.0.0
     statutory_version: 1.0.0
-    statutory_verified: false
+    statutory_verified: true  # verified by the owner against Companies House on 2026-09-28
 
   JIT:
     legal_name: JIT Logistics Ltd
@@ -80,7 +81,7 @@ entities:
     group_branding: true
     template_version: 1.0.0
     statutory_version: 1.0.0
-    statutory_verified: false
+    statutory_verified: true  # verified by the owner against Companies House on 2026-09-28
 
   VALE:
     legal_name: Vale Automotive Ltd
@@ -96,7 +97,7 @@ entities:
     group_branding: true
     template_version: 1.0.0
     statutory_version: 1.0.0
-    statutory_verified: false
+    statutory_verified: true  # verified by the owner against Companies House on 2026-09-28
 
   BIR:
     legal_name: BIR Developments Ltd
@@ -112,7 +113,7 @@ entities:
     group_branding: true
     template_version: 1.0.0
     statutory_version: 1.0.0
-    statutory_verified: false
+    statutory_verified: true  # verified by the owner against Companies House on 2026-09-28
 
   # Ring-fenced: its own templates, no group branding, and nothing in this
   # block or its templates refers to the group companies.
