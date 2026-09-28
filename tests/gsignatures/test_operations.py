@@ -1815,7 +1815,7 @@ class TestLedgerAndRuntime:
         from gsignatures import sa_auth
 
         monkeypatch.setattr(sa_auth, "build_directory_as_admin", lambda: "DIR")
-        monkeypatch.setattr(sa_auth, "build_sheets_as_service_account", lambda: "SH")
+        monkeypatch.setattr(sa_auth, "build_sheets_for_ledger", lambda: "SH")
         monkeypatch.setenv("SIGNATURE_LEDGER_SHEET_ID", "sheet-x")
         runtime = operations.build_runtime()
         assert runtime.directory == "DIR"
@@ -1828,7 +1828,7 @@ class TestLedgerAndRuntime:
         from gsignatures import sa_auth
 
         monkeypatch.setattr(sa_auth, "build_directory_as_admin", lambda: "DIR")
-        monkeypatch.setattr(sa_auth, "build_sheets_as_service_account", lambda: "SH")
+        monkeypatch.setattr(sa_auth, "build_sheets_for_ledger", lambda: "SH")
         monkeypatch.delenv("SIGNATURE_LEDGER_SHEET_ID", raising=False)
         with pytest.raises(LedgerError):
             operations.build_runtime()

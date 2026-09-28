@@ -1263,8 +1263,10 @@ loads when `TOOLS` names it:
 TOOLS="gmail drive calendar docs sheets contacts gsignatures"
 ```
 
-Delegation is granted for exactly three scopes (`gmail.settings.basic`,
-`admin.directory.user.readonly`, `admin.directory.group.member.readonly`);
+Delegation is granted for exactly four scopes (`gmail.settings.basic`,
+`admin.directory.user.readonly`, `admin.directory.group.member.readonly`,
+`spreadsheets` for the ledger written as the internal `SIGNATURE_LEDGER_WRITER`
+account);
 `gmail.settings.sharing`, which also covers forwarding and mailbox delegation,
 is never granted. The weekly audit is a Render cron running
 `uv run python -m gsignatures.audit_cli --all` (the image installs into

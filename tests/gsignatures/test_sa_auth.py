@@ -155,11 +155,12 @@ class TestLoadServiceAccountInfo:
 
 
 class TestDelegatedScopes:
-    def test_exactly_three_scopes_in_order(self):
+    def test_exactly_four_scopes_in_order(self):
         assert sa_auth.DELEGATED_SCOPES == [
             GMAIL_SETTINGS_BASIC_SCOPE,
             ADMIN_DIRECTORY_USER_READONLY_SCOPE,
             ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE,
+            sa_auth.SHEETS_SCOPE,
         ]
 
     def test_no_sharing_scope_and_no_directory_write_scope(self):
@@ -384,3 +385,59 @@ class TestSourceScan:
                 if pattern.search(path.read_text(encoding="utf-8")):
                     offenders.append(str(path))
         assert offenders == []
+
+
+class TestLedgerWriter:
+    def test_unset_means_service_account_itself(self, monkeypatch):
+        monkeypatch.delenv(sa_auth.ENV_LEDGER_WRITER, raising=False)
+        assert sa_auth.ledger_writer_email() is None
+
+    def test_blank_or_not_an_address_is_a_config_error(self, monkeypatch):
+        for bad in ("", "   ", "automated"):
+            monkeypatch.setenv(sa_auth.ENV_LEDGER_WRITER, bad)
+            with pytest.raises(sa_auth.SignatureAuthError) as excinfo:
+                sa_auth.ledger_writer_email()
+            assert sa_auth.ENV_LEDGER_WRITER in str(excinfo.value)
+
+    def test_writer_is_lower_cased_and_stripped(self, monkeypatch):
+        monkeypatch.setenv(sa_auth.ENV_LEDGER_WRITER, "  Automated@OTBgroup.co.uk ")
+        assert sa_auth.ledger_writer_email() == "automated@otbgroup.co.uk"
+
+    def test_build_sheets_for_ledger_impersonates_writer_when_set(self, monkeypatch):
+        monkeypatch.setenv(sa_auth.ENV_SA_JSON, json.dumps(FAKE_SA_INFO))
+        monkeypatch.setenv(sa_auth.ENV_LEDGER_WRITER, "automated@otbgroup.co.uk")
+        base = MagicMock(name="base-creds")
+        delegated = MagicMock(name="delegated-creds")
+        base.with_subject.return_value = delegated
+        with (
+            patch("google.oauth2.service_account.Credentials") as creds_cls,
+            patch("googleapiclient.discovery.build") as build,
+        ):
+            creds_cls.from_service_account_info.return_value = base
+            sa_auth.build_sheets_for_ledger()
+        creds_cls.from_service_account_info.assert_called_once_with(
+            FAKE_SA_INFO, scopes=[sa_auth.SHEETS_SCOPE]
+        )
+        base.with_subject.assert_called_once_with("automated@otbgroup.co.uk")
+        build.assert_called_once_with(
+            "sheets", "v4", credentials=delegated, cache_discovery=False
+        )
+
+    def test_build_sheets_for_ledger_falls_back_to_service_account(self, monkeypatch):
+        monkeypatch.setenv(sa_auth.ENV_SA_JSON, json.dumps(FAKE_SA_INFO))
+        monkeypatch.delenv(sa_auth.ENV_LEDGER_WRITER, raising=False)
+        base = MagicMock(name="base-creds")
+        with (
+            patch("google.oauth2.service_account.Credentials") as creds_cls,
+            patch("googleapiclient.discovery.build") as build,
+        ):
+            creds_cls.from_service_account_info.return_value = base
+            sa_auth.build_sheets_for_ledger()
+        base.with_subject.assert_not_called()
+        build.assert_called_once_with(
+            "sheets", "v4", credentials=base, cache_discovery=False
+        )
+
+    def test_sheets_scope_is_the_fourth_delegated_scope(self):
+        assert sa_auth.DELEGATED_SCOPES[-1] == sa_auth.SHEETS_SCOPE
+        assert sa_auth.LEDGER_SCOPES == [sa_auth.SHEETS_SCOPE]

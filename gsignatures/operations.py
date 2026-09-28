@@ -228,7 +228,7 @@ def build_runtime(*, need_ledger: bool = True) -> Runtime:
     sheet_id: Optional[str] = None
     try:
         sheet_id = ledger_sheet_id()
-        sheets = sa_auth.build_sheets_as_service_account()
+        sheets = sa_auth.build_sheets_for_ledger()
     except (LedgerError, sa_auth.SignatureAuthError):
         if need_ledger:
             raise
