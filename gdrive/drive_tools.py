@@ -27,7 +27,12 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
 from core.attachment_storage import get_attachment_storage, get_attachment_url
-from core.utils import extract_office_xml_text, handle_http_errors, validate_file_path
+from core.utils import (
+    UserInputError,
+    extract_office_xml_text,
+    handle_http_errors,
+    validate_file_path,
+)
 from core.server import server
 from core.config import get_transport_mode
 from gdrive.drive_helpers import (
@@ -1775,6 +1780,7 @@ async def update_drive_file(
     copy_requires_writer_permission: Optional[bool] = None,
     # Custom properties
     properties: Optional[dict] = None,  # User-visible custom properties
+    allow_cross_drive_move: bool = False,
 ) -> str:
     """
     Updates metadata and properties of a Google Drive file.
@@ -1791,6 +1797,10 @@ async def update_drive_file(
         writers_can_share (Optional[bool]): Whether editors can share the file.
         copy_requires_writer_permission (Optional[bool]): Whether copying requires writer permission.
         properties (Optional[dict]): Custom key-value properties for the file.
+        allow_cross_drive_move (bool): Required as True to move a file between
+            drives (My Drive to a shared drive, shared drive to My Drive, or
+            one shared drive to another). Such a move changes who can see the
+            file and what retention applies to it. Defaults to False (refuse).
 
     Returns:
         str: Confirmation message with details of the updates applied.
@@ -1800,12 +1810,17 @@ async def update_drive_file(
         from active use, call soft_delete_drive_file (moves it to a private
         holding folder, reversible via restore_drive_file). This server never
         trashes or hard-deletes Drive files.
+
+        A move (remove_parents set) records the previous parents on the file
+        as appProperties mcp_prev_parents (comma separated), mcp_moved_at
+        (UTC ISO) and mcp_moved_by, so the move can be traced and reversed
+        by hand.
     """
     logger.info(f"[update_drive_file] Updating file {file_id} for {user_google_email}")
 
     current_file_fields = (
-        "name, description, mimeType, parents, starred, webViewLink, "
-        "writersCanShare, copyRequiresWriterPermission, properties"
+        "name, description, mimeType, parents, driveId, starred, webViewLink, "
+        "writersCanShare, copyRequiresWriterPermission, properties, appProperties"
     )
     resolved_file_id, current_file = await resolve_drive_item(
         service,
@@ -1846,6 +1861,42 @@ async def update_drive_file(
 
     resolved_add_parents = await _resolve_parent_arguments(add_parents)
     resolved_remove_parents = await _resolve_parent_arguments(remove_parents)
+
+    previous_parents = list(current_file.get("parents") or [])
+    source_drive_id = current_file.get("driveId")
+    if resolved_add_parents:
+        # A move between drives changes who can see the file and what
+        # retention applies, so it needs an explicit flag. The destination
+        # drive is read from the first new parent; None means My Drive.
+        first_new_parent = resolved_add_parents.split(",")[0]
+        destination = await asyncio.to_thread(
+            service.files()
+            .get(fileId=first_new_parent, fields="id, driveId", supportsAllDrives=True)
+            .execute
+        )
+        destination_drive_id = (destination or {}).get("driveId")
+        if destination_drive_id != source_drive_id and not allow_cross_drive_move:
+            source_label = source_drive_id or "My Drive"
+            destination_label = destination_drive_id or "My Drive"
+            raise UserInputError(
+                f"Refused: moving '{current_file.get('name')}' ({file_id}) "
+                f"from drive {source_label} to drive {destination_label} "
+                "crosses a drive boundary. A cross-drive move changes who "
+                "can see the file and what retention applies to it, and "
+                "Drive may change its owner. If the move is intended, call "
+                "again with allow_cross_drive_move=True; otherwise pick a "
+                "destination folder in the same drive, or use copy_drive_file "
+                "to place a copy there and leave the original where it is."
+            )
+
+    if resolved_remove_parents:
+        # Record where the file came from, the same way soft_delete_drive_file
+        # does, so a move is traceable and reversible by hand.
+        update_body["appProperties"] = {
+            "mcp_prev_parents": ",".join(previous_parents),
+            "mcp_moved_at": datetime.now(timezone.utc).isoformat(),
+            "mcp_moved_by": user_google_email,
+        }
 
     # Build query parameters for parent changes
     query_params = {

@@ -51,7 +51,6 @@ EXPECTED_BLOCKED = {
     "batch_delete_contacts",
     "delete_contact_group",
     "delete_gmail_draft",
-    "delete_gmail_filter",
     "batch_modify_gmail_message_labels",
     "delete_script_project",
 }
@@ -69,6 +68,14 @@ class TestDenylistContent:
 
         assert is_blocked_tool("transfer_drive_ownership") is True
         assert is_blocked_tool("create_drive_file") is False
+
+    def test_delete_gmail_filter_is_not_blocked(self):
+        """create_gmail_filter validates its action, so the AI may undo its
+        own filter; the delete tool is in the gmail extended tier."""
+        from core.tool_policy import BLOCKED_TOOLS
+
+        assert "delete_gmail_filter" not in BLOCKED_TOOLS
+        assert "delete_gmail_filter" in _all_tier_tool_names()
 
 
 # ---------------------------------------------------------------------------

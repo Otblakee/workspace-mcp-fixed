@@ -1452,3 +1452,213 @@ class TestRegistrationPolicy:
             "transfer_drive_ownership",
         ):
             assert name in BLOCKED_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 item 5: loosening a sharing restriction needs confirm=True
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateSharedDriveLoosenConfirm:
+    def _service(self, restrictions_before, restrictions_after=None):
+        service = FakeDrive()
+        service.drives_get_results = [
+            {"id": "d1", "name": "OTB-Restricted", "restrictions": restrictions_before},
+            {
+                "id": "d1",
+                "name": "OTB-Restricted",
+                "restrictions": restrictions_after
+                if restrictions_after is not None
+                else restrictions_before,
+            },
+        ]
+        return service
+
+    @pytest.mark.parametrize(
+        "kwarg, key",
+        [
+            ("domain_users_only", "domainUsersOnly"),
+            ("drive_members_only", "driveMembersOnly"),
+            ("admin_managed_restrictions", "adminManagedRestrictions"),
+            (
+                "sharing_folders_requires_organizer_permission",
+                "sharingFoldersRequiresOrganizerPermission",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_loosening_without_confirm_refused(self, kwarg, key):
+        service = self._service({key: True})
+
+        with pytest.raises(UserInputError) as excinfo:
+            await update_shared_drive(service, USER, drive_id="d1", **{kwarg: False})
+
+        message = str(excinfo.value)
+        assert "Refused" in message
+        assert key in message
+        assert "from True to False" in message
+        assert "confirm=True" in message
+        assert "drives.update" not in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_loosening_with_confirm_proceeds(self):
+        service = self._service({"driveMembersOnly": True}, {"driveMembersOnly": False})
+
+        result = await update_shared_drive(
+            service, USER, drive_id="d1", drive_members_only=False, confirm=True
+        )
+
+        body = service.kwargs_for("drives.update")[0]["body"]
+        assert body["restrictions"] == {"driveMembersOnly": False}
+        assert "driveMembersOnly: True → False" in result
+
+    @pytest.mark.asyncio
+    async def test_tightening_needs_no_confirm(self):
+        service = self._service({"driveMembersOnly": False}, {"driveMembersOnly": True})
+
+        result = await update_shared_drive(
+            service, USER, drive_id="d1", drive_members_only=True
+        )
+
+        assert "driveMembersOnly: False → True" in result
+        assert "drives.update" in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_setting_false_when_already_false_needs_no_confirm(self):
+        """No loosening happens when the flag was not on to begin with."""
+        service = self._service({"domainUsersOnly": False})
+
+        await update_shared_drive(service, USER, drive_id="d1", domain_users_only=False)
+
+        assert "drives.update" in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_setting_false_when_unset_needs_no_confirm(self):
+        service = self._service({})
+
+        await update_shared_drive(service, USER, drive_id="d1", domain_users_only=False)
+
+        assert "drives.update" in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_rename_needs_no_confirm(self):
+        service = self._service({"driveMembersOnly": True})
+
+        await update_shared_drive(service, USER, drive_id="d1", name="Renamed")
+
+        assert "drives.update" in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_copy_requires_writer_permission_is_not_a_sharing_restriction(self):
+        service = self._service({"copyRequiresWriterPermission": True})
+
+        await update_shared_drive(
+            service, USER, drive_id="d1", copy_requires_writer_permission=False
+        )
+
+        assert "drives.update" in service.call_names()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_reports_the_loosening_without_confirm(self):
+        service = FakeDrive()
+        service.drives_get_result = {
+            "id": "d1",
+            "name": "OTB-Restricted",
+            "restrictions": {"domainUsersOnly": True},
+        }
+
+        result = await update_shared_drive(
+            service, USER, drive_id="d1", domain_users_only=False, dry_run=True
+        )
+
+        assert "DRY RUN" in result
+        assert "loosens domainUsersOnly" in result
+        assert "confirm=True" in result
+        assert "drives.update" not in service.call_names()
+
+    def test_loosened_restrictions_helper(self):
+        loosened = shared_drive_tools.loosened_restrictions(
+            {
+                "domainUsersOnly": True,
+                "driveMembersOnly": True,
+                "adminManagedRestrictions": False,
+                "copyRequiresWriterPermission": True,
+            },
+            {
+                "domainUsersOnly": False,
+                "driveMembersOnly": True,
+                "adminManagedRestrictions": False,
+                "copyRequiresWriterPermission": False,
+            },
+        )
+        assert loosened == ["domainUsersOnly"]
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 item 11: organizer / fileOrganizer never go to an individual
+# ---------------------------------------------------------------------------
+
+
+class TestIndividualOrganizerRefused:
+    @pytest.mark.parametrize("role", ["organizer", "fileOrganizer"])
+    @pytest.mark.asyncio
+    async def test_individual_organizer_refused_before_any_call(self, role):
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+
+        with pytest.raises(UserInputError) as excinfo:
+            await set_drive_permission(
+                service,
+                USER,
+                "d1",
+                principal="someone@otbgroup.co.uk",
+                role=role,
+                allow_individual=True,
+            )
+
+        message = str(excinfo.value)
+        assert "Refused" in message
+        assert f"'{role}'" in message
+        assert "someone@otbgroup.co.uk" in message
+        assert "Google Group" in message
+        assert "'writer', 'commenter' or 'reader'" in message
+        assert service.calls == []
+
+    @pytest.mark.parametrize("role", ["writer", "commenter", "reader"])
+    @pytest.mark.asyncio
+    async def test_individual_lower_roles_still_allowed(self, role):
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_create_result = {"id": "p1", "type": "user", "role": role}
+
+        await set_drive_permission(
+            service,
+            USER,
+            "d1",
+            principal="someone@otbgroup.co.uk",
+            role=role,
+            allow_individual=True,
+        )
+
+        body = service.kwargs_for("permissions.create")[0]["body"]
+        assert body == {
+            "type": "user",
+            "role": role,
+            "emailAddress": "someone@otbgroup.co.uk",
+        }
+
+    @pytest.mark.parametrize("role", ["organizer", "fileOrganizer"])
+    @pytest.mark.asyncio
+    async def test_group_may_still_hold_organizer_roles(self, role):
+        service = FakeDrive()
+        service.drives_get_result = {"id": "d1", "name": "Drive"}
+        service.permissions_create_result = {"id": "p1", "type": "group", "role": role}
+
+        result = await set_drive_permission(
+            service, USER, "d1", principal="otb-managers@otbgroup.co.uk", role=role
+        )
+
+        assert "Granted" in result
+        body = service.kwargs_for("permissions.create")[0]["body"]
+        assert body["type"] == "group"
+        assert body["role"] == role

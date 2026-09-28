@@ -46,8 +46,10 @@ BLOCKED_TOOLS = frozenset(
         "batch_delete_contacts",
         "delete_contact_group",
         # --- Gmail: hard delete (low stakes, but no reason to expose) ------
+        #   delete_gmail_filter is deliberately NOT here: create_gmail_filter
+        #   validates its action (no forward, TRASH or SPAM) and the AI must
+        #   be able to undo a filter it created itself.
         "delete_gmail_draft",
-        "delete_gmail_filter",
         # --- Gmail: bulk trash via labels ---------------------------------
         #   Applying the TRASH label trashes messages; the batch variant does
         #   it at scale. The single-message variant is left enabled (it is the
