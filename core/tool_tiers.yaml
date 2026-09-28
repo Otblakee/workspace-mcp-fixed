@@ -274,6 +274,7 @@ gsignatures:
   core:
     - preview_email_signature
     - get_email_signatures
+    - get_email_signature_html
     - set_email_signature
     - apply_email_signatures
     - audit_email_signatures

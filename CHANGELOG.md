@@ -4,6 +4,15 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## 1.17.2 (2026-09-28)
+
+- New tool `get_email_signature_html(user_email, send_as_email=None)`:
+  returns one send-as address's current signature HTML exactly as Gmail
+  holds it, with its hash, character count and every `<img src>` URL. Works
+  for unmanaged addresses too. Read-only, no ledger row, same
+  `SIGNATURE_ADMIN_EMAILS` gate. Registered at the `gsignatures` core tier;
+  the package now exposes seven tools.
+
 ## 1.17.1 (2026-09-28)
 
 - `get_email_signatures` gains `include_html` (default False). When True each

@@ -1244,6 +1244,7 @@ as the record of every apply.
 |------|-------------|
 | `preview_email_signature` | Renders one user's signature (primary or a named send-as) without writing: entity, versions, Directory fields, HTML |
 | `get_email_signatures` | One block per send-as address: flags, current signature hash, entity or skip reason, expected versions, drift against the ledger |
+| `get_email_signature_html` | One send-as address: raw signature HTML as Gmail holds it, hash, character count, `<img src>` URLs. Read-only |
 | `set_email_signature` | Sets one send-as address (the primary by default). Dry run by default; live needs `dry_run=False` and `confirm=True` |
 | `apply_email_signatures` | Same across exactly one scope (OU, domain or group). Dry run by default; refuses scopes above `max_users`; JSONL report |
 | `audit_email_signatures` | Compares every send-as in a scope with the ledger. Never writes a signature; optional `Audit_<date>` tab |
