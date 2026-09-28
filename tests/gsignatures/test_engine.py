@@ -38,6 +38,7 @@ from gsignatures.engine import (  # noqa: E402
     MAX_SIGNATURE_CHARS,
     SIGNATURE_PLACEHOLDERS,
     STATUTORY_PLACEHOLDERS,
+    ADDRESS_EXCLUDED_REASON,
     Entity,
     LoadedTemplate,
     MissingDirectoryDataError,
@@ -324,6 +325,7 @@ def test_shipped_config_seed_values(shipped_config):
         "arthistorywithemily.co.uk": "AHWE",
     }
     assert cfg.skip_alias_domains == ["blakefamily.uk"]
+    assert cfg.skip_addresses == ["accounts@otbgroup.co.uk"]
     assert cfg.exclude_ou_prefixes == [
         "/99 _SYSTEM/BREAKGLASS",
         "/99 _SYSTEM/_Suspended",
@@ -400,6 +402,28 @@ def test_domain_in_skip_list_and_entity_fails(tmp_path):
     cfg = _minimal_config(rules={"skip_alias_domains": ["OTB.example.test"]})
     with pytest.raises(SignatureConfigError, match="skip_alias_domains"):
         _load_tmp(tmp_path, cfg)
+
+
+def test_skip_addresses_default_is_empty(tmp_path):
+    loaded = _load_tmp(tmp_path, _minimal_config())
+    assert loaded.skip_addresses == []
+
+
+def test_skip_addresses_are_lower_cased_and_stripped(tmp_path):
+    loaded = _load_tmp(
+        tmp_path,
+        _minimal_config(rules={"skip_addresses": [" Accounts@OTB.example.test "]}),
+    )
+    assert loaded.skip_addresses == ["accounts@otb.example.test"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["accounts@otb.example.test", ["not-an-address"], ["@x"], ["x@"], [""], [7]],
+)
+def test_skip_addresses_must_be_a_list_of_email_addresses(tmp_path, bad):
+    with pytest.raises(SignatureConfigError, match="skip_addresses"):
+        _load_tmp(tmp_path, _minimal_config(rules={"skip_addresses": bad}))
 
 
 def test_legal_name_without_limited_or_ltd_fails(tmp_path):
@@ -988,6 +1012,48 @@ def test_plan_for_user_oli(shipped_config):
     assert "oliver.blake@jit-logistics.com" in rows[1].html
     assert "03281238" in rows[1].html
     assert "15732792" in rows[0].html
+
+
+def test_plan_for_user_skip_addresses_excludes_an_alias(tmp_path):
+    """A send-as address listed in rules.skip_addresses is skipped with the
+    config reason, whatever the domain rules would have said; the other
+    addresses of the same user are unaffected."""
+    config = _minimal_config(rules={"skip_addresses": ["Accounts@OTB.example.test"]})
+    loaded = _load_tmp(tmp_path, config)
+    user = _user("ada@otb.example.test", "/OTB")
+    send_as = [
+        _send_as("ada@otb.example.test", primary=True),
+        _send_as("accounts@otb.example.test"),
+    ]
+    rows = plan_for_user(loaded, user, send_as)
+    assert [r.status for r in rows] == ["planned", "skipped"]
+    assert rows[1].reason == ADDRESS_EXCLUDED_REASON
+    assert rows[1].reason == "address excluded by config"
+    assert rows[1].entity is None
+    assert rows[1].html is None and rows[1].rendered_hash is None
+
+
+def test_plan_for_user_skip_addresses_excludes_a_primary(tmp_path):
+    """The exclusion applies to a primary address too, ahead of the rule
+    that would otherwise have managed it."""
+    config = _minimal_config(rules={"skip_addresses": ["ada@otb.example.test"]})
+    loaded = _load_tmp(tmp_path, config)
+    user = _user("ada@otb.example.test", "/OTB")
+    rows = plan_for_user(loaded, user, [_send_as("ada@otb.example.test", primary=True)])
+    assert rows[0].status == "skipped"
+    assert rows[0].reason == ADDRESS_EXCLUDED_REASON
+
+
+def test_shipped_config_skips_the_shared_finance_address(shipped_config):
+    user = _user("ada@otbgroup.co.uk", "/01 OTB")
+    send_as = [
+        _send_as("ada@otbgroup.co.uk", primary=True),
+        _send_as("accounts@otbgroup.co.uk"),
+    ]
+    rows = plan_for_user(shipped_config, user, send_as)
+    assert rows[0].status == "planned"
+    assert rows[1].status == "skipped"
+    assert rows[1].reason == ADDRESS_EXCLUDED_REASON
 
 
 def test_plan_for_user_primary_first_even_if_listed_last(shipped_config):

@@ -95,6 +95,24 @@ SENSITIVE = {
     # Resumable upload session URIs are short-lived bearer-equivalent
     # tokens — anyone with one can PUT bytes to the in-flight upload.
     "upload_uri",
+    # Personal data that used to reach the audit Sheet in the clear
+    # (adversarial review, tier 3 item 9): document find/replace text,
+    # calendar attendees, locations, titles and descriptions, contact
+    # names and phone numbers, the display name a message goes out under,
+    # and the criteria dict of a Gmail filter (from/to/subject/query).
+    "find_text",
+    "replace_text",
+    "attendees",
+    "location",
+    "summary",
+    "description",
+    "phone",
+    "phones",
+    "given_name",
+    "family_name",
+    "display_name",
+    "from_name",
+    "criteria",
 }
 
 

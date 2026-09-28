@@ -31,6 +31,11 @@ rules:
   # Personal-domain aliases are never given a company signature.
   skip_alias_domains:
     - blakefamily.uk
+  # Exact send-as addresses that are never managed, whatever the rules say.
+  skip_addresses:
+    # The shared finance address stays unsigned until a finance template
+    # exists.
+    - accounts@otbgroup.co.uk
   primary:
     # The AHWE domain rule sits ahead of every OU rule on purpose.
     - match: {primary_domain: arthistorywithemily.co.uk}

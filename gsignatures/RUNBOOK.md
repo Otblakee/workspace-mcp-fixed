@@ -84,19 +84,19 @@ re-check the client ID and scope list once it has failed for more than a day.
      possible where external sharing is allowed.
 3. Note the Sheet ID from the URL for step 4.
 
-The ledger is append-only by convention. Every live apply adds two rows per
-send-as address, in this order: a `pending` row written before the Gmail
-patch (`readback_hash` is the word `pending`; the previous signature HTML
-and its hash are already filled in, so the rollback record exists before
-anything changes in Gmail), then a completed row written after the patch
-with the hash Gmail returned, same `run_id`. Every read prefers the
-completed row of a run over its pending row. A pending row with no
-completed row means the apply was interrupted (or its patch failed) after
-the ledger write; the audit reports that address as `apply_interrupted`
-until it is re-applied or restored, and `restore_email_signature` can
-restore from the pending row. Audits compare Gmail against these rows. Do
-not edit or delete rows; if something is wrong, apply again (the new row
-wins).
+The ledger is append-only by convention. Every live apply, and every live
+restore, adds two rows per send-as address, in this order: a `pending` row
+written before the Gmail patch (`readback_hash` is the word `pending`; the
+previous signature HTML and its hash are already filled in, so the rollback
+record exists before anything changes in Gmail), then a completed row
+written after the patch with the hash Gmail returned, same `run_id`. Every
+read prefers the completed row of a run over its pending row. A pending row
+with no completed row means the apply (or restore) was interrupted, or its
+patch failed, after the ledger write; the audit reports that address as
+`apply_interrupted` until it is re-applied or restored, and
+`restore_email_signature` can restore from the pending row. Audits compare
+Gmail against these rows. Do not edit or delete rows; if something is
+wrong, apply again (the new row wins).
 
 ## 4. Render environment group `signatures`
 
@@ -207,8 +207,14 @@ domain rule via `domain="arthistorywithemily.co.uk"`):
 
 1. `apply_email_signatures(ou_path="/02 JIT")`: dry run. Read every row.
    `error` rows usually mean a missing job title in the Directory; fix the
-   Directory and re-run the dry run until the table is clean.
-2. `apply_email_signatures(ou_path="/02 JIT", dry_run=False, confirm=True)`.
+   Directory and re-run the dry run until the table is clean. Note the
+   `users N` count in the header line.
+2. `apply_email_signatures(ou_path="/02 JIT", dry_run=False, confirm=True,
+   expected_users=N)` with the `N` the dry run printed. A live run over more
+   than one user is refused without it, or with a different number, before
+   anything is written; the refusal prints the current count. This is the
+   second lock: `confirm=True` says "I mean it", `expected_users` says "and
+   I read the dry run". A single-user scope needs no count.
 3. Keep the result table and the JSONL report link with the change record
    for that OU. The ledger holds the rows; the table is the human-readable
    evidence of the run.
@@ -264,13 +270,28 @@ Fastest to slowest:
    table you kept and in the ledger). A `pending` row left by an
    interrupted apply is a valid source: its rollback record was written
    before the patch. Dry run by default; repeat with
-   `dry_run=False, confirm=True` to restore. The restore is itself a ledger
-   row (versions `restored`, the replaced signature in
-   `previous_signature_html`), so it can be reversed the same way. An empty
+   `dry_run=False, confirm=True` to restore. The restore is recorded like an
+   apply: a `pending` ledger row first (the replaced signature already in
+   `previous_signature_html`), then the patch, then the completed row, both
+   versions `restored`, so it can be reversed the same way. An empty
    previous signature clears the address. Until the template is fixed and
    re-applied, the audit reports that address as `stale_template`, which is
    correct: the managed signature is not in place.
-4. **Revert content for many addresses:** revert the template files and the
+4. **Undo one apply run across a scope:**
+   `restore_email_signature(ou_path="/02 JIT", run_id="<the apply's run_id>")`
+   restores every (user, send-as) in the scope that has a ledger row for
+   that run_id; `domain` or `group_email` work the same way, exactly one
+   scope, and `run_id` is required in this mode (there is no "latest row"
+   to fall back on). Rows of that run for users outside the scope are
+   counted in the output and left alone. Dry run by default; the header
+   prints `users N (with ledger rows for run_id ...)`. Repeat with
+   `dry_run=False, confirm=True, expected_users=N` to restore; the same
+   rule as a live apply, refused without the matching count when more than
+   one user is affected. Each address gets the same pending and completed
+   ledger rows as a single restore, and the run writes a JSONL report.
+   Nothing is deleted from the ledger; a restore of a restore is possible
+   because the replaced signature is on record.
+5. **Revert content for many addresses:** revert the template files and the
    pinned versions in `config/entities.yaml` in git, redeploy, and run
    `apply_email_signatures` again (dry run, then live). The ledger rows carry
    the old versions, so every address re-applies without `force`; the ledger

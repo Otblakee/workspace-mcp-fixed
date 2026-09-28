@@ -24,10 +24,17 @@ Rules carried by this module (owner decisions, see CLAUDE.md):
   render, because Gmail sanitises what it stores. A dry run whose ledger
   could not be read says so in every ``would_apply`` reason rather than
   claiming the address was never applied.
-* A restore (``restore_user``) puts back the ``previous_signature_html`` a
-  ledger row recorded, under the same dry-run and confirm rule, and records
-  a new ledger row with both versions set to ``restored`` so the next apply
-  and audit see the managed signature is not in place.
+* A restore (``restore_user`` for one address, ``restore_scope`` for every
+  address a run touched inside one scope) puts back the
+  ``previous_signature_html`` a ledger row recorded, under the same dry-run
+  and confirm rule, and records it the same way as an apply: a pending
+  ledger row first, then the Gmail patch, then the completed row, both
+  versions set to ``restored`` so the next apply and audit see the managed
+  signature is not in place.
+* A live run over more than one user (``apply_scope``, ``restore_scope``)
+  also needs ``expected_users`` equal to the user count the preceding dry
+  run printed; a mismatch is refused before any write, with the current
+  count. A single-user run (and the single-address tools) needs no count.
 * Isolation: one failing send-as address becomes an ``error`` row and the
   rest of the user continues; one failing user becomes an ``error`` row
   and the rest of the scope continues.
@@ -105,6 +112,23 @@ DEFAULT_MAX_USERS = 200
 # managed signature is not in place.
 RESTORED_VERSION = "restored"
 
+# A live scope run over more than one user must name the user count the
+# preceding dry run printed. Tested verbatim (after formatting).
+EXPECTED_USERS_MESSAGE = (
+    "Live scope run refused: scope {label} currently covers {count} users, and "
+    "a live run over more than one user needs expected_users={count}, the user "
+    "count the preceding dry run printed (got {given}). Nothing was changed. "
+    "Repeat the dry run if the count has moved, then pass expected_users={count}."
+)
+
+# A scope restore has no "latest row" to fall back on: the run_id is what
+# says which rows are undone. Tested verbatim.
+SCOPE_RESTORE_RUN_ID_MESSAGE = (
+    "A scope restore needs run_id: the run whose ledger rows are to be put "
+    "back for every user in the scope. Nothing was changed. Find the run_id "
+    "in the result table of the apply you are undoing, or in the Ledger tab."
+)
+
 # Reason prefix on every address left unpatched after a ledger append
 # failed earlier in the same run. Tested verbatim.
 LEDGER_FAILED_REASON = "not attempted: ledger append failed earlier in this run"
@@ -165,6 +189,29 @@ def _http_status(exc: BaseException) -> Optional[int]:
         return int(status) if status is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _format_expected(value: Optional[int]) -> str:
+    return "none" if value is None else repr(value)
+
+
+def require_expected_users(
+    label: str, count: int, *, dry_run: bool, expected_users: Optional[int]
+) -> None:
+    """Refuse a live run over more than one user without the matching count.
+
+    ``expected_users`` must equal ``count`` (the number of users the run
+    covers, which is what the dry run printed). A dry run, and a live run
+    over one user, need no count. Raises before any write.
+    """
+    if dry_run or count <= 1:
+        return
+    if isinstance(expected_users, bool) or expected_users != count:
+        raise UserInputError(
+            EXPECTED_USERS_MESSAGE.format(
+                label=label, count=count, given=_format_expected(expected_users)
+            )
+        )
 
 
 def scope_label(
@@ -433,6 +480,13 @@ def _row(
         before_hash=before_hash,
         after_hash=after_hash,
     )
+
+
+def _count_actions(rows: List[ResultRow]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        counts[row.action] = counts.get(row.action, 0) + 1
+    return counts
 
 
 def _user_error_row(user_email: str, exc: BaseException) -> ResultRow:
@@ -819,6 +873,145 @@ def _restore_row(
     )
 
 
+async def _read_ledger_for_restore(
+    sheets, sheet_id: Optional[str], *, dry_run: bool
+) -> Tuple[str, List[Dict[str, str]]]:
+    """Prepare the ledger (write probe on a live run) and read every row.
+
+    A dry run still needs a readable ledger: the row is what is restored.
+    """
+    sheet_id = _require_ledger_client(sheets, sheet_id)
+    try:
+        await _prepare_ledger_tab(sheets, sheet_id, probe_write=not dry_run)
+        return sheet_id, await read_ledger_rows(sheets, sheet_id)
+    except LedgerError:
+        raise
+    except Exception as exc:
+        raise LedgerError(
+            "The signature ledger could not be prepared or read "
+            f"({_error_text(exc)}). No signature was written."
+        ) from exc
+
+
+async def _restore_address(
+    *,
+    gmail,
+    entry: Dict[str, Any],
+    ledger_row: Dict[str, str],
+    user_email: str,
+    actor: str,
+    run_id: str,
+    dry_run: bool,
+    sheets,
+    sheet_id: str,
+    state: _RunState,
+) -> ResultRow:
+    """Restore one send-as address from one ledger row. The live order is
+    the same as an apply: pending ledger row, Gmail patch, completed ledger
+    row (``LIVE_APPLY_ORDER``), so a process killed after the patch still
+    leaves the replaced signature on record and ``ledger.outranks`` makes
+    the completed row win on every read."""
+    address = str(entry.get("sendAsEmail") or "")
+    previous_html = ledger_row.get("previous_signature_html") or ""
+    target_hash = signature_hash(previous_html)
+    current_html = str(entry.get("signature") or "")
+    current_hash = signature_hash(current_html)
+    source = (
+        f"ledger row run_id {ledger_row.get('run_id') or '?'} applied "
+        f"{ledger_row.get('applied_at') or '?'}"
+    )
+    if not previous_html.strip():
+        source += " (previous signature was empty: this clears the signature)"
+
+    def row(action: str, reason: str, after_hash: Optional[str]) -> ResultRow:
+        return _restore_row(
+            user_email, address, ledger_row, action, reason, current_hash, after_hash
+        )
+
+    if current_hash == target_hash:
+        return row(
+            "unchanged",
+            f"Gmail already holds the previous signature from {source}",
+            current_hash,
+        )
+    if dry_run:
+        return row(
+            "would_apply", f"restore previous signature from {source}", target_hash
+        )
+    if state.ledger_failed:
+        return row("error", f"{LEDGER_FAILED_REASON} ({state.ledger_failed})", None)
+
+    # Pending row first: the rollback record (the signature being replaced)
+    # is on the sheet before Gmail changes.
+    ledger_entry = {
+        "applied_at": utc_now_iso(),
+        "actor": actor,
+        "user_email": user_email,
+        "send_as_email": address,
+        "entity": ledger_row.get("entity") or "",
+        "template_version": RESTORED_VERSION,
+        "statutory_version": RESTORED_VERSION,
+        "rendered_hash": target_hash,
+        "readback_hash": PENDING_READBACK,
+        "previous_hash": current_hash,
+        "previous_signature_html": current_html,
+        "run_id": run_id,
+    }
+    try:
+        await append_ledger_rows(sheets, sheet_id, [ledger_entry])
+    except Exception as exc:
+        logger.error(
+            "pending ledger row for restore of %s / %s could not be written; "
+            "signature not restored: %s",
+            user_email,
+            address,
+            _error_text(exc),
+        )
+        state.ledger_failed = _error_text(exc)
+        return row(
+            "error", f"{LEDGER_PENDING_FAILED_REASON} ({_error_text(exc)})", None
+        )
+
+    try:
+        readback = await clients.patch_signature(gmail, address, previous_html)
+    except Exception as exc:
+        logger.warning(
+            "signature restore failed for %s / %s: %s",
+            user_email,
+            address,
+            _error_text(exc),
+        )
+        return row(
+            "error",
+            f"{_error_text(exc)}; a pending ledger row for run {run_id} remains "
+            "and the audit reports apply_interrupted until the address is "
+            "re-applied or restored",
+            None,
+        )
+    readback_hash = signature_hash(readback.get("signature"))
+
+    ledger_entry = dict(
+        ledger_entry, applied_at=utc_now_iso(), readback_hash=readback_hash
+    )
+    try:
+        await append_ledger_rows(sheets, sheet_id, [ledger_entry])
+    except Exception as exc:
+        logger.error(
+            "signature restored for %s / %s but the ledger append failed: %s",
+            user_email,
+            address,
+            _error_text(exc),
+        )
+        state.ledger_failed = _error_text(exc)
+        return row(
+            "error",
+            f"signature restored {LEDGER_APPEND_FAILED_REASON} "
+            f"({_error_text(exc)}); record this row by hand",
+            readback_hash,
+        )
+    return row("applied", f"restored previous signature from {source}", readback_hash)
+
+
 async def restore_user(
     user_email: str,
     send_as_email: Optional[str] = None,
@@ -845,134 +1038,242 @@ async def restore_user(
     the ledger is prepared before Gmail is touched. A dry run still needs a
     readable ledger, because the row is what is being restored.
 
-    A live restore records a new ledger row with ``rendered_hash`` of what
-    was restored, ``readback_hash`` of what Gmail kept, both versions
-    ``restored``, and the signature it replaced in ``previous_signature_html``
-    so a restore is itself reversible. Exactly one ``ResultRow`` is returned.
+    A live restore is recorded like an apply: a pending ledger row (the
+    signature being replaced already in ``previous_signature_html``), then
+    the patch, then a completed row with ``rendered_hash`` of what was
+    restored and ``readback_hash`` of what Gmail kept, both versions
+    ``restored``, so a restore is itself reversible. Exactly one ``ResultRow``
+    is returned.
     """
     gate_live(dry_run, confirm)
     user_email = user_email.strip()
-    sheet_id = _require_ledger_client(sheets, sheet_id)
-    try:
-        await _prepare_ledger_tab(sheets, sheet_id, probe_write=not dry_run)
-        records = await read_ledger_rows(sheets, sheet_id)
-    except LedgerError:
-        raise
-    except Exception as exc:
-        raise LedgerError(
-            "The signature ledger could not be prepared or read "
-            f"({_error_text(exc)}). No signature was written."
-        ) from exc
+    sheet_id, records = await _read_ledger_for_restore(
+        sheets, sheet_id, dry_run=dry_run
+    )
 
     gmail = gmail_factory(user_email)
     send_as_list = await clients.list_send_as(gmail)
     entry = _pick_send_as(send_as_list, user_email, send_as_email)
     address = str(entry.get("sendAsEmail") or "")
     ledger_row = _pick_ledger_row(records, user_email, address, from_run_id)
-
-    previous_html = ledger_row.get("previous_signature_html") or ""
-    target_hash = signature_hash(previous_html)
-    current_html = str(entry.get("signature") or "")
-    current_hash = signature_hash(current_html)
-    source = (
-        f"ledger row run_id {ledger_row.get('run_id') or '?'} applied "
-        f"{ledger_row.get('applied_at') or '?'}"
-    )
-    if not previous_html.strip():
-        source += " (previous signature was empty: this clears the signature)"
-
-    if current_hash == target_hash:
-        return [
-            _restore_row(
-                user_email,
-                address,
-                ledger_row,
-                "unchanged",
-                f"Gmail already holds the previous signature from {source}",
-                current_hash,
-                current_hash,
-            )
-        ]
-    if dry_run:
-        return [
-            _restore_row(
-                user_email,
-                address,
-                ledger_row,
-                "would_apply",
-                f"restore previous signature from {source}",
-                current_hash,
-                target_hash,
-            )
-        ]
-
-    try:
-        readback = await clients.patch_signature(gmail, address, previous_html)
-    except Exception as exc:
-        logger.warning(
-            "signature restore failed for %s / %s: %s",
-            user_email,
-            address,
-            _error_text(exc),
-        )
-        return [
-            _restore_row(
-                user_email,
-                address,
-                ledger_row,
-                "error",
-                _error_text(exc),
-                current_hash,
-                None,
-            )
-        ]
-    readback_hash = signature_hash(readback.get("signature"))
-    ledger_entry = {
-        "applied_at": utc_now_iso(),
-        "actor": actor,
-        "user_email": user_email,
-        "send_as_email": address,
-        "entity": ledger_row.get("entity") or "",
-        "template_version": RESTORED_VERSION,
-        "statutory_version": RESTORED_VERSION,
-        "rendered_hash": target_hash,
-        "readback_hash": readback_hash,
-        "previous_hash": current_hash,
-        "previous_signature_html": current_html,
-        "run_id": run_id,
-    }
-    try:
-        await append_ledger_rows(sheets, sheet_id, [ledger_entry])
-    except Exception as exc:
-        logger.error(
-            "signature restored for %s / %s but the ledger append failed: %s",
-            user_email,
-            address,
-            _error_text(exc),
-        )
-        return [
-            _restore_row(
-                user_email,
-                address,
-                ledger_row,
-                "error",
-                f"signature restored {LEDGER_APPEND_FAILED_REASON} "
-                f"({_error_text(exc)}); record this row by hand",
-                current_hash,
-                readback_hash,
-            )
-        ]
     return [
-        _restore_row(
-            user_email,
-            address,
-            ledger_row,
-            "applied",
-            f"restored previous signature from {source}",
-            current_hash,
-            readback_hash,
+        await _restore_address(
+            gmail=gmail,
+            entry=entry,
+            ledger_row=ledger_row,
+            user_email=user_email,
+            actor=actor,
+            run_id=run_id,
+            dry_run=dry_run,
+            sheets=sheets,
+            sheet_id=sheet_id,
+            state=_RunState(),
         )
     ]
+
+
+def _rows_for_run(
+    records: List[Dict[str, str]], from_run_id: str
+) -> Dict[Tuple[str, str], Dict[str, str]]:
+    """The best ledger row per (user, send-as) that carries ``from_run_id``.
+
+    The completed row of the run beats its pending row (``ledger.outranks``);
+    a pending row with no completed row is a valid source.
+    """
+    chosen: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for record in records:
+        if (record.get("run_id") or "").strip() != from_run_id:
+            continue
+        key = ledger_key(record)
+        current = chosen.get(key)
+        if current is None or outranks(record, current):
+            chosen[key] = record
+    return chosen
+
+
+def _restore_missing_address_row(
+    user_email: str, ledger_row: Dict[str, str], reason: str
+) -> ResultRow:
+    return _restore_row(
+        user_email,
+        str(ledger_row.get("send_as_email") or ""),
+        ledger_row,
+        "error",
+        reason,
+        None,
+        None,
+    )
+
+
+async def restore_scope(
+    directory,
+    *,
+    ou_path: Optional[str] = None,
+    domain: Optional[str] = None,
+    group_email: Optional[str] = None,
+    from_run_id: Optional[str],
+    actor: str,
+    run_id: str,
+    dry_run: bool = True,
+    confirm: bool = False,
+    expected_users: Optional[int] = None,
+    max_users: int = DEFAULT_MAX_USERS,
+    sheets=None,
+    sheet_id: Optional[str] = None,
+    gmail_factory: GmailFactory = sa_auth.build_gmail_for_user,
+) -> Tuple[List[ResultRow], Dict[str, Any]]:
+    """Undo one run: restore every (user, send-as) in a scope that has a
+    ledger row for ``from_run_id``.
+
+    Checks, in order: exactly one scope; the live gate; ``from_run_id`` is
+    required (refused with ``SCOPE_RESTORE_RUN_ID_MESSAGE``); the ledger
+    (write probe on a live run, then every row is read); the scope's users
+    against ``max_users``; then the rows of that run inside the scope. No row
+    at all is refused. A live restore over more than one affected user needs
+    ``expected_users`` equal to that count (``require_expected_users``),
+    checked before any write. Rows of the run for users outside the scope
+    are counted in ``report_meta["rows_outside_scope"]`` and left alone.
+
+    Each address then follows ``_restore_address`` (pending row, patch,
+    completed row) with one ``_RunState`` for the run, so a failed ledger
+    append stops every later patch. A user whose Gmail cannot be read
+    becomes one ``error`` row per ledger row; an address the mailbox no
+    longer has becomes an ``error`` row. Every row is written as JSONL into
+    the attachment store and ``report_meta`` carries the access line.
+    """
+    label = scope_label(ou_path=ou_path, domain=domain, group_email=group_email)
+    gate_live(dry_run, confirm)
+    if not (from_run_id or "").strip():
+        raise UserInputError(SCOPE_RESTORE_RUN_ID_MESSAGE)
+    from_run_id = str(from_run_id).strip()
+    if not isinstance(max_users, int) or max_users < 1:
+        raise UserInputError(
+            f"max_users must be a positive integer, got {max_users!r}."
+        )
+
+    sheet_id, records = await _read_ledger_for_restore(
+        sheets, sheet_id, dry_run=dry_run
+    )
+    resolved = await _resolve_scope_users(
+        directory,
+        ou_path=ou_path,
+        domain=domain,
+        group_email=group_email,
+        all_users=False,
+    )
+    if len(resolved) > max_users:
+        raise UserInputError(
+            f"Scope {label} matches {len(resolved)} users, more than "
+            f"max_users={max_users}. Narrow the scope or raise max_users on "
+            "purpose. Nothing was changed."
+        )
+
+    run_rows = _rows_for_run(records, from_run_id)
+    in_scope = {email.lower() for email, _, _ in resolved if email}
+    by_user: Dict[str, List[Dict[str, str]]] = {}
+    outside = 0
+    for (user_key, _), record in run_rows.items():
+        if user_key in in_scope:
+            by_user.setdefault(user_key, []).append(record)
+        else:
+            outside += 1
+    if not by_user:
+        raise UserInputError(
+            f"The ledger has no row with run_id {from_run_id} for any user in "
+            f"scope {label}"
+            + (
+                f" ({outside} row(s) with that run_id belong to users outside "
+                "the scope)"
+                if outside
+                else ""
+            )
+            + ". Nothing was changed."
+        )
+    user_count = len(by_user)
+    require_expected_users(
+        label, user_count, dry_run=dry_run, expected_users=expected_users
+    )
+
+    state = _RunState()
+    rows: List[ResultRow] = []
+    scope_errors = {email.lower(): err for email, _, err in resolved if err}
+    for email, _, _ in resolved:
+        user_key = email.lower()
+        ledger_rows = by_user.get(user_key)
+        if not ledger_rows:
+            continue
+        ledger_rows.sort(key=lambda r: (r.get("send_as_email") or "").lower())
+        display_email = str(ledger_rows[0].get("user_email") or email)
+        error = scope_errors.get(user_key)
+        if error is None:
+            try:
+                gmail = gmail_factory(display_email)
+                send_as_list = await clients.list_send_as(gmail)
+            except _SETUP_ERRORS:  # the key or config, never one user's fault
+                raise
+            except Exception as exc:  # one user must not stop the scope
+                logger.warning(
+                    "signature restore failed for %s: %s",
+                    display_email,
+                    _error_text(exc),
+                )
+                error = exc
+        if error is not None:
+            rows.extend(
+                _restore_missing_address_row(display_email, r, _error_text(error))
+                for r in ledger_rows
+            )
+            continue
+        entries = {str(e.get("sendAsEmail") or "").lower(): e for e in send_as_list}
+        for ledger_row in ledger_rows:
+            address = str(ledger_row.get("send_as_email") or "")
+            entry = entries.get(address.lower())
+            if entry is None:
+                rows.append(
+                    _restore_missing_address_row(
+                        display_email,
+                        ledger_row,
+                        f"{display_email} no longer has send-as address {address}; "
+                        "nothing to restore onto",
+                    )
+                )
+                continue
+            rows.append(
+                await _restore_address(
+                    gmail=gmail,
+                    entry=entry,
+                    ledger_row=ledger_row,
+                    user_email=display_email,
+                    actor=actor,
+                    run_id=run_id,
+                    dry_run=dry_run,
+                    sheets=sheets,
+                    sheet_id=sheet_id,
+                    state=state,
+                )
+            )
+
+    filename = f"signatures-restore-{'dryrun' if dry_run else 'live'}-{run_id}.jsonl"
+    attachment_id, path, access_line = write_jsonl_report(
+        result_rows_as_dicts(rows), filename=filename
+    )
+    report_meta = {
+        "scope": label,
+        "run_id": run_id,
+        "from_run_id": from_run_id,
+        "dry_run": dry_run,
+        "actor": actor,
+        "user_count": user_count,
+        "scope_user_count": len(resolved),
+        "rows_outside_scope": outside,
+        "ledger_failed": state.ledger_failed,
+        "counts": _count_actions(rows),
+        "report_filename": filename,
+        "report_attachment_id": attachment_id,
+        "report_path": path,
+        "access_line": access_line,
+    }
+    return rows, report_meta
 
 
 # ---------------------------------------------------------------------------
@@ -1022,13 +1323,6 @@ async def _resolve_scope_users(
     return [(str(u.get("primaryEmail") or ""), u, None) for u in users]
 
 
-def _count_actions(rows: List[ResultRow]) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
-    for row in rows:
-        counts[row.action] = counts.get(row.action, 0) + 1
-    return counts
-
-
 async def apply_scope(
     config: SignatureConfig,
     directory,
@@ -1043,6 +1337,7 @@ async def apply_scope(
     force: bool = False,
     include_aliases: bool = True,
     max_users: int = DEFAULT_MAX_USERS,
+    expected_users: Optional[int] = None,
     sheets=None,
     sheet_id: Optional[str] = None,
     gmail_factory: GmailFactory = sa_auth.build_gmail_for_user,
@@ -1051,10 +1346,13 @@ async def apply_scope(
 
     Checks, in order: exactly one scope; the live gate; the ledger (live
     runs only, before any write); the user count against ``max_users``
-    (refused with the count, never truncated). Then each user is handled
-    on its own: a user that cannot be planned at all becomes one ``error``
-    row with send-as ``*``. Every row is written as JSONL into the
-    attachment store and ``report_meta`` carries the access line.
+    (refused with the count, never truncated); then, on a live run over
+    more than one user, ``expected_users`` must equal that count
+    (``require_expected_users``), before any signature is written. Then
+    each user is handled on its own: a user that cannot be planned at all
+    becomes one ``error`` row with send-as ``*``. Every row is written as
+    JSONL into the attachment store and ``report_meta`` carries the access
+    line.
     """
     label = scope_label(ou_path=ou_path, domain=domain, group_email=group_email)
     gate_live(dry_run, confirm)
@@ -1078,6 +1376,9 @@ async def apply_scope(
             f"max_users={max_users}. Narrow the scope or raise max_users on "
             "purpose. Nothing was changed."
         )
+    require_expected_users(
+        label, len(resolved), dry_run=dry_run, expected_users=expected_users
+    )
 
     rows: List[ResultRow] = []
     for email, user, error in resolved:
@@ -1315,6 +1616,8 @@ __all__ = [
     "LIVE_APPLY_ORDER",
     "DEFAULT_MAX_USERS",
     "DRIFT_STATUSES",
+    "EXPECTED_USERS_MESSAGE",
+    "SCOPE_RESTORE_RUN_ID_MESSAGE",
     "LEDGER_APPEND_FAILED_REASON",
     "LEDGER_FAILED_REASON",
     "LEDGER_NOT_CONFIGURED_NOTE",
@@ -1336,6 +1639,8 @@ __all__ = [
     "plan_user",
     "prepare_ledger",
     "read_ledger_best_effort",
+    "require_expected_users",
+    "restore_scope",
     "restore_user",
     "scope_label",
     "utc_now_iso",

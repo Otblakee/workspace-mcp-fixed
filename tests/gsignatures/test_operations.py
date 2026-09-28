@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from core.utils import UserInputError  # noqa: E402
 from gsignatures import operations  # noqa: E402
 from gsignatures.engine import load_config, signature_hash  # noqa: E402
+from gsignatures.engine import PENDING_READBACK  # noqa: E402
 from gsignatures.ledger import AUDIT_HEADER, LEDGER_HEADER, LedgerError  # noqa: E402
 from tests.gsignatures.fakes import (  # noqa: E402
     FakeDirectory,
@@ -1319,6 +1320,81 @@ class TestApplyScope:
         assert meta["user_count"] == 2
 
     @pytest.mark.asyncio
+    async def test_live_over_two_users_needs_expected_users(
+        self, config, directory, pool
+    ):
+        """OU /01 OTB covers two users: a live run without the count, or with
+        the wrong count, is refused before any write, naming the current
+        count. The right count proceeds."""
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        for given in (None, 1, 3, True):
+            with pytest.raises(UserInputError) as excinfo:
+                await _apply_scope(
+                    config,
+                    directory,
+                    pool,
+                    ou_path="/01 OTB",
+                    dry_run=False,
+                    confirm=True,
+                    expected_users=given,
+                    sheets=sheets,
+                    sheet_id=SHEET_ID,
+                )
+            assert str(excinfo.value) == operations.EXPECTED_USERS_MESSAGE.format(
+                label="OU /01 OTB",
+                count=2,
+                given="none" if given is None else repr(given),
+            )
+            assert "expected_users=2" in str(excinfo.value)
+        assert pool.patch_calls() == []
+        assert pool.factory_calls == []
+        assert "values.append" not in sheets.names()
+        assert sheets.ledger_rows() == []
+
+        rows, meta = await _apply_scope(
+            config,
+            directory,
+            pool,
+            ou_path="/01 OTB",
+            dry_run=False,
+            confirm=True,
+            expected_users=2,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+        )
+        assert meta["user_count"] == 2
+        assert pool.patch_calls() != []
+        assert len(sheets.completed_ledger_rows()) == len(
+            [r for r in rows if r.action == "applied"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_dry_run_ignores_expected_users(self, config, directory, pool):
+        rows, meta = await _apply_scope(
+            config, directory, pool, ou_path="/01 OTB", expected_users=99
+        )
+        assert meta["user_count"] == 2
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_single_user_live_needs_no_expected_users(
+        self, config, directory, pool
+    ):
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        rows, meta = await _apply_scope(
+            config,
+            directory,
+            pool,
+            domain="jit-logistics.com",
+            dry_run=False,
+            confirm=True,
+            sheets=sheets,
+            sheet_id=SHEET_ID,
+        )
+        assert meta["user_count"] == 1
+        assert pool.patch_calls() == [(BOB, BOB)]
+
+    @pytest.mark.asyncio
     async def test_max_users_refuses_without_truncating(self, config, directory, pool):
         with pytest.raises(UserInputError) as excinfo:
             await _apply_scope(
@@ -1376,6 +1452,7 @@ class TestApplyScope:
             ou_path="/01 OTB",
             dry_run=False,
             confirm=True,
+            expected_users=2,
             sheets=sheets,
             sheet_id=SHEET_ID,
         )
@@ -1404,6 +1481,7 @@ class TestApplyScope:
             group_email="leads@otbgroup.co.uk",
             dry_run=False,
             confirm=True,
+            expected_users=2,
             sheets=sheets,
             sheet_id=SHEET_ID,
         )
@@ -1443,6 +1521,7 @@ class TestApplyScope:
             group_email="leads@otbgroup.co.uk",
             dry_run=False,
             confirm=True,
+            expected_users=2,
             sheets=sheets,
             sheet_id=SHEET_ID,
         )
@@ -1551,6 +1630,7 @@ class TestApplyScope:
             group_email="leads@otbgroup.co.uk",
             dry_run=False,
             confirm=True,
+            expected_users=3,
             sheets=sheets,
             sheet_id=SHEET_ID,
         )
@@ -1956,7 +2036,14 @@ class TestRestoreUser:
         assert row.after_hash == signature_hash(stored)
         assert row.before_hash == signature_hash(OLD_PRIMARY)
         ledger = sheets.ledger_rows()
-        assert len(ledger) == 2
+        # Pending row before the patch, completed row after it, same run.
+        assert len(ledger) == 3
+        pending = ledger[-2]
+        assert pending["run_id"] == RESTORE_RUN
+        assert pending["readback_hash"] == PENDING_READBACK
+        assert pending["previous_signature_html"] == OLD_PRIMARY
+        assert pending["rendered_hash"] == signature_hash(PREVIOUS)
+        assert pending["template_version"] == operations.RESTORED_VERSION
         new = ledger[-1]
         assert new["run_id"] == RESTORE_RUN
         assert new["actor"] == ACTOR
@@ -2060,7 +2147,49 @@ class TestRestoreUser:
         assert pool.patch_calls() == []
 
     @pytest.mark.asyncio
-    async def test_patch_failure_and_append_failure_are_error_rows(self, pool):
+    async def test_restore_writes_pending_then_patches_then_completes(self, pool):
+        """Same order as an apply on one shared timeline: append(pending),
+        patch, append(completed). The rollback record is on the sheet
+        before Gmail changes."""
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        timeline: list = []
+        sheets.timeline = timeline
+        pool.mailboxes[ALICE].timeline = timeline
+        rows = await _restore(pool, sheets=sheets, dry_run=False, confirm=True)
+        assert rows[0].action == "applied"
+        events = []
+        for name, payload in timeline:
+            if name == "sendAs.patch":
+                events.append(("patch", payload, None))
+            else:
+                ((send_as, readback),) = payload
+                events.append(
+                    (
+                        "append",
+                        send_as,
+                        "pending" if readback == PENDING_READBACK else "completed",
+                    )
+                )
+        assert events == [
+            ("append", ALICE, "pending"),
+            ("patch", ALICE, None),
+            ("append", ALICE, "completed"),
+        ]
+        assert operations.LIVE_APPLY_ORDER == (
+            "ledger_pending",
+            "gmail_patch",
+            "ledger_completed",
+        )
+        # The completed row wins on every read, so a further restore or
+        # apply sees the restore, not its pending row.
+        latest = await operations.prepare_ledger(sheets, SHEET_ID)
+        assert latest[(ALICE, ALICE)]["readback_hash"] != PENDING_READBACK
+        assert latest[(ALICE, ALICE)]["run_id"] == RESTORE_RUN
+
+    @pytest.mark.asyncio
+    async def test_patch_failure_leaves_the_pending_row(self, pool):
         sheets = _ledger_with_rows(
             [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
         )
@@ -2068,11 +2197,408 @@ class TestRestoreUser:
         rows = await _restore(pool, sheets=sheets, dry_run=False, confirm=True)
         assert rows[0].action == "error"
         assert rows[0].reason.startswith("HttpError")
+        assert "apply_interrupted" in rows[0].reason
+        # The pending row was written before the failed patch and stays.
+        assert len(sheets.ledger_rows()) == 2
+        assert len(sheets.pending_ledger_rows()) == 1
+        assert sheets.pending_ledger_rows()[0]["run_id"] == RESTORE_RUN
+        assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == OLD_PRIMARY
+
+    @pytest.mark.asyncio
+    async def test_pending_append_failure_means_no_patch(self, pool):
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        sheets.fail_append = http_error(500, "backendError")
+        rows = await _restore(pool, sheets=sheets, dry_run=False, confirm=True)
+        assert rows[0].action == "error"
+        assert rows[0].reason.startswith(operations.LEDGER_PENDING_FAILED_REASON)
+        assert pool.patch_calls() == []
+        assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == OLD_PRIMARY
         assert len(sheets.ledger_rows()) == 1
 
-        pool.mailboxes[ALICE].fail_patch_for.clear()
-        sheets.fail_append = http_error(500, "backendError")
+    @pytest.mark.asyncio
+    async def test_completed_append_failure_is_an_error_row_after_the_patch(self, pool):
+        sheets = _ledger_with_rows(
+            [_applied_row(ALICE, PREVIOUS, "2026-09-20T09:00:00+00:00", "run-a")]
+        )
+        # Append 1 is the pending row (succeeds); append 2 is the completed row.
+        sheets.fail_append_on_calls = {2: http_error(500, "backendError")}
         rows = await _restore(pool, sheets=sheets, dry_run=False, confirm=True)
         assert rows[0].action == "error"
         assert operations.LEDGER_APPEND_FAILED_REASON in rows[0].reason
         assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == PREVIOUS
+        assert len(sheets.pending_ledger_rows()) == 1
+
+
+# ---------------------------------------------------------------------------
+# restore_scope
+# ---------------------------------------------------------------------------
+
+
+UNDO_RUN = "run-undo"
+LEADS = "leads@otbgroup.co.uk"
+BOB_PREVIOUS = "<div>bob before</div>"
+ALIAS_PREVIOUS = "<div>alias before</div>"
+
+
+def _row_for(user_email, send_as_email, previous_html, run_id, entity="OTB"):
+    return [
+        "2026-09-21T09:00:00+00:00",
+        ACTOR,
+        user_email,
+        send_as_email,
+        entity,
+        "1.0.0",
+        "1.0.0",
+        "rendered-" + run_id,
+        "readback-" + run_id,
+        signature_hash(previous_html),
+        previous_html,
+        run_id,
+    ]
+
+
+@pytest.fixture
+def undo_ledger():
+    """Run UNDO_RUN touched Alice (primary and JIT alias) and Bob, both
+    members of the leads group, plus Dave, who is not. An older run for
+    Alice is there too so the run_id filter is what selects rows."""
+    return _ledger_with_rows(
+        [
+            _row_for(ALICE, ALICE, "<div>much older</div>", "run-old"),
+            _row_for(ALICE, ALICE, PREVIOUS, UNDO_RUN),
+            _row_for(ALICE, ALICE_JIT, ALIAS_PREVIOUS, UNDO_RUN, "JIT"),
+            _row_for(BOB, BOB, BOB_PREVIOUS, UNDO_RUN, "JIT"),
+            _row_for(DAVE, DAVE, "<div>dave before</div>", UNDO_RUN, "VALE"),
+        ]
+    )
+
+
+async def _restore_scope(directory, pool, sheets, **kw):
+    kw.setdefault("actor", ACTOR)
+    kw.setdefault("run_id", RESTORE_RUN)
+    kw.setdefault("gmail_factory", pool.factory)
+    kw.setdefault("sheets", sheets)
+    kw.setdefault("sheet_id", SHEET_ID)
+    kw.setdefault("from_run_id", UNDO_RUN)
+    return await operations.restore_scope(directory, **kw)
+
+
+class TestRestoreScope:
+    @pytest.mark.asyncio
+    async def test_exactly_one_scope_and_live_gate_first(
+        self, directory, pool, undo_ledger
+    ):
+        with pytest.raises(UserInputError):
+            await _restore_scope(directory, pool, undo_ledger)
+        with pytest.raises(UserInputError):
+            await _restore_scope(
+                directory, pool, undo_ledger, ou_path="/01 OTB", group_email=LEADS
+            )
+        with pytest.raises(UserInputError) as excinfo:
+            await _restore_scope(
+                directory, pool, undo_ledger, group_email=LEADS, dry_run=False
+            )
+        assert str(excinfo.value) == operations.LIVE_CONFIRM_MESSAGE
+        assert directory.calls == [] and undo_ledger.calls == []
+        assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing", [None, "", "   "])
+    async def test_run_id_is_required_before_any_call(
+        self, directory, pool, undo_ledger, missing
+    ):
+        with pytest.raises(UserInputError) as excinfo:
+            await _restore_scope(
+                directory, pool, undo_ledger, group_email=LEADS, from_run_id=missing
+            )
+        assert str(excinfo.value) == operations.SCOPE_RESTORE_RUN_ID_MESSAGE
+        assert directory.calls == [] and undo_ledger.calls == []
+        assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    async def test_dry_run_over_two_users(self, directory, pool, undo_ledger):
+        rows, meta = await _restore_scope(
+            directory, pool, undo_ledger, group_email=LEADS
+        )
+        by = {(r.user_email, r.send_as_email): r for r in rows}
+        assert set(by) == {(ALICE, ALICE), (ALICE, ALICE_JIT), (BOB, BOB)}
+        assert all(r.action == "would_apply" for r in rows)
+        assert all(r.template_version == operations.RESTORED_VERSION for r in rows)
+        assert by[(ALICE, ALICE)].after_hash == signature_hash(PREVIOUS)
+        assert by[(ALICE, ALICE_JIT)].after_hash == signature_hash(ALIAS_PREVIOUS)
+        assert by[(BOB, BOB)].after_hash == signature_hash(BOB_PREVIOUS)
+        assert all(UNDO_RUN in r.reason for r in rows)
+        # The older run for Alice was not selected.
+        assert "run-old" not in " ".join(r.reason for r in rows)
+        assert meta["scope"] == f"group {LEADS}"
+        assert meta["run_id"] == RESTORE_RUN
+        assert meta["from_run_id"] == UNDO_RUN
+        assert meta["dry_run"] is True
+        assert meta["user_count"] == 2
+        assert meta["scope_user_count"] == 2
+        assert meta["rows_outside_scope"] == 1  # Dave
+        assert meta["counts"] == {"would_apply": 3}
+        assert (
+            meta["report_filename"] == f"signatures-restore-dryrun-{RESTORE_RUN}.jsonl"
+        )
+        assert meta["access_line"]
+        lines = Path(meta["report_path"]).read_text().strip().splitlines()
+        assert len(lines) == 3
+        assert {json.loads(line)["send_as_email"] for line in lines} == {
+            ALICE,
+            ALICE_JIT,
+            BOB,
+        }
+        assert pool.patch_calls() == []
+        assert "values.append" not in undo_ledger.names()
+        assert "values.update" not in undo_ledger.names()  # no probe on a dry run
+
+    @pytest.mark.asyncio
+    async def test_dry_run_needs_a_readable_ledger(self, directory, pool):
+        with pytest.raises(LedgerError):
+            await _restore_scope(directory, pool, None, group_email=LEADS)
+        sheets = FakeSheets({"Ledger": [LEDGER_HEADER]})
+        sheets.fail_reads = http_error(500, "backendError")
+        with pytest.raises(LedgerError):
+            await _restore_scope(directory, pool, sheets, group_email=LEADS)
+        assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    async def test_live_over_two_users_needs_expected_users(
+        self, directory, pool, undo_ledger
+    ):
+        for given in (None, 1, 3):
+            with pytest.raises(UserInputError) as excinfo:
+                await _restore_scope(
+                    directory,
+                    pool,
+                    undo_ledger,
+                    group_email=LEADS,
+                    dry_run=False,
+                    confirm=True,
+                    expected_users=given,
+                )
+            assert str(excinfo.value) == operations.EXPECTED_USERS_MESSAGE.format(
+                label=f"group {LEADS}",
+                count=2,
+                given="none" if given is None else repr(given),
+            )
+        assert pool.patch_calls() == []
+        assert pool.factory_calls == []
+        assert "values.append" not in undo_ledger.names()
+        assert len(undo_ledger.ledger_rows()) == 5
+
+    @pytest.mark.asyncio
+    async def test_live_over_two_users_with_the_right_count(
+        self, directory, pool, undo_ledger
+    ):
+        timeline: list = []
+        undo_ledger.timeline = timeline
+        pool.mailboxes[ALICE].timeline = timeline
+        pool.mailboxes[BOB].timeline = timeline
+        rows, meta = await _restore_scope(
+            directory,
+            pool,
+            undo_ledger,
+            group_email=LEADS,
+            dry_run=False,
+            confirm=True,
+            expected_users=2,
+        )
+        assert [r.action for r in rows] == ["applied"] * 3
+        assert meta["dry_run"] is False
+        assert meta["counts"] == {"applied": 3}
+        assert meta["ledger_failed"] is None
+        assert meta["report_filename"] == f"signatures-restore-live-{RESTORE_RUN}.jsonl"
+        assert set(pool.patch_calls()) == {
+            (ALICE, ALICE),
+            (ALICE, ALICE_JIT),
+            (BOB, BOB),
+        }
+        assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == PREVIOUS
+        assert pool.mailboxes[ALICE].send_as[ALICE_JIT]["signature"] == ALIAS_PREVIOUS
+        assert pool.mailboxes[BOB].send_as[BOB]["signature"] == BOB_PREVIOUS
+        # Dave, outside the scope, was not touched.
+        assert pool.mailboxes[DAVE].calls == []
+        # One pending and one completed row per address, same restore run.
+        new_rows = undo_ledger.ledger_rows()[5:]
+        assert len(new_rows) == 6
+        assert all(r["run_id"] == RESTORE_RUN for r in new_rows)
+        assert all(
+            r["template_version"] == operations.RESTORED_VERSION for r in new_rows
+        )
+        assert len(undo_ledger.pending_ledger_rows()) == 3
+        assert len([r for r in new_rows if r["readback_hash"] != PENDING_READBACK]) == 3
+        # Per address the order is pending, patch, completed.
+        kinds = [
+            (name, payload if name == "sendAs.patch" else payload[0][0])
+            for name, payload in timeline
+        ]
+        for address in (ALICE, ALICE_JIT, BOB):
+            mine = [k for k in kinds if k[1] == address]
+            assert [k[0] for k in mine] == [
+                "values.append",
+                "sendAs.patch",
+                "values.append",
+            ], address
+        # The replaced (managed) signatures are on record for a re-restore.
+        completed = {
+            r["send_as_email"]: r
+            for r in undo_ledger.completed_ledger_rows()
+            if r["run_id"] == RESTORE_RUN
+        }
+        assert completed[ALICE]["previous_signature_html"] == OLD_PRIMARY
+        assert completed[ALICE_JIT]["previous_signature_html"] == OLD_ALIAS
+
+    @pytest.mark.asyncio
+    async def test_single_user_live_needs_no_expected_users(
+        self, directory, pool, undo_ledger
+    ):
+        rows, meta = await _restore_scope(
+            directory,
+            pool,
+            undo_ledger,
+            domain="jit-logistics.com",
+            dry_run=False,
+            confirm=True,
+        )
+        assert meta["user_count"] == 1
+        assert [r.action for r in rows] == ["applied"]
+        assert pool.patch_calls() == [(BOB, BOB)]
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_id_is_refused(self, directory, pool, undo_ledger):
+        with pytest.raises(UserInputError) as excinfo:
+            await _restore_scope(
+                directory, pool, undo_ledger, group_email=LEADS, from_run_id="run-zzz"
+            )
+        message = str(excinfo.value)
+        assert "run-zzz" in message and "Nothing was changed" in message
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_run_id_only_outside_the_scope_is_refused_and_says_so(
+        self, directory, pool, undo_ledger
+    ):
+        # UNDO_RUN touched nobody in valeautomotive.co.uk except Dave; a
+        # scope that excludes every affected user has nothing to restore.
+        with pytest.raises(UserInputError) as excinfo:
+            await _restore_scope(directory, pool, undo_ledger, ou_path="/04 BIR")
+        message = str(excinfo.value)
+        assert UNDO_RUN in message and "OU /04 BIR" in message
+        assert "4 row(s)" in message and "outside the scope" in message
+        assert pool.patch_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_already_restored_address_is_unchanged(
+        self, directory, pool, undo_ledger
+    ):
+        pool.mailboxes[BOB].send_as[BOB]["signature"] = BOB_PREVIOUS
+        rows, _ = await _restore_scope(
+            directory,
+            pool,
+            undo_ledger,
+            domain="jit-logistics.com",
+            dry_run=False,
+            confirm=True,
+        )
+        assert [r.action for r in rows] == ["unchanged"]
+        assert pool.patch_calls() == []
+        assert len(undo_ledger.ledger_rows()) == 5
+
+    @pytest.mark.asyncio
+    async def test_missing_send_as_and_unreadable_mailbox_are_error_rows(
+        self, directory, pool, undo_ledger
+    ):
+        undo_ledger.tabs["Ledger"].append(
+            _row_for(ALICE, "gone@otbgroup.co.uk", "<div>x</div>", UNDO_RUN)
+        )
+        pool.fail_for[BOB.lower()] = http_error(403, "forbidden")
+        rows, meta = await _restore_scope(
+            directory,
+            pool,
+            undo_ledger,
+            group_email=LEADS,
+            dry_run=False,
+            confirm=True,
+            expected_users=2,
+        )
+        by = {(r.user_email, r.send_as_email): r for r in rows}
+        assert by[(ALICE, ALICE)].action == "applied"
+        assert by[(ALICE, ALICE_JIT)].action == "applied"
+        gone = by[(ALICE, "gone@otbgroup.co.uk")]
+        assert gone.action == "error" and "no longer has" in gone.reason
+        assert by[(BOB, BOB)].action == "error"
+        assert by[(BOB, BOB)].reason.startswith("HttpError")
+        assert meta["counts"] == {"applied": 2, "error": 2}
+        assert set(pool.patch_calls()) == {(ALICE, ALICE), (ALICE, ALICE_JIT)}
+
+    @pytest.mark.asyncio
+    async def test_ledger_append_failure_stops_later_patches(
+        self, directory, pool, undo_ledger
+    ):
+        # Append 2 (the completed row of the first address) fails; nothing
+        # after it is patched.
+        undo_ledger.fail_append_on_calls = {2: http_error(500, "backendError")}
+        rows, meta = await _restore_scope(
+            directory,
+            pool,
+            undo_ledger,
+            group_email=LEADS,
+            dry_run=False,
+            confirm=True,
+            expected_users=2,
+        )
+        actions = [r.action for r in rows]
+        assert actions == ["error", "error", "error"]
+        assert operations.LEDGER_APPEND_FAILED_REASON in rows[0].reason
+        assert rows[1].reason.startswith(operations.LEDGER_FAILED_REASON)
+        assert rows[2].reason.startswith(operations.LEDGER_FAILED_REASON)
+        assert meta["ledger_failed"]
+        assert len(pool.patch_calls()) == 1
+
+    @pytest.mark.asyncio
+    async def test_max_users_refuses_without_truncating(
+        self, directory, pool, undo_ledger
+    ):
+        with pytest.raises(UserInputError) as excinfo:
+            await _restore_scope(
+                directory, pool, undo_ledger, group_email=LEADS, max_users=1
+            )
+        assert "max_users" in str(excinfo.value)
+        assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    async def test_live_with_read_only_ledger_share_refuses_before_gmail(
+        self, directory, pool, undo_ledger
+    ):
+        undo_ledger.fail_writes = http_error(403, "forbidden")
+        with pytest.raises(LedgerError):
+            await _restore_scope(
+                directory,
+                pool,
+                undo_ledger,
+                group_email=LEADS,
+                dry_run=False,
+                confirm=True,
+                expected_users=2,
+            )
+        assert pool.factory_calls == []
+        assert directory.calls == []
+
+    @pytest.mark.asyncio
+    async def test_pending_row_of_an_interrupted_apply_is_a_valid_source(
+        self, directory, pool
+    ):
+        sheets = _ledger_with_rows(
+            [_pending_row(BOB, BOB_PREVIOUS, "2026-09-21T09:00:00+00:00", UNDO_RUN)]
+        )
+        # _pending_row is written for Alice; retarget it to Bob.
+        sheets.tabs["Ledger"][1][LEDGER_HEADER.index("user_email")] = BOB
+        rows, _ = await _restore_scope(
+            directory, pool, sheets, domain="jit-logistics.com"
+        )
+        assert [r.action for r in rows] == ["would_apply"]
+        assert rows[0].after_hash == signature_hash(BOB_PREVIOUS)
