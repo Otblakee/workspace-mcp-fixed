@@ -16,7 +16,8 @@ from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 
 from auth.service_decorator import require_google_service
-from core.utils import handle_http_errors
+from core.utils import UserInputError, handle_http_errors
+from gdrive.drive_batch import _allowed_permission_domains
 
 from core.server import server
 
@@ -1233,16 +1234,50 @@ async def share_calendar(
         user_google_email (str): The user's Google email address. Required.
         calendar_id (str): The ID of the calendar to share.
         share_with_email (str): The email address of the person to share with.
-        role (str): The access role to grant. One of "freeBusyReader", "reader", "writer", or "owner". Defaults to "reader".
+        role (str): The access role to grant. One of "freeBusyReader", "reader" or "writer". Defaults to "reader". "owner" is refused: an owner grant cannot be undone from this server and hands the calendar to someone else. Grant owner rights in the Google Calendar UI if they are really needed.
+
+    The address must be inside DRIVE_PERMISSION_ALLOWED_DOMAINS when that
+    allowlist is set (the same allowlist the Drive permission tools use).
 
     Returns:
         str: Confirmation message with sharing details.
     """
-    valid_roles = {"freeBusyReader", "reader", "writer", "owner"}
+    if role == "owner":
+        raise UserInputError(
+            f"Refused: share_calendar will not grant role 'owner' on calendar "
+            f"'{calendar_id}' to {share_with_email}. An owner grant hands the "
+            "calendar to another account and there is no tool on this server "
+            "to take it back. Grant 'reader', 'writer' or 'freeBusyReader' "
+            "instead, or grant owner rights by hand in the Google Calendar "
+            "sharing settings."
+        )
+    valid_roles = {"freeBusyReader", "reader", "writer"}
     if role not in valid_roles:
         return (
             f"Invalid role '{role}'. Must be one of: {', '.join(sorted(valid_roles))}"
         )
+
+    address = (share_with_email or "").strip()
+    if not address or "@" not in address:
+        raise UserInputError(
+            f"Refused: share_with_email must be an email address; got "
+            f"{share_with_email!r}. Pass the address of the person or group to "
+            "share with."
+        )
+    allowed_domains = _allowed_permission_domains()
+    if allowed_domains:
+        domain = address.lower().rsplit("@", 1)[-1]
+        if domain not in allowed_domains:
+            raise UserInputError(
+                f"Refused: share_calendar will not share calendar "
+                f"'{calendar_id}' with {address} because its domain "
+                f"'{domain}' is outside the allowed domains "
+                f"({', '.join(allowed_domains)}). External sharing is "
+                "refused at the tool boundary so a calendar cannot leak "
+                "outside the tenant. Share with an internal address instead, "
+                "or change DRIVE_PERMISSION_ALLOWED_DOMAINS on the server if "
+                "that domain should be allowed."
+            )
 
     logger.info(
         f"[share_calendar] Sharing calendar '{calendar_id}' with {share_with_email} as {role}"

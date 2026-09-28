@@ -15,7 +15,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # Auth & server utilities
 from auth.service_decorator import require_google_service, require_multiple_services
-from core.utils import extract_office_xml_text, handle_http_errors
+from core.utils import UserInputError, extract_office_xml_text, handle_http_errors
 from core.server import server
 from core.comments import create_comment_tools
 
@@ -57,6 +57,9 @@ from gdocs.managers import (
 import json
 
 logger = logging.getLogger(__name__)
+
+# find_and_replace_doc refuses a shorter find_text without confirm=True.
+MIN_FIND_TEXT_CHARS = 3
 
 
 # Map non-Doc Workspace mime types to the tool family the caller probably
@@ -819,6 +822,7 @@ async def find_and_replace_doc(
     find_text: str,
     replace_text: str,
     match_case: bool = False,
+    confirm: bool = False,
 ) -> str:
     """
     Finds and replaces text throughout a Google Doc.
@@ -826,9 +830,13 @@ async def find_and_replace_doc(
     Args:
         user_google_email: User's Google email address
         document_id: ID of the document to update
-        find_text: Text to search for
+        find_text: Text to search for. Fewer than 3 characters is refused
+            unless confirm=True, because a one or two character search
+            matches all over the document.
         replace_text: Text to replace with
         match_case: Whether to match case exactly
+        confirm: Must be True to run with a find_text shorter than 3
+            characters. Defaults to False.
 
     Returns:
         str: Confirmation message with replacement count
@@ -836,6 +844,16 @@ async def find_and_replace_doc(
     logger.info(
         f"[find_and_replace_doc] Doc={document_id}, find='{find_text}', replace='{replace_text}'"
     )
+
+    if len(find_text or "") < MIN_FIND_TEXT_CHARS and not confirm:
+        raise UserInputError(
+            f"Refused: find_text {find_text!r} is shorter than "
+            f"{MIN_FIND_TEXT_CHARS} characters, so it would match all over "
+            f"document {document_id} and replace every occurrence at once. "
+            "Use a longer, more specific find_text (include the surrounding "
+            "words), or call again with confirm=True if every occurrence "
+            "really should change. Version history is the way back."
+        )
 
     requests = [create_find_replace_request(find_text, replace_text, match_case)]
 

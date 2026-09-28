@@ -14,6 +14,7 @@ gmail:
     - draft_gmail_message
     - list_gmail_filters
     - create_gmail_filter
+    - delete_gmail_filter
 
   complete:
     - get_gmail_threads_content_batch

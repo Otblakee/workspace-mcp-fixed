@@ -100,6 +100,32 @@ _PERMISSION_FIELDS = (
 )
 
 
+# Restriction flags whose True to False change widens access. Turning any of
+# them off needs confirm=True in update_shared_drive. copyRequiresWriterPermission
+# is a download/copy control, not a sharing boundary, so it is not listed.
+SHARING_RESTRICTION_KEYS = (
+    "domainUsersOnly",
+    "driveMembersOnly",
+    "adminManagedRestrictions",
+    "sharingFoldersRequiresOrganizerPermission",
+)
+
+# Roles that carry membership management or move/delete rights on a shared
+# drive. They are granted to groups only; an individual never gets them.
+_INDIVIDUAL_FORBIDDEN_ROLES = ("organizer", "fileOrganizer")
+
+
+def loosened_restrictions(
+    current: Dict[str, Any], requested: Dict[str, Any]
+) -> List[str]:
+    """Return the sharing restriction keys ``requested`` turns from True to False."""
+    return [
+        key
+        for key in SHARING_RESTRICTION_KEYS
+        if requested.get(key) is False and current.get(key) is True
+    ]
+
+
 async def _get_shared_drive(
     service,
     drive_id: str,
@@ -495,9 +521,16 @@ async def update_shared_drive(
     sharing_folders_requires_organizer_permission: Optional[bool] = None,
     use_domain_admin_access: bool = False,
     dry_run: bool = False,
+    confirm: bool = False,
 ) -> str:
     """
     Renames a shared drive and/or sets its restriction flags.
+
+    Loosening a sharing restriction (turning domain_users_only,
+    drive_members_only, admin_managed_restrictions or
+    sharing_folders_requires_organizer_permission from True to False) needs
+    ``confirm=True``; the current value is read first so the direction is
+    known. Tightening a flag and renaming need no confirmation.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -517,6 +550,8 @@ async def update_shared_drive(
             administrator. Requires a Workspace admin account.
         dry_run (bool): When True, report the intended change without
             applying it. Defaults to False.
+        confirm (bool): Must be True to loosen a sharing restriction (True to
+            False). Defaults to False.
 
     Returns:
         str: Before/after summary, re-read from ``drives.get`` so the change
@@ -557,12 +592,31 @@ async def update_shared_drive(
     if restrictions:
         body["restrictions"] = restrictions
 
+    loosened = loosened_restrictions(before.get("restrictions") or {}, restrictions)
+    if loosened and not confirm and not dry_run:
+        raise UserInputError(
+            f"Refused: update_shared_drive would loosen "
+            f"{', '.join(loosened)} on shared drive '{before.get('name')}' "
+            f"({drive_id}) from True to False, which widens who can reach "
+            "the drive's content. Loosening a sharing restriction needs "
+            "confirm=True. Run with dry_run=True to see the full change, "
+            "then call again with confirm=True if it is intended; tightening "
+            "a flag or renaming needs no confirmation."
+        )
+
     if dry_run:
+        note = ""
+        if loosened:
+            note = (
+                f"\n   Note: this loosens {', '.join(loosened)} and will need "
+                "confirm=True on the real run."
+            )
         return (
             "DRY RUN — no changes applied.\n"
             f"   Shared drive: '{before.get('name')}' ({drive_id})\n"
             f"   Would set: {body}\n"
             f"   Current restrictions: {before.get('restrictions', {})}"
+            f"{note}"
         )
 
     await execute_with_backoff(
@@ -722,7 +776,9 @@ async def set_drive_permission(
             ``allow_individual=True``). Required.
         role (str): One of organizer, fileOrganizer, writer, commenter, reader.
         allow_individual (bool): Explicit opt-in to grant an individual rather
-            than a group. Defaults to False.
+            than a group. Defaults to False. An individual may hold writer,
+            commenter or reader only; organizer and fileOrganizer are refused
+            for individuals.
         allow_unverified_group (bool): Proceed with a group grant when the
             Admin Directory service is unavailable to verify it. Defaults to
             False (refuse). Only relevant on deployments without an admin
@@ -740,6 +796,15 @@ async def set_drive_permission(
         raise UserInputError("file_or_drive_id is required.")
 
     validate_drive_role(role)
+    if allow_individual and role in _INDIVIDUAL_FORBIDDEN_ROLES:
+        raise UserInputError(
+            f"Refused: set_drive_permission will not grant role '{role}' to an "
+            f"individual ({principal}). organizer and fileOrganizer carry "
+            "membership management and move rights that must follow group "
+            f"membership so they end with offboarding. Grant '{role}' to a "
+            "Google Group the person belongs to (without allow_individual), "
+            "or grant the individual 'writer', 'commenter' or 'reader'."
+        )
     principal_type, email = resolve_principal(
         principal, allow_individual=allow_individual
     )

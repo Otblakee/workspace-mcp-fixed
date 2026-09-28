@@ -384,13 +384,18 @@ services would register. The denylist is the control; the YAML prune is tidy.
   the AI must share)
 - Calendar: `delete_event`
 - Contacts: `delete_contact`, `batch_delete_contacts`, `delete_contact_group`
-- Gmail: `delete_gmail_draft`, `delete_gmail_filter`,
-  `batch_modify_gmail_message_labels` (bulk trash via the TRASH label)
+- Gmail: `delete_gmail_draft`, `batch_modify_gmail_message_labels` (bulk
+  trash via the TRASH label). `delete_gmail_filter` was blocked until
+  v1.17.0 and is now allowed so the AI can undo a filter it created;
+  `create_gmail_filter` is validated instead (see "Tier 3 policy
+  narrowings").
 
-Deliberately NOT blocked (judgement calls, harden later if needed): the
-single-message `modify_gmail_message_labels` (normal archive/label path, can
-still apply TRASH to one message), `manage_gmail_label` (can delete labels),
-`share_calendar`, `send_gmail_message`, `create_gmail_filter`,
+Deliberately NOT blocked, but narrowed in v1.17.0 (see "Tier 3 policy
+narrowings"): the single-message `modify_gmail_message_labels` (archive and
+label only; TRASH and SPAM refused), `manage_gmail_label` (delete needs
+`confirm=True`), `share_calendar` (no owner, domain allowlist),
+`send_gmail_message` (`from_name` must match Gmail's display name),
+`create_gmail_filter` (no forward, no trash, no wildcard criteria),
 `delete_conditional_formatting`. The content-overwrite tools
 (`modify_doc_text`, `find_and_replace_doc`, `batch_update_doc`,
 `modify_sheet_values`, `modify_event`, `update_contact`) are kept by design;
@@ -1024,3 +1029,42 @@ signature undo, label delete, whole-tab clears, display-name spoofing, audit
 redaction of names and phones) are parked in `FOLLOWUPS.md`, "Adversarial
 review, tier 3", awaiting the owner's decision. They are not bugs; each one
 narrows what a connected client can do.
+
+## Tier 3 policy narrowings (v1.17.0)
+
+The policy findings parked from the 2026-09-26 review, all approved by the
+owner on 2026-09-28 and implemented as refusals or confirm flags. Nothing
+was removed. The one widening is `delete_gmail_filter`, unblocked so an AI
+can undo its own filter now that `create_gmail_filter` is validated.
+
+| Tool | Narrowing |
+| --- | --- |
+| `share_calendar` | no `owner`; address must pass `DRIVE_PERMISSION_ALLOWED_DOMAINS` when set (reuses `drive_batch._allowed_permission_domains`) |
+| `create_gmail_filter` | refuses `forward`, TRASH or SPAM targets, empty or wildcard-only criteria |
+| `update_drive_file` | writes `mcp_prev_parents`, `mcp_moved_at`, `mcp_moved_by` on every move; cross-drive move needs `allow_cross_drive_move=True` |
+| `modify_gmail_message_labels` | refuses TRASH and SPAM in `add_label_ids` |
+| `update_shared_drive` | loosening a restriction flag needs `confirm=True` (`loosened_restrictions`) |
+| `manage_gmail_label` | delete needs `confirm=True` |
+| `modify_sheet_values` | clearing a bare sheet name needs `confirm=True` (`is_bare_sheet_name`) |
+| `find_and_replace_doc` | `find_text` under `MIN_FIND_TEXT_CHARS` (3) needs `confirm=True` |
+| `send_gmail_message`, `draft_gmail_message` | `from_name` must equal the send-as display name after case and whitespace normalisation; an empty display name refuses |
+| `set_drive_permission` | `organizer` and `fileOrganizer` refused for individuals |
+| audit | `SENSITIVE` gains names, phones, attendees, summary, location, description, find and replace text, `from_name`, `criteria` |
+| `/attachments/{file_id}` | audit row `attachments_download` per request, non-fatal |
+
+Signatures: `restore_email_signature` gains a scope mode (`run_id` plus one
+of `ou_path`, `domain`, `group_email`; `operations.restore_scope`), live scope
+runs over more than one user need `expected_users` equal to the dry-run
+count (`operations.require_expected_users`, `EXPECTED_USERS_MESSAGE`), the
+single-address restore is pending-first, and `rules.skip_addresses` excludes
+exact addresses (`accounts@otbgroup.co.uk` shipped). OTB, JIT, VALE and BIR
+carry `statutory_verified: true` (owner confirmation, 2026-09-28); AHWE does
+not.
+
+Operational notes: your own primary send-as had no display name in Gmail on
+2026-09-28, so `from_name` on the primary is refused until one is set. The
+`from_name` check calls `sendAs.get`, which needs `gmail.settings.basic`; the
+OTB token has it, a send-only client would get a 403 on that path. Render
+cron `otb-signature-audit` (Mondays 07:00 UTC, fixed all year by the owner's
+choice) audits only; it needs the `signature-sa.json` secret file added in the
+dashboard.

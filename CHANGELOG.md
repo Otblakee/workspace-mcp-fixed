@@ -4,6 +4,66 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.17.0] - 2026-09-28
+
+### Changed
+
+Policy narrowings from the adversarial review, tier 3, all approved by the
+owner on 2026-09-28. No tool or parameter was removed; each item is a
+refusal or a confirm flag, and every refusal says what was refused, why,
+and what to do instead.
+
+- `share_calendar` refuses role `owner` and any address outside
+  `DRIVE_PERMISSION_ALLOWED_DOMAINS` when that is set.
+- `create_gmail_filter` validates the action and criteria: no `forward`
+  action, no TRASH or SPAM as the target label, no empty or wildcard-only
+  criteria. `delete_gmail_filter` is unblocked so the AI can undo a filter it
+  created; it is the one widening in this release.
+- `update_drive_file` records the previous parents, time and actor in
+  `appProperties` on every move and refuses a move across a drive boundary
+  unless `allow_cross_drive_move=True`.
+- `modify_gmail_message_labels` refuses TRASH and SPAM in `add_label_ids`;
+  archive by removing INBOX and restore from trash still work.
+- `update_shared_drive` needs `confirm=True` to loosen any of the four sharing
+  restriction flags; tightening and renames do not.
+- `manage_gmail_label` delete, `modify_sheet_values` clearing a bare sheet
+  name, and `find_and_replace_doc` with `find_text` under 3 characters each
+  need `confirm=True`.
+- `send_gmail_message` and `draft_gmail_message` accept `from_name` only when
+  it matches the display name Gmail holds for that send-as address.
+- `set_drive_permission` with `allow_individual=True` refuses `organizer` and
+  `fileOrganizer` for the individual.
+- Audit redaction now covers `find_text`, `replace_text`, `attendees`,
+  `location`, `summary`, `description`, `phone`, `phones`, `given_name`,
+  `family_name`, `display_name`, `from_name` and `criteria`.
+- `/attachments/{file_id}` writes an audit row (`attachments_download`) for
+  every request; a failed audit never blocks the download.
+
+### Added (signatures)
+
+- `restore_email_signature` can now undo one apply run across a scope:
+  pass `run_id` with exactly one of `ou_path`, `domain` or `group_email`
+  instead of `user_email`. Same dry-run and confirm regime, one ledger row
+  per address, JSONL report.
+- Live scope runs (`apply_email_signatures` and the scope restore) over more
+  than one user also need `expected_users`, the user count the preceding dry
+  run printed. A mismatch refuses before any write.
+- The single-address restore now writes its ledger row pending-first, like
+  the apply path.
+- `rules.skip_addresses` in `entities.yaml`: exact send-as addresses never
+  managed. Ships with `accounts@otbgroup.co.uk`, which stays unsigned until
+  a finance template exists.
+- OTB, JIT, VALE and BIR are `statutory_verified: true` after the owner
+  confirmed the values against Companies House on 2026-09-28. AHWE stays
+  unverified.
+
+### Operations
+
+- Render cron job `otb-signature-audit` created on 2026-09-28: Frankfurt,
+  Docker, Mondays 07:00 UTC, `uv run python -m gsignatures.audit_cli --all`,
+  the five `SIGNATURE_*` variables set; the secret file is added in the
+  dashboard. Audits only; exit 2 on drift surfaces as a failed run.
+
 ## [1.16.3] - 2026-09-28
 
 ### Added

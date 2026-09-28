@@ -413,11 +413,12 @@ by hand): Gmail draft "ZZ_MCPTEST_2026-09-26 draft (safe to delete)", label
 2026-11-10, two contacts named ZZ_MCPTEST and an empty contact group of the
 same name. The Drive scratch folder is in the holding folder.
 
-## Adversarial review, tier 3 (parked 2026-09-26, owner decision)
+## Adversarial review, tier 3 (parked 2026-09-26, approved and shipped in v1.17.0 on 2026-09-28)
 
 Findings from the 2026-09-26 review that change what a connected AI client
-can do. None is a bug; each is a policy narrowing. Recommendation in
-brackets. Decide, then implement in one PR with confirm flags and tests.
+can do. All eleven were approved as recommended and shipped in v1.17.0
+(see CLAUDE.md "Tier 3 policy narrowings"). Kept here as the record of what
+was decided and why.
 
 1. `share_calendar` can grant an external address owner rights on any
    calendar and there is no acl list or delete tool to undo it. [Cap the

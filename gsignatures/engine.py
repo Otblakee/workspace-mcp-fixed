@@ -204,6 +204,9 @@ class SignatureConfig:
     skip_alias_domains: List[str]
     templates_dir: Path
     domain_to_entity: Dict[str, str]
+    # Exact send-as addresses (lower-cased) that are never managed, whatever
+    # the rules would say: shared mailboxes that have no template yet.
+    skip_addresses: List[str] = dataclasses.field(default_factory=list)
 
 
 @dataclass
@@ -462,7 +465,7 @@ def _parse_entity(
 
 def _parse_rules(
     raw_rules: Any, entity_codes: Iterable[str], problems: List[str]
-) -> Tuple[List[PrimaryRule], List[str], List[str]]:
+) -> Tuple[List[PrimaryRule], List[str], List[str], List[str]]:
     codes = set(entity_codes)
     if raw_rules is None:
         raw_rules = {}
@@ -487,6 +490,19 @@ def _parse_rules(
         problems.append("rules.skip_alias_domains: must be a list of domain names")
         skip = []
     skip = [d.strip().lower() for d in skip]
+
+    skip_addresses = raw_rules.get("skip_addresses") or []
+    if not isinstance(skip_addresses, list) or not all(
+        isinstance(x, str) and x.strip() for x in skip_addresses
+    ):
+        problems.append("rules.skip_addresses: must be a list of email addresses")
+        skip_addresses = []
+    skip_addresses = [a.strip().lower() for a in skip_addresses]
+    for address in skip_addresses:
+        if "@" not in address or address.startswith("@") or address.endswith("@"):
+            problems.append(
+                f"rules.skip_addresses: {address!r} is not an email address"
+            )
 
     primary_raw = raw_rules.get("primary")
     rules: List[PrimaryRule] = []
@@ -527,7 +543,7 @@ def _parse_rules(
                 primary_domain=primary_domain.lower() if primary_domain else None,
             )
         )
-    return rules, list(exclude), skip
+    return rules, list(exclude), skip, skip_addresses
 
 
 def load_config(
@@ -584,7 +600,9 @@ def load_config(
         if entity is not None:
             entities[code_text] = entity
 
-    rules, exclude, skip = _parse_rules(raw.get("rules"), entities.keys(), problems)
+    rules, exclude, skip, skip_addresses = _parse_rules(
+        raw.get("rules"), entities.keys(), problems
+    )
 
     domain_to_entity: Dict[str, str] = {}
     for code, entity in entities.items():
@@ -618,6 +636,7 @@ def load_config(
         skip_alias_domains=skip,
         templates_dir=tdir,
         domain_to_entity=domain_to_entity,
+        skip_addresses=skip_addresses,
     )
 
 
@@ -908,6 +927,10 @@ def signature_hash(html: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Skip reason for a send-as address listed in ``rules.skip_addresses``.
+ADDRESS_EXCLUDED_REASON = "address excluded by config"
+
+
 def plan_for_user(
     config: SignatureConfig,
     user: Dict[str, Any],
@@ -930,7 +953,11 @@ def plan_for_user(
         send_as_email = str(send_as.get("sendAsEmail") or "")
         is_primary = bool(send_as.get("isPrimary"))
 
-        if is_primary:
+        if send_as_email.strip().lower() in config.skip_addresses:
+            # The address itself is excluded by config, before any rule:
+            # a shared mailbox with no template yet, for example.
+            code, reason = None, ADDRESS_EXCLUDED_REASON
+        elif is_primary:
             code, reason = primary_entity, primary_reason
         else:
             code, reason = resolve_alias_entity(
@@ -1126,6 +1153,7 @@ __all__ = [
     "LEGAL_FORMS",
     "MAX_SIGNATURE_CHARS",
     "RESULT_ACTIONS",
+    "ADDRESS_EXCLUDED_REASON",
     "SignatureConfigError",
     "MissingDirectoryDataError",
     "TemplateError",

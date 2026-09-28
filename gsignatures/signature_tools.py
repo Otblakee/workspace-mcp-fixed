@@ -26,9 +26,12 @@ peeled off.
 
 Write safety: the three write tools (set, apply, restore) default to
 ``dry_run=True``, and a live write needs ``dry_run=False`` AND
-``confirm=True``. Every live apply is recorded in the ledger Sheet before the
-tool returns; a live run is refused outright when the ledger cannot be
-reached. The write tools also carry ``_workspace_write_tool = True`` (set by
+``confirm=True``. A live scope run (``apply_email_signatures``, or
+``restore_email_signature`` with a scope) over more than one user also needs
+``expected_users`` equal to the user count the preceding dry run printed;
+``confirm`` stays a bare boolean for compatibility, the count is the second
+lock. Every live apply is recorded in the ledger Sheet before the tool
+returns; a live run is refused outright when the ledger cannot be reached. The write tools also carry ``_workspace_write_tool = True`` (set by
 ``_write_tool``), which ``core.tool_registry.filter_server_tools`` honours in
 ``--read-only`` mode, so a read-only server drops them at registration; and
 each refuses a live run in the body when the server is read-only, in case a
@@ -73,6 +76,14 @@ _SETUP_ERRORS = (SignatureAuthError, LedgerError, SignatureConfigError)
 READ_ONLY_MESSAGE = (
     "This server is running in read-only mode; signature writes are disabled. "
     "Nothing was changed. Dry runs still work."
+)
+
+# restore_email_signature works in one of two modes. Tested verbatim.
+RESTORE_MODE_MESSAGE = (
+    "Pass either user_email (restore one send-as address) or exactly one scope "
+    "(ou_path, domain or group_email) together with run_id (restore every "
+    "address that run touched inside the scope), not both. Got {got}. Nothing "
+    "was changed."
 )
 
 
@@ -434,11 +445,100 @@ async def _restore(
             "and confirm=True."
         )
     else:
+        lines.append(_RESTORE_LIVE_NOTE)
+    return "\n".join(lines)
+
+
+_RESTORE_LIVE_NOTE = (
+    "Notes: every applied row has two ledger rows (Ledger tab), both with "
+    "versions 'restored': a pending row written before the patch, with the "
+    "replaced signature in previous_signature_html, and a completed row with "
+    "the read-back hash, so the restore can itself be reversed. The next apply "
+    "will re-apply the managed signature unless the address is excluded first."
+)
+
+
+def _expected_users_hint(count: int) -> str:
+    """The switches a live repeat of a scope dry run needs."""
+    if count > 1:
+        return f"dry_run=False, confirm=True and expected_users={count}"
+    return "dry_run=False and confirm=True"
+
+
+async def _restore_scope(
+    actor: str,
+    ou_path: Optional[str],
+    domain: Optional[str],
+    group_email: Optional[str],
+    run_id_to_restore: Optional[str],
+    dry_run: bool,
+    confirm: bool,
+    expected_users: Optional[int],
+    max_users: int,
+) -> str:
+    # Scope, switch and run_id checks first, so the caller sees the right
+    # refusal even when the runtime cannot be built (no ledger env, no key).
+    operations.scope_label(ou_path=ou_path, domain=domain, group_email=group_email)
+    _refuse_if_read_only(dry_run)
+    operations.gate_live(dry_run, confirm)
+    if not (run_id_to_restore or "").strip():
+        raise UserInputError(operations.SCOPE_RESTORE_RUN_ID_MESSAGE)
+    # The rows being restored live in the ledger, so even a dry run needs it.
+    rt = build_runtime(need_ledger=True)
+    run_id = operations.new_run_id()
+    rows, meta = await operations.restore_scope(
+        rt.directory,
+        ou_path=ou_path,
+        domain=domain,
+        group_email=group_email,
+        from_run_id=run_id_to_restore,
+        actor=actor,
+        run_id=run_id,
+        dry_run=dry_run,
+        confirm=confirm,
+        expected_users=expected_users,
+        max_users=max_users,
+        sheets=rt.sheets,
+        sheet_id=rt.sheet_id,
+        gmail_factory=rt.gmail_factory,
+    )
+    lines = [
+        f"RESTORE scope {meta['scope']} | undoing run_id {meta['from_run_id']} | "
+        f"run_id {run_id} | {_mode_word(dry_run)} | actor {actor} | "
+        f"users {meta['user_count']} (with ledger rows for run_id "
+        f"{meta['from_run_id']}, of {meta['scope_user_count']} in the scope)",
+        *(
+            [
+                f"Note: {meta['rows_outside_scope']} ledger row(s) of run_id "
+                f"{meta['from_run_id']} belong to users outside this scope and "
+                "were left alone."
+            ]
+            if meta.get("rows_outside_scope")
+            else []
+        ),
+        *(
+            [
+                "LEDGER FAILED MID-RUN: after the first failed ledger append "
+                "no further address was patched; those rows read 'not "
+                "attempted'. Record the 'restored but the ledger append "
+                "failed' rows by hand, fix the ledger, then run again."
+            ]
+            if meta.get("ledger_failed")
+            else []
+        ),
+        format_result_table(rows),
+        f"Report: {meta['report_filename']}. {meta['access_line']}",
+    ]
+    if dry_run:
         lines.append(
-            "Notes: the restore is recorded in the Ledger tab with versions "
-            "'restored' and the replaced signature in previous_signature_html, "
-            "so it can itself be reversed. The next apply will re-apply the "
-            "managed signature unless the address is excluded first."
+            "Notes: nothing was written. To restore, repeat with "
+            f"{_expected_users_hint(meta['user_count'])}."
+        )
+    else:
+        lines.append(_RESTORE_LIVE_NOTE)
+        lines.append(
+            "Keep this table and the report: together with the Ledger tab they "
+            "are the evidence of what was restored."
         )
     return "\n".join(lines)
 
@@ -453,6 +553,7 @@ async def _apply(
     confirm: bool,
     force: bool,
     max_users: int,
+    expected_users: Optional[int],
 ) -> str:
     # Scope and switch checks first, so the caller sees the right refusal
     # even when the runtime cannot be built (no ledger env, no key).
@@ -474,6 +575,7 @@ async def _apply(
         force=force,
         include_aliases=include_aliases,
         max_users=max_users,
+        expected_users=expected_users,
         sheets=rt.sheets,
         sheet_id=rt.sheet_id,
         gmail_factory=rt.gmail_factory,
@@ -506,7 +608,7 @@ async def _apply(
         "the evidence of what was applied."
         if not dry_run
         else "Keep this table: it is the evidence of what a live run would do. "
-        "Repeat with dry_run=False and confirm=True to apply.",
+        f"Repeat with {_expected_users_hint(meta['user_count'])} to apply.",
     ]
     return "\n".join(lines)
 
@@ -650,17 +752,21 @@ async def apply_email_signatures(
     confirm: bool = False,
     force: bool = False,
     max_users: int = operations.DEFAULT_MAX_USERS,
+    expected_users: Optional[int] = None,
 ) -> str:
     """
     Applies managed signatures across one scope: an OU, a domain or a group.
 
     Exactly one scope. Dry run by default; a live write needs dry_run=False
-    AND confirm=True and a reachable ledger. A scope with more users than
-    max_users is refused with the count (never truncated). One failing
-    address or user is an error row; the rest continue, except that after a
-    failed ledger append nothing further is patched in that run. Every row
-    is also written as a JSONL report. Refused on a read-only server. Caller
-    must be on SIGNATURE_ADMIN_EMAILS.
+    AND confirm=True and a reachable ledger, and when the scope covers more
+    than one user also expected_users equal to the user count the dry run
+    printed (a mismatch is refused before any write, with the current
+    count). A scope with more users than max_users is refused with the
+    count (never truncated). One failing address or user is an error row;
+    the rest continue, except that after a failed ledger append nothing
+    further is patched in that run. Every row is also written as a JSONL
+    report. Refused on a read-only server. Caller must be on
+    SIGNATURE_ADMIN_EMAILS.
 
     Args:
         ou_path (Optional[str]): Organisational unit path, e.g. '/01 OTB'
@@ -673,10 +779,13 @@ async def apply_email_signatures(
         confirm (bool): Second switch for a live write. Defaults to False.
         force (bool): Re-apply addresses the ledger says are unchanged.
         max_users (int): Refuse scopes larger than this. Defaults to 200.
+        expected_users (Optional[int]): For a live run over more than one
+            user, the user count the preceding dry run printed. Required
+            then; ignored on a dry run and on a single-user scope.
 
     Returns:
-        str: Header (scope, run_id, mode, actor), the result table, the
-            JSONL report access line and a reminder to keep the table.
+        str: Header (scope, run_id, mode, actor, users), the result table,
+            the JSONL report access line and a reminder to keep the table.
     """
     actor = await _require_allowed_caller()
     return await _translated(
@@ -690,6 +799,7 @@ async def apply_email_signatures(
             confirm,
             force,
             max_users,
+            expected_users,
         )
     )
 
@@ -736,37 +846,89 @@ async def audit_email_signatures(
 @handle_http_errors("restore_email_signature", service_type="gmail")
 @_write_tool
 async def restore_email_signature(
-    user_email: str,
+    user_email: Optional[str] = None,
     send_as_email: Optional[str] = None,
     run_id: Optional[str] = None,
     dry_run: bool = True,
     confirm: bool = False,
+    ou_path: Optional[str] = None,
+    domain: Optional[str] = None,
+    group_email: Optional[str] = None,
+    expected_users: Optional[int] = None,
+    max_users: int = operations.DEFAULT_MAX_USERS,
 ) -> str:
     """
-    Puts back the previous signature the ledger recorded for one send-as address.
+    Puts back the previous signature the ledger recorded: one send-as address,
+    or every address one run touched inside a scope.
 
-    Uses the latest ledger row for the address (or the row from a given
-    run_id) and restores its previous_signature_html: the signature that was
-    in place before that apply. An empty previous signature clears the
-    signature. Dry run by default; a live restore needs dry_run=False AND
-    confirm=True and a writable ledger, and is itself recorded as a ledger
-    row (versions 'restored') so it can be reversed. The next apply will
-    re-apply the managed signature. Refused on a read-only server. Caller
-    must be on SIGNATURE_ADMIN_EMAILS.
+    Two modes, exactly one of them. With user_email: uses the latest ledger
+    row for the address (or the row from a given run_id) and restores its
+    previous_signature_html, the signature in place before that apply. With
+    a scope (ou_path, domain or group_email) and run_id: restores every
+    (user, send-as) in the scope that has a ledger row for that run_id, so
+    one apply run can be undone; run_id is required in this mode. An empty
+    previous signature clears the signature. Dry run by default; a live
+    restore needs dry_run=False AND confirm=True and a writable ledger, and
+    a scope restore over more than one user also expected_users equal to
+    the user count the dry run printed. Every live restore is recorded as
+    ledger rows (a pending row before the patch, a completed row after,
+    versions 'restored') so it can be reversed; a scope restore also writes
+    a JSONL report. The next apply will re-apply the managed signature.
+    Refused on a read-only server. Caller must be on SIGNATURE_ADMIN_EMAILS.
 
     Args:
-        user_email (str): The user's primary address. Required.
+        user_email (Optional[str]): The user's primary address, for a
+            single-address restore. Not with a scope.
         send_as_email (Optional[str]): The send-as address to restore.
-            Defaults to the primary.
-        run_id (Optional[str]): Restore from the ledger row of this run_id
-            instead of the latest row for the address.
+            Defaults to the primary. Single-address mode only.
+        run_id (Optional[str]): Single address: restore from the ledger row
+            of this run_id instead of the latest row. Scope: the run to
+            undo. Required with a scope.
         dry_run (bool): Report without writing. Defaults to True.
         confirm (bool): Second switch for a live restore. Defaults to False.
+        ou_path (Optional[str]): Scope: organisational unit path (includes
+            child OUs).
+        domain (Optional[str]): Scope: a primary-address domain.
+        group_email (Optional[str]): Scope: a group; direct user members only.
+        expected_users (Optional[int]): Scope, live, more than one user: the
+            user count the preceding dry run printed. Required then.
+        max_users (int): Scope: refuse scopes larger than this. Defaults to 200.
 
     Returns:
-        str: Mode line, a one-row result table and notes.
+        str: Mode line, the result table (one row per restored address)
+            and notes; a scope restore adds the JSONL report access line.
     """
     actor = await _require_allowed_caller()
+    has_user = bool(user_email and user_email.strip())
+    scope_given = [
+        name
+        for name, value in (
+            ("ou_path", ou_path),
+            ("domain", domain),
+            ("group_email", group_email),
+        )
+        if value and str(value).strip()
+    ]
+    if has_user and scope_given:
+        raise UserInputError(
+            RESTORE_MODE_MESSAGE.format(got="user_email and " + ", ".join(scope_given))
+        )
+    if not has_user and not scope_given:
+        raise UserInputError(RESTORE_MODE_MESSAGE.format(got="neither"))
+    if scope_given:
+        return await _translated(
+            _restore_scope(
+                actor,
+                ou_path,
+                domain,
+                group_email,
+                run_id,
+                dry_run,
+                confirm,
+                expected_users,
+                max_users,
+            )
+        )
     user_email = _require_email(user_email, "user_email")
     return await _translated(
         _restore(actor, user_email, send_as_email, run_id, dry_run, confirm)

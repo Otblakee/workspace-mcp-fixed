@@ -1,7 +1,10 @@
 import functools
+import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import List, Optional
 from importlib import metadata
 
@@ -28,7 +31,12 @@ from core.config import (
     set_transport_mode as _set_transport_mode,
     get_oauth_redirect_uri as get_oauth_redirect_uri_for_current_mode,
 )
-from core.audit import audit_log, logger as audit_logger
+from core.audit import (
+    _resolve_client,
+    _resolve_user_email,
+    audit_log,
+    logger as audit_logger,
+)
 from core.tool_policy import BLOCKED_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -623,6 +631,52 @@ async def health_check(request: Request):
     )
 
 
+# Audit identity of the attachment download route. The route is not an MCP
+# tool, so the ``audit_log`` decorator never sees it; ``_submit_attachment_audit``
+# builds the same row shape by hand and hands it to the same queue.
+ATTACHMENT_AUDIT_TOOL = "attachments_download"
+ATTACHMENT_AUDIT_SERVICE = "attachments"
+_ATTACHMENT_UA_MAX = 100
+
+
+async def _submit_attachment_audit(
+    request: Request, file_id: str, status: str, error: str, started: float
+) -> None:
+    """Queue one audit row for a ``/attachments/{file_id}`` request.
+
+    Every request to the route is logged, hit or miss: the URL is a
+    capability URL (possession of the id is the only access control), so
+    the log is the only record of who fetched what. ``params_summary``
+    carries only the User-Agent, cut to 100 characters. The user is resolved
+    the same way as for a tool call; there is no MCP request context on a
+    plain HTTP GET, so it is normally the ``DEFAULT_USER`` fallback, which
+    is what the row is meant to say. A failure here never reaches the
+    caller: the download is served regardless.
+    """
+    try:
+        await _ensure_audit_started()
+        user_agent = (request.headers.get("user-agent") or "").strip()
+        summary = {"user_agent": user_agent[:_ATTACHMENT_UA_MAX]}
+        audit_logger().submit(
+            {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                "user": await _resolve_user_email(),
+                "service": ATTACHMENT_AUDIT_SERVICE,
+                "tool": ATTACHMENT_AUDIT_TOOL,
+                "params_summary": json.dumps(summary, ensure_ascii=False),
+                "resource_id": str(file_id)[:200],
+                "status": status,
+                "error": error,
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "client": _resolve_client(),
+            }
+        )
+    except Exception as exc:
+        logger.error("Attachment audit submit failed (non-fatal): %s", exc)
+
+
 @server.custom_route("/attachments/{file_id}", methods=["GET"])
 async def serve_attachment(request: Request):
     """Serve a stored attachment file.
@@ -630,9 +684,14 @@ async def serve_attachment(request: Request):
     FastMCP custom routes are plain Starlette routes: Starlette calls the
     endpoint with the Request as the only argument, so path params must be
     read from ``request.path_params``.
+
+    Every request is audited through ``_submit_attachment_audit`` (tool
+    ``attachments_download``, service ``attachments``), with status
+    ``success`` when the file is served and ``error`` on a 404.
     """
     from core.attachment_storage import get_attachment_storage
 
+    started = time.perf_counter()
     file_id = request.path_params["file_id"]
     storage = get_attachment_storage()
     metadata = storage.get_attachment_metadata(file_id)
@@ -644,6 +703,9 @@ async def serve_attachment(request: Request):
     )
 
     if not metadata:
+        await _submit_attachment_audit(
+            request, file_id, "error", "404: attachment not found or expired", started
+        )
         return JSONResponse(
             {
                 "error": "Attachment not found or expired",
@@ -655,6 +717,9 @@ async def serve_attachment(request: Request):
 
     file_path = storage.get_attachment_path(file_id)
     if not file_path:
+        await _submit_attachment_audit(
+            request, file_id, "error", "404: attachment file not found", started
+        )
         return JSONResponse(
             {
                 "error": "Attachment file not found",
@@ -664,6 +729,7 @@ async def serve_attachment(request: Request):
             status_code=404,
         )
 
+    await _submit_attachment_audit(request, file_id, "success", "", started)
     # Capability URL: possession of the UUID is the only access control,
     # so make sure intermediaries never cache the response.
     return FileResponse(

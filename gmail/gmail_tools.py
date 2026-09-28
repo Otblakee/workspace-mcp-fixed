@@ -19,10 +19,11 @@ from email.mime.base import MIMEBase
 from email import encoders
 from email.utils import formataddr
 
+from googleapiclient.errors import HttpError
 from pydantic import Field
 
 from auth.service_decorator import require_google_service, require_multiple_services
-from core.utils import handle_http_errors, validate_file_path
+from core.utils import UserInputError, handle_http_errors, validate_file_path
 from core.server import server
 from auth.scopes import (
     GMAIL_SEND_SCOPE,
@@ -242,6 +243,63 @@ def _sanitize_header_value(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     return value.replace("\r", "").replace("\n", "").replace("\x00", "")
+
+
+def _normalise_display_name(value: Optional[str]) -> str:
+    """Case-fold and collapse whitespace so 'Oliver  Blake' == 'oliver blake'."""
+    return " ".join((value or "").split()).casefold()
+
+
+async def _assert_from_name_matches_send_as(
+    service, from_name: str, sender_email: str
+) -> None:
+    """Refuse a ``from_name`` that is not the sender's own Gmail display name.
+
+    ``from_name`` is free text on the wire, so without this check mail could go
+    out under another person's name. The name is checked against the
+    ``displayName`` of the sendAs entry for ``sender_email``
+    (``users.settings.sendAs.get``), after case and whitespace normalisation.
+    The Gmail profile carries no name and the Directory needs a separate
+    service, so an empty sendAs display name is a refusal: the caller sets the
+    name once in Gmail settings and it is then accepted here.
+    """
+    try:
+        send_as = await asyncio.to_thread(
+            service.users()
+            .settings()
+            .sendAs()
+            .get(userId="me", sendAsEmail=sender_email)
+            .execute
+        )
+    except HttpError as error:
+        status = getattr(getattr(error, "resp", None), "status", None)
+        if status == 404:
+            raise UserInputError(
+                f"Refused: from_name '{from_name}' cannot be checked because "
+                f"'{sender_email}' is not one of this account's send-as "
+                "addresses, so it has no display name to compare against. "
+                "Send from a configured send-as address, or leave from_name "
+                "unset."
+            ) from error
+        raise
+    configured = (send_as or {}).get("displayName") or ""
+    if not configured.strip():
+        raise UserInputError(
+            f"Refused: from_name '{from_name}' cannot be used because the "
+            f"send-as entry for '{sender_email}' has no display name to check "
+            "it against, and a free-text name would let mail go out under "
+            "someone else's name. Set the display name for this address in "
+            "Gmail settings (Accounts > Send mail as), then pass the same name, "
+            "or leave from_name unset."
+        )
+    if _normalise_display_name(from_name) != _normalise_display_name(configured):
+        raise UserInputError(
+            f"Refused: from_name '{from_name}' does not match the display name "
+            f"'{configured}' configured for '{sender_email}' in Gmail. Mail "
+            "may only go out under the sender's own name. Pass "
+            f"from_name='{configured}', leave from_name unset, or change the "
+            "display name in Gmail settings (Accounts > Send mail as) first."
+        )
 
 
 def _prepare_gmail_message(
@@ -1142,7 +1200,7 @@ async def send_gmail_message(
     from_name: Annotated[
         Optional[str],
         Field(
-            description="Optional sender display name (e.g., 'Peter Hartree'). If provided, the From header will be formatted as 'Name <email>'.",
+            description="Optional sender display name. Must match the display name configured in Gmail for the sending address (Settings > Accounts > Send mail as); any other name is refused. If provided, the From header will be formatted as 'Name <email>'.",
         ),
     ] = None,
     from_email: Annotated[
@@ -1196,7 +1254,7 @@ async def send_gmail_message(
               - 'mime_type' (optional): MIME type (defaults to 'application/octet-stream')
         cc (Optional[str]): Optional CC email address.
         bcc (Optional[str]): Optional BCC email address.
-        from_name (Optional[str]): Optional sender display name. If provided, the From header will be formatted as 'Name <email>'.
+        from_name (Optional[str]): Optional sender display name. Must match the display name configured in Gmail for the sending address; any other name is refused. If provided, the From header will be formatted as 'Name <email>'.
         from_email (Optional[str]): Optional 'Send As' alias email address. The alias must be
             configured in Gmail settings (Settings > Accounts > Send mail as). If not provided,
             the email will be sent from the authenticated user's primary email address.
@@ -1279,6 +1337,8 @@ async def send_gmail_message(
     # Prepare the email message
     # Use from_email (Send As alias) if provided, otherwise default to authenticated user
     sender_email = from_email or user_google_email
+    if from_name:
+        await _assert_from_name_matches_send_as(service, from_name, sender_email)
     raw_message, thread_id_final = _prepare_gmail_message(
         subject=subject,
         body=body,
@@ -1340,7 +1400,7 @@ async def draft_gmail_message(
     from_name: Annotated[
         Optional[str],
         Field(
-            description="Optional sender display name (e.g., 'Peter Hartree'). If provided, the From header will be formatted as 'Name <email>'.",
+            description="Optional sender display name. Must match the display name configured in Gmail for the sending address (Settings > Accounts > Send mail as); any other name is refused. If provided, the From header will be formatted as 'Name <email>'.",
         ),
     ] = None,
     from_email: Annotated[
@@ -1386,7 +1446,7 @@ async def draft_gmail_message(
         to (Optional[str]): Optional recipient email address. Can be left empty for drafts.
         cc (Optional[str]): Optional CC email address.
         bcc (Optional[str]): Optional BCC email address.
-        from_name (Optional[str]): Optional sender display name. If provided, the From header will be formatted as 'Name <email>'.
+        from_name (Optional[str]): Optional sender display name. Must match the display name configured in Gmail for the sending address; any other name is refused. If provided, the From header will be formatted as 'Name <email>'.
         from_email (Optional[str]): Optional 'Send As' alias email address. The alias must be
             configured in Gmail settings (Settings > Accounts > Send mail as). If not provided,
             the draft will be from the authenticated user's primary email address.
@@ -1465,6 +1525,8 @@ async def draft_gmail_message(
     # Prepare the email message
     # Use from_email (Send As alias) if provided, otherwise default to authenticated user
     sender_email = from_email or user_google_email
+    if from_name:
+        await _assert_from_name_matches_send_as(service, from_name, sender_email)
     raw_message, thread_id_final = _prepare_gmail_message(
         subject=subject,
         body=body,
@@ -1806,6 +1868,7 @@ async def manage_gmail_label(
     label_id: Optional[str] = None,
     label_list_visibility: Optional[Literal["labelShow", "labelHide"]] = None,
     message_list_visibility: Optional[Literal["show", "hide"]] = None,
+    confirm: bool = False,
 ) -> str:
     """
     Manages Gmail labels: create, update, or delete labels.
@@ -1817,6 +1880,7 @@ async def manage_gmail_label(
         label_id (Optional[str]): Label ID. Required for update and delete operations.
         label_list_visibility (Optional[Literal["labelShow", "labelHide"]]): Whether the label is shown in the label list. Defaults to "labelShow" on create; on update, None preserves the label's current setting.
         message_list_visibility (Optional[Literal["show", "hide"]]): Whether the label is shown in the message list. Defaults to "show" on create; on update, None preserves the label's current setting.
+        confirm (bool): Must be True for action="delete". Deleting a label removes it from every message that carries it and cannot be undone. Defaults to False.
 
     Returns:
         str: Confirmation message of the label operation.
@@ -1830,6 +1894,15 @@ async def manage_gmail_label(
 
     if action in ["update", "delete"] and not label_id:
         raise Exception("Label ID is required for update and delete actions.")
+
+    if action == "delete" and not confirm:
+        raise UserInputError(
+            f"Refused: deleting label '{label_id}' needs confirm=True. Deleting "
+            "a label strips it from every message that carries it and cannot "
+            "be undone. Check the label with list_gmail_labels, then call "
+            "again with confirm=True, or use action='update' with "
+            "label_list_visibility='labelHide' to hide it instead."
+        )
 
     if action == "create":
         label_object = {
@@ -1956,6 +2029,94 @@ async def list_gmail_filters(service, user_google_email: str) -> str:
     return "\n".join(lines).rstrip()
 
 
+_FILTER_CRITERIA_FIELDS = (
+    "from",
+    "to",
+    "subject",
+    "query",
+    "hasAttachment",
+    "size",
+    "negatedQuery",
+)
+_FILTER_TEXT_FIELDS = ("from", "to", "subject", "query", "negatedQuery")
+_FILTER_BLOCKED_LABELS = ("TRASH", "SPAM")
+
+
+def _is_wildcard_criterion(value: Any) -> bool:
+    """True for a text criterion that matches every message ('*', '@', '')."""
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    return stripped == "" or all(ch in "*@." for ch in stripped)
+
+
+def _validate_gmail_filter(criteria: Any, action: Any) -> None:
+    """Refuse filter shapes that delete, forward or match all future mail.
+
+    Raises ``UserInputError`` before the Gmail API is called.
+    """
+    if not isinstance(action, dict) or not action:
+        raise UserInputError(
+            "Refused: create_gmail_filter needs a non-empty action dict "
+            "(for example {'addLabelIds': ['Label_1'], 'removeLabelIds': "
+            "['INBOX']}). Nothing was created."
+        )
+    if "forward" in action:
+        raise UserInputError(
+            "Refused: create_gmail_filter will not create a filter with a "
+            "'forward' action. Auto-forwarding future mail to another address "
+            "is an exfiltration path, so no tool on this server sets it up. "
+            "Remove the 'forward' key; set up forwarding by hand in Gmail "
+            "settings if it is really wanted."
+        )
+    add_labels = action.get("addLabelIds") or []
+    if not isinstance(add_labels, (list, tuple)):
+        add_labels = [add_labels]
+    blocked = [
+        label
+        for label in add_labels
+        if isinstance(label, str) and label.upper() in _FILTER_BLOCKED_LABELS
+    ]
+    if blocked:
+        raise UserInputError(
+            f"Refused: create_gmail_filter will not create a filter that adds "
+            f"{', '.join(blocked)}. A filter that trashes or marks future mail "
+            "as spam deletes it before anyone sees it. Archive instead by "
+            "removing INBOX ({'removeLabelIds': ['INBOX']}) or apply an "
+            "ordinary label; delete mail by hand in Gmail."
+        )
+
+    if not isinstance(criteria, dict) or not criteria:
+        raise UserInputError(
+            "Refused: create_gmail_filter needs a non-empty criteria dict with "
+            f"at least one of {', '.join(_FILTER_CRITERIA_FIELDS)}. A filter "
+            "with no criteria would apply to every future message. Nothing "
+            "was created."
+        )
+    specific = {
+        key: value
+        for key, value in criteria.items()
+        if key in _FILTER_CRITERIA_FIELDS and value not in (None, "")
+    }
+    if not specific:
+        raise UserInputError(
+            "Refused: create_gmail_filter criteria must include at least one "
+            f"of {', '.join(_FILTER_CRITERIA_FIELDS)}; got keys "
+            f"{sorted(criteria.keys())}. A filter with no specific criterion "
+            "would apply to every future message. Nothing was created."
+        )
+    text_fields = {k: v for k, v in specific.items() if k in _FILTER_TEXT_FIELDS}
+    only_text = len(specific) == len(text_fields)
+    if only_text and all(_is_wildcard_criterion(v) for v in text_fields.values()):
+        shown = ", ".join(f"{k}={v!r}" for k, v in text_fields.items())
+        raise UserInputError(
+            f"Refused: create_gmail_filter criteria ({shown}) are a bare "
+            "wildcard that matches every message, so the filter would apply "
+            "to all future mail. Narrow the criteria to a real sender, "
+            "recipient, subject or search query. Nothing was created."
+        )
+
+
 @server.tool()
 @handle_http_errors("create_gmail_filter", service_type="gmail")
 @require_google_service("gmail", "gmail_settings_basic")
@@ -1983,10 +2144,18 @@ async def create_gmail_filter(
         criteria (Dict[str, Any]): Criteria for matching messages.
         action (Dict[str, Any]): Actions to apply to matched messages.
 
+    Refused before any API call: an action with a "forward" key (mail
+    forwarding is an exfiltration path), an action that adds TRASH or SPAM
+    (a filter that deletes future mail), and criteria that are empty or match
+    everything (a bare wildcard such as query "*" or from "@"). Use
+    delete_gmail_filter to undo a filter this tool created.
+
     Returns:
         str: Confirmation message with the created filter ID.
     """
     logger.info("[create_gmail_filter] Invoked")
+
+    _validate_gmail_filter(criteria, action)
 
     filter_body = {"criteria": criteria, "action": action}
 
@@ -2054,12 +2223,14 @@ async def modify_gmail_message_labels(
     """
     Adds or removes labels from a Gmail message.
     To archive an email, remove the INBOX label.
-    To delete an email, add the TRASH label.
+    Deleting is not available here: adding TRASH or SPAM is refused, because a
+    loop over this tool would empty an inbox one message at a time. Delete
+    mail by hand in the Gmail UI.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         message_id (str): The ID of the message to modify.
-        add_label_ids (Optional[List[str]]): List of label IDs to add to the message.
+        add_label_ids (Optional[List[str]]): List of label IDs to add to the message. TRASH and SPAM are refused.
         remove_label_ids (Optional[List[str]]): List of label IDs to remove from the message.
 
     Returns:
@@ -2072,6 +2243,21 @@ async def modify_gmail_message_labels(
     if not add_label_ids and not remove_label_ids:
         raise Exception(
             "At least one of add_label_ids or remove_label_ids must be provided."
+        )
+
+    blocked = [
+        label
+        for label in (add_label_ids or [])
+        if isinstance(label, str) and label.upper() in ("TRASH", "SPAM")
+    ]
+    if blocked:
+        raise UserInputError(
+            f"Refused: modify_gmail_message_labels will not add "
+            f"{', '.join(blocked)} to message {message_id}. Trashing or "
+            "marking as spam deletes mail, and this server does not delete "
+            "mail. To archive the message, remove the INBOX label "
+            "(remove_label_ids=['INBOX']); to delete it, do so by hand in the "
+            "Gmail UI."
         )
 
     body = {}

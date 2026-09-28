@@ -491,7 +491,8 @@ class TestPreview:
         assert "Alice Able" in out
         assert "Director" in out
         assert "Mobile: (none)" in out
-        assert "statutory_verified" in out and "WARNING" in out
+        # OTB is verified, so no statutory warning appears in the preview.
+        assert "WARNING" not in out
         assert "<table" in out
         assert pool.patch_calls() == []
         # Read-only: the ledger is not needed for a preview.
@@ -790,6 +791,41 @@ class TestApplyEmailSignatures:
         assert pool.factory_calls == []
 
     @pytest.mark.asyncio
+    async def test_dry_run_tells_the_caller_the_expected_users_to_pass(
+        self, runtime, as_owner, pool
+    ):
+        out = await apply_email_signatures(ou_path="/01 OTB")
+        assert "users 2" in out.splitlines()[0]
+        assert "expected_users=2" in out
+        single = await apply_email_signatures(group_email="leads@otbgroup.co.uk")
+        assert "users 1" in single.splitlines()[0]
+        assert "expected_users" not in single
+
+    @pytest.mark.asyncio
+    async def test_live_over_two_users_needs_expected_users(
+        self, runtime, as_owner, pool, sheets
+    ):
+        with pytest.raises(UserInputError) as excinfo:
+            await apply_email_signatures(ou_path="/01 OTB", dry_run=False, confirm=True)
+        assert str(excinfo.value) == operations.EXPECTED_USERS_MESSAGE.format(
+            label="OU /01 OTB", count=2, given="none"
+        )
+        with pytest.raises(UserInputError) as excinfo:
+            await apply_email_signatures(
+                ou_path="/01 OTB", dry_run=False, confirm=True, expected_users=5
+            )
+        assert "(got 5)" in str(excinfo.value)
+        assert pool.patch_calls() == []
+        assert sheets.ledger_rows() == []
+
+        out = await apply_email_signatures(
+            ou_path="/01 OTB", dry_run=False, confirm=True, expected_users=2
+        )
+        assert "LIVE" in out.splitlines()[0]
+        assert (ALICE, ALICE) in pool.patch_calls()
+        assert sheets.completed_ledger_rows()
+
+    @pytest.mark.asyncio
     async def test_confirm_alone_is_still_a_dry_run(
         self, runtime, as_owner, pool, sheets
     ):
@@ -958,11 +994,15 @@ class TestRestoreEmailSignature:
             "<div>before the rollout</div>"
         )
         rows = sheets.ledger_rows()
-        assert len(rows) == 2
+        # Pending row before the patch, completed row after it.
+        assert len(rows) == 3
+        assert len(sheets.pending_ledger_rows()) == 1
+        assert rows[-2]["previous_signature_html"] == OLD_PRIMARY
         assert rows[-1]["template_version"] == operations.RESTORED_VERSION
         assert rows[-1]["previous_signature_html"] == OLD_PRIMARY
         assert rows[-1]["actor"] == OWNER
         assert rows[-1]["run_id"] in out
+        assert "pending row" in out
 
     @pytest.mark.asyncio
     async def test_run_id_is_passed_through(
@@ -994,8 +1034,207 @@ class TestRestoreEmailSignature:
 
     @pytest.mark.asyncio
     async def test_blank_user_email_is_refused(self, runtime, as_owner):
-        with pytest.raises(UserInputError):
+        # A blank user_email with no scope is "neither" mode.
+        with pytest.raises(UserInputError) as excinfo:
             await restore_email_signature(" ")
+        assert str(excinfo.value) == signature_tools.RESTORE_MODE_MESSAGE.format(
+            got="neither"
+        )
+        assert runtime.build_calls == []
+        with pytest.raises(UserInputError):
+            await restore_email_signature("not-an-address")
+
+
+# ---------------------------------------------------------------------------
+# restore_email_signature: scope mode
+# ---------------------------------------------------------------------------
+
+UNDO_RUN = "run-undo"
+ALICE_PREVIOUS = "<div>alice before</div>"
+CAROL_PREVIOUS = "<div>carol before</div>"
+
+
+def _undo_row(user_email, send_as_email, previous_html, run_id=UNDO_RUN):
+    return [
+        "2026-09-21T09:00:00+00:00",
+        OWNER,
+        user_email,
+        send_as_email,
+        "OTB",
+        "1.0.0",
+        "1.0.0",
+        "rendered-" + run_id,
+        "readback-" + run_id,
+        signature_hash(previous_html),
+        previous_html,
+        run_id,
+    ]
+
+
+@pytest.fixture
+def undo_rows(sheets):
+    """Run UNDO_RUN touched Alice and Carol, both in /01 OTB."""
+    sheets.tabs["Ledger"].append(_undo_row(ALICE, ALICE, ALICE_PREVIOUS))
+    sheets.tabs["Ledger"].append(_undo_row(CAROL, CAROL, CAROL_PREVIOUS))
+
+
+class TestRestoreEmailSignatureScope:
+    @pytest.mark.asyncio
+    async def test_user_email_and_scope_together_are_refused(
+        self, runtime, as_owner, pool
+    ):
+        with pytest.raises(UserInputError) as excinfo:
+            await restore_email_signature(ALICE, ou_path="/01 OTB", run_id=UNDO_RUN)
+        assert str(excinfo.value) == signature_tools.RESTORE_MODE_MESSAGE.format(
+            got="user_email and ou_path"
+        )
+        with pytest.raises(UserInputError) as excinfo:
+            await restore_email_signature(
+                ALICE, domain="otbgroup.co.uk", group_email="leads@otbgroup.co.uk"
+            )
+        assert "user_email and domain, group_email" in str(excinfo.value)
+        assert runtime.build_calls == []
+        assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    async def test_neither_mode_is_refused(self, runtime, as_owner):
+        with pytest.raises(UserInputError) as excinfo:
+            await restore_email_signature()
+        assert str(excinfo.value) == signature_tools.RESTORE_MODE_MESSAGE.format(
+            got="neither"
+        )
+        assert runtime.build_calls == []
+
+    @pytest.mark.asyncio
+    async def test_two_scopes_are_refused(self, runtime, as_owner):
+        with pytest.raises(UserInputError):
+            await restore_email_signature(
+                ou_path="/01 OTB", domain="otbgroup.co.uk", run_id=UNDO_RUN
+            )
+        assert runtime.build_calls == []
+
+    @pytest.mark.asyncio
+    async def test_scope_without_run_id_is_refused_before_the_runtime(
+        self, runtime, as_owner, pool
+    ):
+        with pytest.raises(UserInputError) as excinfo:
+            await restore_email_signature(ou_path="/01 OTB")
+        assert str(excinfo.value) == operations.SCOPE_RESTORE_RUN_ID_MESSAGE
+        assert runtime.build_calls == []
+        assert pool.factory_calls == []
+
+    @pytest.mark.asyncio
+    async def test_scope_live_without_confirm_is_refused(self, runtime, as_owner, pool):
+        with pytest.raises(UserInputError) as excinfo:
+            await restore_email_signature(
+                ou_path="/01 OTB", run_id=UNDO_RUN, dry_run=False
+            )
+        assert str(excinfo.value) == operations.LIVE_CONFIRM_MESSAGE
+        assert runtime.build_calls == []
+
+    @pytest.mark.asyncio
+    async def test_scope_dry_run_output_shape(
+        self, runtime, as_owner, pool, sheets, undo_rows
+    ):
+        out = await restore_email_signature(ou_path="/01 OTB", run_id=UNDO_RUN)
+        head = out.splitlines()[0]
+        assert head.startswith("RESTORE scope OU /01 OTB")
+        assert f"undoing run_id {UNDO_RUN}" in head
+        assert "DRY RUN" in head
+        assert OWNER in head
+        assert "users 2 (with ledger rows" in head
+        assert "would_apply 2" in out  # the table summary line
+        assert ALICE in out and CAROL in out
+        assert "signatures-restore-dryrun-" in out
+        assert "expected_users=2" in out
+        assert pool.patch_calls() == []
+        assert len(sheets.ledger_rows()) == 2
+        assert runtime.build_calls[0]["need_ledger"] is True
+
+    @pytest.mark.asyncio
+    async def test_scope_live_expected_users_mismatch_is_refused(
+        self, runtime, as_owner, pool, sheets, undo_rows
+    ):
+        for given in (None, 1):
+            with pytest.raises(UserInputError) as excinfo:
+                await restore_email_signature(
+                    ou_path="/01 OTB",
+                    run_id=UNDO_RUN,
+                    dry_run=False,
+                    confirm=True,
+                    expected_users=given,
+                )
+            assert str(excinfo.value) == operations.EXPECTED_USERS_MESSAGE.format(
+                label="OU /01 OTB",
+                count=2,
+                given="none" if given is None else repr(given),
+            )
+        assert pool.patch_calls() == []
+        assert len(sheets.ledger_rows()) == 2
+
+    @pytest.mark.asyncio
+    async def test_scope_live_with_the_right_count_restores_every_address(
+        self, runtime, as_owner, pool, sheets, undo_rows
+    ):
+        out = await restore_email_signature(
+            ou_path="/01 OTB",
+            run_id=UNDO_RUN,
+            dry_run=False,
+            confirm=True,
+            expected_users=2,
+        )
+        assert "LIVE" in out.splitlines()[0]
+        assert out.count("applied") >= 2
+        assert "signatures-restore-live-" in out
+        assert "pending row" in out
+        assert set(pool.patch_calls()) == {(ALICE, ALICE), (CAROL, CAROL)}
+        assert pool.mailboxes[ALICE].send_as[ALICE]["signature"] == ALICE_PREVIOUS
+        assert pool.mailboxes[CAROL].send_as[CAROL]["signature"] == CAROL_PREVIOUS
+        assert len(sheets.ledger_rows()) == 6
+        assert len(sheets.pending_ledger_rows()) == 2
+        assert {r["template_version"] for r in sheets.ledger_rows()[2:]} == {
+            operations.RESTORED_VERSION
+        }
+
+    @pytest.mark.asyncio
+    async def test_scope_single_user_live_needs_no_count(
+        self, runtime, as_owner, pool, sheets, undo_rows
+    ):
+        out = await restore_email_signature(
+            group_email="leads@otbgroup.co.uk",
+            run_id=UNDO_RUN,
+            dry_run=False,
+            confirm=True,
+        )
+        assert "users 1 (with ledger rows" in out.splitlines()[0]
+        assert pool.patch_calls() == [(ALICE, ALICE)]
+
+    @pytest.mark.asyncio
+    async def test_scope_notes_rows_outside_the_scope(
+        self, runtime, as_owner, pool, sheets, undo_rows
+    ):
+        out = await restore_email_signature(
+            group_email="leads@otbgroup.co.uk", run_id=UNDO_RUN
+        )
+        assert "1 ledger row(s) of run_id run-undo belong to users outside" in out
+
+    @pytest.mark.asyncio
+    async def test_scope_read_only_server_refuses_a_live_restore(
+        self, runtime, as_owner, pool, undo_rows, read_only_server
+    ):
+        with pytest.raises(UserInputError) as excinfo:
+            await restore_email_signature(
+                ou_path="/01 OTB",
+                run_id=UNDO_RUN,
+                dry_run=False,
+                confirm=True,
+                expected_users=2,
+            )
+        assert "read-only" in str(excinfo.value)
+        assert runtime.build_calls == []
+        assert pool.patch_calls() == []
+        out = await restore_email_signature(ou_path="/01 OTB", run_id=UNDO_RUN)
+        assert out.startswith("RESTORE scope")
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,9 @@
 6. A domain-policy rejection of a FastMCP-validated token is terminal in the
    auth middleware; a request with no token still reaches session binding.
 7. ``_ensure_audit_started`` resets its flag on failure so the next call
+8. ``core.audit.SENSITIVE`` covers the personal data the tier 3 review found
+   in the audit Sheet in the clear (find/replace text, attendees, locations,
+   summaries, contact names and phones, from_name, filter criteria).
    retries.
 """
 
@@ -243,6 +246,130 @@ class TestOAuthProxyDiskStoreCap:
 # ---------------------------------------------------------------------------
 # 3. Audit error text scrubbing
 # ---------------------------------------------------------------------------
+
+
+class TestSensitiveKeysTier3:
+    """Tier 3 item 9: personal data stays out of ``params_summary``."""
+
+    NEW_KEYS = (
+        "find_text",
+        "replace_text",
+        "attendees",
+        "location",
+        "summary",
+        "description",
+        "phone",
+        "phones",
+        "given_name",
+        "family_name",
+        "display_name",
+        "from_name",
+        "criteria",
+    )
+
+    # Everything that was already in the set before this change stays.
+    OLD_KEYS = (
+        "body",
+        "text_content",
+        "message_body",
+        "html_body",
+        "values",
+        "data",
+        "content",
+        "notes",
+        "description",
+        "subject",
+        "query",
+        "base64_content",
+        "fileUrl",
+        "attachments",
+        "raw",
+        "upload_uri",
+    )
+
+    def test_every_key_is_in_sensitive(self):
+        from core.audit import SENSITIVE
+
+        for key in self.NEW_KEYS + self.OLD_KEYS:
+            assert key in SENSITIVE, key
+
+    def test_find_and_replace_text_redacted(self):
+        from core.audit import _redact
+
+        out = _redact(
+            {
+                "document_id": "doc-1",
+                "find_text": "Jane Doe salary 55000",
+                "replace_text": "REDACTED NAME",
+                "match_case": True,
+            }
+        )
+        assert "Jane Doe" not in out and "REDACTED NAME" not in out
+        assert '"find_text": "<redacted:str:21>"' in out
+        assert '"replace_text": "<redacted:str:13>"' in out
+        assert '"document_id": "doc-1"' in out
+        assert '"match_case": true' in out
+
+    def test_calendar_event_fields_redacted(self):
+        from core.audit import _redact
+
+        out = _redact(
+            {
+                "calendar_id": "primary",
+                "summary": "Disciplinary meeting with J. Doe",
+                "location": "Room 4, 12 Private Road",
+                "description": "HR notes",
+                "attendees": ["jane@example.com", "hr@example.com"],
+            }
+        )
+        for leak in ("Disciplinary", "Private Road", "HR notes", "jane@example.com"):
+            assert leak not in out, leak
+        assert '"attendees": "<redacted:list:2>"' in out
+        assert '"calendar_id": "primary"' in out
+
+    def test_contact_fields_redacted_at_depth(self):
+        from core.audit import _redact
+
+        out = _redact(
+            {
+                "given_name": "Jane",
+                "family_name": "Doe",
+                "phone": "07700 900123",
+                "contacts": [
+                    {"given_name": "John", "phones": ["07700 900456"]},
+                    {"display_name": "Jo Bloggs", "email": "jo@example.com"},
+                ],
+            }
+        )
+        for leak in ("Jane", "Doe", "900123", "John", "900456", "Jo Bloggs"):
+            assert leak not in out, leak
+        # A non-sensitive sibling at depth survives so the row stays useful.
+        assert "jo@example.com" in out
+
+    def test_from_name_and_filter_criteria_redacted(self):
+        from core.audit import _redact
+
+        out = _redact(
+            {
+                "to": "someone@example.com",
+                "from_name": "Chief Executive",
+                "criteria": {"from": "boss@example.com", "query": "salary"},
+                "action": {"addLabelIds": ["Label_1"]},
+            }
+        )
+        assert "Chief Executive" not in out
+        assert "boss@example.com" not in out and "salary" not in out
+        assert '"criteria": "<redacted:dict:2>"' in out
+        assert '"addLabelIds": ["Label_1"]' in out
+
+    def test_signature_tool_switches_still_clear(self):
+        """The signature tools' own keys are addresses and switches; the
+        registration test pins them out of SENSITIVE, and this change must
+        not widen the set onto them."""
+        from core.audit import SENSITIVE
+
+        for key in ("user_email", "send_as_email", "ou_path", "domain", "group_email"):
+            assert key not in SENSITIVE
 
 
 class TestAuditErrorScrub:

@@ -8,6 +8,7 @@ import logging
 import asyncio
 import json
 import copy
+import re
 from typing import List, Optional, Union
 
 from auth.service_decorator import require_google_service
@@ -36,6 +37,30 @@ from gsheets.sheets_helpers import (
 
 # Configure module logger
 logger = logging.getLogger(__name__)
+
+# A1 references: A1, A1:B2, A:C, 1:5, with optional $ anchors.
+_A1_CELL_RANGE = re.compile(
+    r"^\$?[A-Za-z]{1,3}\$?\d+(:\$?[A-Za-z]{1,3}\$?\d*)?$"
+    r"|^\$?[A-Za-z]{1,3}:\$?[A-Za-z]{1,3}$"
+    r"|^\d+:\d+$"
+)
+
+
+def is_bare_sheet_name(range_name: Optional[str]) -> bool:
+    """True when ``range_name`` names a whole tab: no '!' and no A1 reference.
+
+    "Sheet1" and "'Q3 Data'" are bare; "Sheet1!A1:B2", "A1:B2", "A:C" and
+    "1:5" are not. A blank range is treated as bare, since Sheets would apply
+    it to the first tab.
+    """
+    text = (range_name or "").strip()
+    if not text:
+        return True
+    if "!" in text:
+        return False
+    return _A1_CELL_RANGE.match(text) is None
+
+
 MAX_HYPERLINK_FETCH_CELLS = 5000
 
 
@@ -295,6 +320,7 @@ async def modify_sheet_values(
     values: Optional[Union[str, List[List[str]]]] = None,
     value_input_option: str = "USER_ENTERED",
     clear_values: bool = False,
+    confirm: bool = False,
 ) -> str:
     """
     Modifies values in a specific range of a Google Sheet - can write, update, or clear values.
@@ -306,6 +332,7 @@ async def modify_sheet_values(
         values (Optional[Union[str, List[List[str]]]]): 2D array of values to write/update. Can be a JSON string or Python list. Required unless clear_values=True.
         value_input_option (str): How to interpret input values ("RAW" or "USER_ENTERED"). Defaults to "USER_ENTERED".
         clear_values (bool): If True, clears the range instead of writing values. Defaults to False.
+        confirm (bool): Must be True to clear a whole tab, i.e. clear_values=True with a range_name that is a bare sheet name with no cell reference (for example "Sheet1"). Defaults to False.
 
     Returns:
         str: Confirmation message of the successful modification operation.
@@ -314,6 +341,16 @@ async def modify_sheet_values(
     logger.info(
         f"[modify_sheet_values] Invoked. Operation: {operation}, Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Range: {range_name}"
     )
+
+    if clear_values and is_bare_sheet_name(range_name) and not confirm:
+        raise UserInputError(
+            f"Refused: clearing range '{range_name}' would clear the whole tab, "
+            "because the range is a bare sheet name with no cell reference. "
+            "Clearing a whole tab needs confirm=True. Narrow the range to the "
+            f"cells you mean (for example '{range_name}!A2:D100'), or call "
+            "again with confirm=True if the whole tab should be emptied. "
+            "Version history is the only way back."
+        )
 
     # Parse values if it's a JSON string (MCP passes parameters as JSON strings)
     if values is not None and isinstance(values, str):
