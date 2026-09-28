@@ -65,6 +65,7 @@ def _unwrap(tool):
 
 preview_email_signature = _unwrap(signature_tools.preview_email_signature)
 get_email_signatures = _unwrap(signature_tools.get_email_signatures)
+get_email_signature_html = _unwrap(signature_tools.get_email_signature_html)
 set_email_signature = _unwrap(signature_tools.set_email_signature)
 apply_email_signatures = _unwrap(signature_tools.apply_email_signatures)
 audit_email_signatures = _unwrap(signature_tools.audit_email_signatures)
@@ -191,6 +192,7 @@ def _tool_calls():
     return [
         ("preview", lambda: preview_email_signature(ALICE)),
         ("get", lambda: get_email_signatures(ALICE)),
+        ("get_html", lambda: get_email_signature_html(ALICE)),
         ("set", lambda: set_email_signature(ALICE)),
         ("apply", lambda: apply_email_signatures(ou_path="/01 OTB")),
         ("audit", lambda: audit_email_signatures(ou_path="/01 OTB")),
@@ -639,6 +641,66 @@ class TestGetEmailSignatures:
         assert out.count("never_applied") == 2
         assert "unmanaged" in out
         assert "Ledger" not in sheets.tabs  # a read never creates the tab
+
+
+# ---------------------------------------------------------------------------
+# get_email_signature_html
+# ---------------------------------------------------------------------------
+
+
+RICH_SIGNATURE = (
+    '<table><tr><td><img src="https://www.otbgroup.co.uk/logo.png" width="120">'
+    "</td></tr><tr><td><b>Alice Able</b><br>"
+    "<img alt='x' src='https://cdn.example.com/a.gif'></td></tr></table>"
+)
+
+
+class TestGetEmailSignatureHtml:
+    @pytest.mark.asyncio
+    async def test_primary_by_default_with_hash_count_and_images(
+        self, runtime, as_owner, pool
+    ):
+        pool.mailboxes[ALICE].send_as[ALICE]["signature"] = RICH_SIGNATURE
+        out = await get_email_signature_html(ALICE)
+        assert f"(send-as {ALICE})" in out
+        assert f"hash: {signature_hash(RICH_SIGNATURE)}" in out
+        assert f"characters: {len(RICH_SIGNATURE)}" in out
+        assert "images: 2" in out
+        assert "   - https://www.otbgroup.co.uk/logo.png" in out
+        assert "   - https://cdn.example.com/a.gif" in out
+        assert out.rstrip().endswith(RICH_SIGNATURE)
+
+    @pytest.mark.asyncio
+    async def test_named_send_as_and_empty_signature(self, runtime, as_owner):
+        out = await get_email_signature_html(ALICE, send_as_email=ALICE_JIT)
+        assert f"(send-as {ALICE_JIT})" in out
+        assert "hash: (empty)" in out
+        assert "characters: 0" in out
+        assert "images: 0" in out
+        assert out.rstrip().endswith("(empty)")
+
+    @pytest.mark.asyncio
+    async def test_unmanaged_personal_alias_is_still_readable(
+        self, runtime, as_owner, pool
+    ):
+        pool.mailboxes[ALICE].send_as[ALICE_HOME]["signature"] = "<p>home</p>"
+        out = await get_email_signature_html(ALICE, send_as_email=ALICE_HOME)
+        assert "<p>home</p>" in out
+
+    @pytest.mark.asyncio
+    async def test_unknown_send_as_is_refused(self, runtime, as_owner):
+        with pytest.raises(UserInputError, match="no send-as address"):
+            await get_email_signature_html(ALICE, send_as_email="nobody@otbgroup.co.uk")
+
+    @pytest.mark.asyncio
+    async def test_reads_nothing_into_gmail_or_the_ledger(
+        self, runtime, as_owner, pool, sheets
+    ):
+        before_sig = dict(pool.mailboxes[ALICE].send_as[ALICE])
+        before_tabs = {k: [list(r) for r in v] for k, v in sheets.tabs.items()}
+        await get_email_signature_html(ALICE)
+        assert pool.mailboxes[ALICE].send_as[ALICE] == before_sig
+        assert sheets.tabs == before_tabs
 
 
 # ---------------------------------------------------------------------------

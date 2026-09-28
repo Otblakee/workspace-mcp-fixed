@@ -199,6 +199,7 @@ session: the tools accept only the OAuth 2.1 authentication paths.
    aliases (`oliver.blake@jit-logistics.com`, `otb@otbgroup.co.uk`) and every
    other user in `/01 OTB`. `oliver@blakefamily.uk` reads `unmanaged`. That
    is the expected picture; only `error` rows need attention here.
+   To see the HTML behind a hash, `get_email_signature_html(user_email=..., send_as_email=...)` prints it verbatim with its image URLs.
 
 ## 7. Rollout by OU
 

@@ -1,6 +1,6 @@
 """Wiring tests for the opt-in ``gsignatures`` service.
 
-Asserts that the six tools register, sit at the core tier of the
+Asserts that the seven tools register, sit at the core tier of the
 ``gsignatures`` section in ``core/tool_tiers.yaml``, that the service is
 opt-in (``main.OPT_IN_TOOLS``) and unblocked, that every write tool defaults
 to a dry run and needs a separate confirm, that ``--read-only`` removes the
@@ -31,6 +31,7 @@ PACKAGE = REPO_ROOT / "gsignatures"
 TOOLS = {
     "preview_email_signature",
     "get_email_signatures",
+    "get_email_signature_html",
     "set_email_signature",
     "apply_email_signatures",
     "audit_email_signatures",
@@ -67,10 +68,10 @@ class TestRegistration:
 
         return get_tool_components(server)
 
-    def test_all_six_tools_registered(self, registered):
+    def test_all_seven_tools_registered(self, registered):
         assert TOOLS <= set(registered)
 
-    def test_module_exposes_exactly_six_tools(self):
+    def test_module_exposes_exactly_seven_tools(self):
         seen = set()
         for name, obj in vars(signature_tools).items():
             if name.startswith("_") or not callable(obj):

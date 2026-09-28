@@ -703,7 +703,7 @@ Package `gsignatures/`: `engine.py` (pure: config, entity resolution,
 rendering, hashing, planning, drift), `sa_auth.py` (service-account auth),
 `clients.py` (thin Gmail and Directory wrappers), `ledger.py` (the Sheet),
 `operations.py` (the async orchestration, injected clients, no transport),
-`signature_tools.py` (the six MCP tools), `audit_cli.py` (the cron), plus
+`signature_tools.py` (the seven MCP tools; `get_email_signature_html` reads one send-as HTML back verbatim, read-only), `audit_cli.py` (the cron), plus
 `config/entities.yaml`, `templates/<CODE>/`, `TEMPLATES.md` and `RUNBOOK.md`.
 Tests in `tests/gsignatures/`; the fakes live in `tests/gsignatures/fakes.py`.
 

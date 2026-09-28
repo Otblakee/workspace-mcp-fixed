@@ -47,6 +47,7 @@ reaches the client instead of being flattened to a generic failure.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Awaitable, List, Optional, TypeVar
 
@@ -231,6 +232,41 @@ def _short(value: Optional[str]) -> str:
     return (value or "")[:12] or "(empty)"
 
 
+_IMG_SRC_RE = re.compile(
+    r"<img\b[^>]*?\bsrc\s*=\s*([\"'])(.*?)\1", re.IGNORECASE | re.DOTALL
+)
+
+
+def _img_srcs(html: str) -> List[str]:
+    """Every ``<img src>`` URL in document order, duplicates kept."""
+    return [m.group(2).strip() for m in _IMG_SRC_RE.finditer(html or "")]
+
+
+def _pick_send_as(send_as_list, user_email: str, send_as_email: Optional[str]):
+    """The Gmail send-as entry for ``send_as_email`` (the primary by default).
+
+    Works on the raw send-as list rather than the engine's plans so an
+    address the rules skip (personal alias, excluded address) can still be
+    read back.
+    """
+    if send_as_email and send_as_email.strip():
+        wanted = send_as_email.strip().lower()
+        for entry in send_as_list:
+            if str(entry.get("sendAsEmail") or "").lower() == wanted:
+                return entry
+        available = (
+            ", ".join(str(e.get("sendAsEmail") or "") for e in send_as_list) or "(none)"
+        )
+        raise UserInputError(
+            f"{user_email} has no send-as address {send_as_email.strip()}. "
+            f"Available: {available}."
+        )
+    for entry in send_as_list:
+        if entry.get("isPrimary"):
+            return entry
+    raise UserInputError(f"{user_email} has no primary send-as address in Gmail.")
+
+
 # ---------------------------------------------------------------------------
 # Implementations (called after the gate)
 # ---------------------------------------------------------------------------
@@ -329,6 +365,30 @@ async def _get(user_email: str, include_html: bool = False) -> str:
             ledger_row = ledger_latest.get((primary_email, address.lower()))
             status, reason = drift_status(plan, current_html, ledger_row)
             lines.append(f"   drift: {status} ({reason})")
+    return "\n".join(lines)
+
+
+async def _get_html(user_email: str, send_as_email: Optional[str]) -> str:
+    rt = build_runtime(need_ledger=False)
+    user, send_as_list, _ = await operations.plan_user(
+        rt.config, rt.directory, user_email, gmail_factory=rt.gmail_factory
+    )
+    entry = _pick_send_as(send_as_list, user_email, send_as_email)
+    address = str(entry.get("sendAsEmail") or "")
+    html = str(entry.get("signature") or "")
+    images = _img_srcs(html)
+    lines = [
+        f"Signature HTML for {user.get('primaryEmail') or user_email} "
+        f"(send-as {address})",
+        f"   displayName: {entry.get('displayName') or '(none)'}",
+        f"   hash: {signature_hash(html) if html else '(empty)'}",
+        f"   characters: {len(html)}",
+        f"   images: {len(images)}",
+    ]
+    lines.extend(f"   - {src}" for src in images)
+    lines.append("")
+    lines.append("HTML:")
+    lines.append(html if html else "(empty)")
     return "\n".join(lines)
 
 
@@ -706,6 +766,34 @@ async def get_email_signatures(user_email: str, include_html: bool = False) -> s
     await _require_allowed_caller()
     user_email = _require_email(user_email, "user_email")
     return await _translated(_get(user_email, include_html))
+
+
+@server.tool()
+@handle_http_errors("get_email_signature_html", service_type="gmail")
+async def get_email_signature_html(
+    user_email: str, send_as_email: Optional[str] = None
+) -> str:
+    """
+    Returns one send-as address's current signature HTML exactly as Gmail holds it.
+
+    Prints the display name, the signature hash, the character count, every
+    `<img src>` URL found in it, then the raw HTML. Works for any send-as
+    address on the account, managed or not, so a hand-made signature can be
+    read back before it is rebuilt as a template. Read-only: no Gmail write,
+    no ledger row. Caller must be on SIGNATURE_ADMIN_EMAILS.
+
+    Args:
+        user_email (str): The user's primary address. Required.
+        send_as_email (Optional[str]): One of the user's send-as addresses.
+            Defaults to the primary.
+
+    Returns:
+        str: Header lines (display name, hash, characters, images) and the
+            raw HTML, or '(empty)' when no signature is set.
+    """
+    await _require_allowed_caller()
+    user_email = _require_email(user_email, "user_email")
+    return await _translated(_get_html(user_email, send_as_email))
 
 
 @server.tool()
