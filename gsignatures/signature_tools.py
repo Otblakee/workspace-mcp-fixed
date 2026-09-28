@@ -279,7 +279,7 @@ async def _preview(user_email: str, send_as_email: Optional[str]) -> str:
     return "\n".join(lines)
 
 
-async def _get(user_email: str) -> str:
+async def _get(user_email: str, include_html: bool = False) -> str:
     rt = build_runtime(need_ledger=False)
     user, send_as_list, planned = await operations.plan_user(
         rt.config, rt.directory, user_email, gmail_factory=rt.gmail_factory
@@ -308,6 +308,8 @@ async def _get(user_email: str) -> str:
         lines.append(f"- {address}{flag_text}")
         lines.append(f"   displayName: {entry.get('displayName') or '(none)'}")
         lines.append(f"   current signature hash: {_short(current_hash)}")
+        if include_html:
+            lines.append("   current signature HTML: " + (current_html or "(empty)"))
         if plan is None:
             lines.append("   entity: (no plan)")
             continue
@@ -680,25 +682,30 @@ async def preview_email_signature(
 
 @server.tool()
 @handle_http_errors("get_email_signatures", is_read_only=True, service_type="gmail")
-async def get_email_signatures(user_email: str) -> str:
+async def get_email_signatures(user_email: str, include_html: bool = False) -> str:
     """
     Lists a user's send-as addresses with their current signature state.
 
     One block per address: primary and default flags, display name, the
     current signature hash (or '(empty)'), the resolved entity or the skip
     reason, the expected versions, and the drift status against the ledger.
-    Read-only. When the ledger cannot be read the block says 'ledger
-    unavailable' rather than failing. Caller must be on SIGNATURE_ADMIN_EMAILS.
+    With include_html=True each block also carries the current signature
+    HTML exactly as Gmail holds it, so an existing hand-made signature can
+    be read back and rebuilt as a template. Read-only. When the ledger
+    cannot be read the block says 'ledger unavailable' rather than failing.
+    Caller must be on SIGNATURE_ADMIN_EMAILS.
 
     Args:
         user_email (str): The user's primary address. Required.
+        include_html (bool): Also print each address's current signature
+            HTML. Defaults to False.
 
     Returns:
         str: One block per send-as address.
     """
     await _require_allowed_caller()
     user_email = _require_email(user_email, "user_email")
-    return await _translated(_get(user_email))
+    return await _translated(_get(user_email, include_html))
 
 
 @server.tool()
