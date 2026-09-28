@@ -4,6 +4,19 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## [1.16.3] - 2026-09-28
+
+### Added
+
+- `SIGNATURE_LEDGER_WRITER`: when set, the signature ledger is read and
+  written by impersonating that internal system account through domain-wide
+  delegation instead of as the service account itself. Needed because the
+  OTB Workspace sharing policy refuses to share the ledger Sheet with an
+  address outside the tenant, and a service account is outside the tenant.
+  The delegation entry gains a fourth scope,
+  `https://www.googleapis.com/auth/spreadsheets`, used only for this. Unset,
+  the previous behaviour is unchanged. Runbook, README and CLAUDE.md updated.
+
 ## [1.16.2] - 2026-09-26
 
 ### Fixed

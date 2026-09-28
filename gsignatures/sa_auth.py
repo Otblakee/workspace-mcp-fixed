@@ -65,6 +65,7 @@ DELEGATED_SCOPES: List[str] = [
     GMAIL_SETTINGS_BASIC_SCOPE,
     ADMIN_DIRECTORY_USER_READONLY_SCOPE,
     ADMIN_DIRECTORY_GROUP_MEMBER_READONLY_SCOPE,
+    SHEETS_SCOPE,
 ]
 
 # Scope subsets used per client. Gmail gets settings only; the Directory
@@ -81,6 +82,13 @@ ENV_SA_JSON = "SIGNATURE_SERVICE_ACCOUNT_JSON"
 ENV_DIRECTORY_ADMIN = "SIGNATURE_DIRECTORY_ADMIN"
 ENV_ADMIN_EMAILS = "SIGNATURE_ADMIN_EMAILS"
 ENV_LEDGER_SHEET_ID = "SIGNATURE_LEDGER_SHEET_ID"
+# Optional. When set, the ledger is written by impersonating this internal
+# account through domain-wide delegation instead of as the service account
+# itself. Needed when the Workspace sharing policy refuses to share the
+# ledger Sheet with an address outside the tenant (a service account is
+# outside the tenant). The Sheet is shared internally with this account as
+# Editor. Never a person: use a system account such as automated@.
+ENV_LEDGER_WRITER = "SIGNATURE_LEDGER_WRITER"
 
 DEFAULT_DIRECTORY_ADMIN = "oliver@otbgroup.co.uk"
 DEFAULT_ADMIN_EMAILS = "oliver@otbgroup.co.uk"
@@ -241,6 +249,40 @@ def build_sheets_as_service_account():
     """Sheets v4 client acting as the service account itself."""
     creds = service_account_credentials(LEDGER_SCOPES)
     return discovery.build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+def ledger_writer_email() -> Optional[str]:
+    """The internal account the ledger is written as, or ``None``.
+
+    Read from ``SIGNATURE_LEDGER_WRITER``. Unset means the service account
+    writes the ledger as itself (the Sheet must then be shared with the
+    service account's own address). Set but blank or not an address is a
+    configuration error.
+    """
+    if ENV_LEDGER_WRITER not in os.environ:
+        return None
+    value = os.environ[ENV_LEDGER_WRITER].strip().lower()
+    if not value or "@" not in value:
+        raise SignatureAuthError(
+            f"{ENV_LEDGER_WRITER} is set but is not an email address. Unset it "
+            "so the service account writes the ledger as itself, or set it to "
+            "the internal system account the ledger Sheet is shared with."
+        )
+    return value
+
+
+def build_sheets_for_ledger():
+    """Sheets v4 client for the ledger.
+
+    Impersonates ``SIGNATURE_LEDGER_WRITER`` through domain-wide delegation
+    when that is set (the Sheet is shared internally with that account), and
+    otherwise acts as the service account itself.
+    """
+    writer = ledger_writer_email()
+    if writer:
+        creds = delegated_credentials(writer, LEDGER_SCOPES)
+        return discovery.build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return build_sheets_as_service_account()
 
 
 # --- Identities and the caller allowlist --------------------------------------

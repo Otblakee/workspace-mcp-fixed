@@ -829,7 +829,19 @@ start-up banner prints no `SIGNATURE_*` value, and the service is in
 https://www.googleapis.com/auth/gmail.settings.basic
 https://www.googleapis.com/auth/admin.directory.user.readonly
 https://www.googleapis.com/auth/admin.directory.group.member.readonly
+https://www.googleapis.com/auth/spreadsheets
 ```
+
+**Ledger writer (v1.16.3).** The OTB sharing policy refuses to share a Sheet
+with an address outside the tenant, and a service account is outside the
+tenant, so the ledger cannot be shared with the service account directly.
+`SIGNATURE_LEDGER_WRITER=automated@otbgroup.co.uk` makes
+`sa_auth.build_sheets_for_ledger` impersonate that internal system account
+(hence the fourth delegation scope) and the Sheet is shared internally with
+it as Editor. Unset, the old behaviour stands: the service account writes as
+itself. Never set it to a person. Live on 2026-09-28: the key, the
+delegation and the Directory and Gmail reads all proved out; the ledger was
+the only 403.
 
 **Render env vars** (environment group `signatures`, attached to the web
 service and the cron): `SIGNATURE_SERVICE_ACCOUNT_FILE=/etc/secrets/signature-sa.json`,

@@ -35,10 +35,10 @@ Admin console path:
 Delegation > Add new**
 
 * Client ID: the service account's numeric Unique ID from step 1.
-* OAuth scopes: exactly these three, comma-separated, nothing else:
+* OAuth scopes: exactly these four, comma-separated, nothing else:
 
 ```
-https://www.googleapis.com/auth/gmail.settings.basic,https://www.googleapis.com/auth/admin.directory.user.readonly,https://www.googleapis.com/auth/admin.directory.group.member.readonly
+https://www.googleapis.com/auth/gmail.settings.basic,https://www.googleapis.com/auth/admin.directory.user.readonly,https://www.googleapis.com/auth/admin.directory.group.member.readonly,https://www.googleapis.com/auth/spreadsheets
 ```
 
 They are `gsignatures.sa_auth.DELEGATED_SCOPES`, in that order. The list in
@@ -51,6 +51,7 @@ What each one is for:
 | `gmail.settings.basic` | `users.settings.sendAs.list/get/patch` (the signature only) | each user |
 | `admin.directory.user.readonly` | `users.get` / `users.list` for name, title, mobile, OU | the Directory admin (`SIGNATURE_DIRECTORY_ADMIN`) |
 | `admin.directory.group.member.readonly` | `members.list` for group scopes | the Directory admin |
+| `spreadsheets` | reading and appending the ledger Sheet | the ledger writer (`SIGNATURE_LEDGER_WRITER`, an internal system account); unused when that is unset |
 
 **The Gmail sharing settings scope (`settings.sharing`) is deliberately NOT granted.** Gmail's API puts
 send-as updates under two scopes. The basic one is enough to change a
@@ -70,9 +71,17 @@ re-check the client ID and scope list once it has failed for more than a day.
 1. Create a Google Sheet named **OTB_LOG_SignatureLedger_2026-09-25_v1** in
    the IT records folder (the same area as the MCP audit log). Leave it
    empty; the `Ledger` tab and its header are created on first write.
-2. Share it as **Editor** with the service account's email address from
-   step 1. The ledger is written as the service account itself, not as any
-   user, so this share is the only way it can write.
+2. Share it as **Editor** with the account that writes it. Two choices:
+   * **Internal writer (used at OTB).** Set `SIGNATURE_LEDGER_WRITER` to an
+     internal system account (OTB uses `automated@otbgroup.co.uk`) and share
+     the Sheet with that account. The service account impersonates it
+     through delegation using the `spreadsheets` scope. Use this when the
+     Workspace sharing policy refuses external addresses, which it does at
+     OTB: a service account is outside the tenant, so the direct share is
+     blocked. Never point this at a person.
+   * **Service account itself.** Leave `SIGNATURE_LEDGER_WRITER` unset and
+     share the Sheet with the service account's own email from step 1. Only
+     possible where external sharing is allowed.
 3. Note the Sheet ID from the URL for step 4.
 
 The ledger is append-only by convention. Every live apply adds two rows per
@@ -107,6 +116,7 @@ Environment variables:
 | `SIGNATURE_DIRECTORY_ADMIN` | `oliver@otbgroup.co.uk` (the admin impersonated for Directory reads). Must be a Workspace super admin, or hold an admin role with Users: Read and Groups: Read; the Admin SDK authorises each call by this user's privileges, so a non-admin address makes every Directory call fail with 403 |
 | `SIGNATURE_ADMIN_EMAILS` | `oliver@otbgroup.co.uk` (comma-separated allowlist of who may call the tools) |
 | `SIGNATURE_LEDGER_SHEET_ID` | the Sheet ID from step 3 |
+| `SIGNATURE_LEDGER_WRITER` | `automated@otbgroup.co.uk` (the internal account the Sheet is shared with; omit to write as the service account itself) |
 
 The web service prints none of these at start-up, by design. Check them in
 the Render dashboard, not the logs.

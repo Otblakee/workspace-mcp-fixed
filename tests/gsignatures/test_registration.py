@@ -236,13 +236,14 @@ class TestScopes:
             scopes.BASE_SCOPES
         )
 
-    def test_delegated_scopes_are_the_three_documented(self):
+    def test_delegated_scopes_are_the_four_documented(self):
         from gsignatures.sa_auth import DELEGATED_SCOPES
 
         assert DELEGATED_SCOPES == [
             "https://www.googleapis.com/auth/gmail.settings.basic",
             "https://www.googleapis.com/auth/admin.directory.user.readonly",
             "https://www.googleapis.com/auth/admin.directory.group.member.readonly",
+            "https://www.googleapis.com/auth/spreadsheets",
         ]
 
 
