@@ -4,6 +4,24 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## 1.17.3 (2026-09-28)
+
+- **Fix: fresh OAuth sign-ins consented to identity scopes only.** FastMCP 4
+  fills `WWW-Authenticate: Bearer scope="..."` on every 401 from
+  `required_scopes`, which this server keeps identity-only on purpose
+  (v1.11.1) while carrying the full enabled-service list as `valid_scopes`.
+  claude.ai requests exactly the scopes the challenge names, so any sign-in
+  after the 1.16.0 upgrade asked Google for openid, email and profile only
+  and every Workspace tool then failed with "OAuth credentials lack required
+  scopes". Tokens issued under FastMCP 3 kept working until replaced, which
+  is why it surfaced on 2026-09-28 when the connector was reconnected.
+  FastMCP 3 sent no scope hint at all. New `auth/google_provider.py`
+  (`WorkspaceGoogleProvider`) widens the challenge to `valid_scopes`; the
+  verifier gate, metadata and per-tool scope checks are unchanged.
+  `tests/test_oauth_challenge_scopes.py` drives a real 401 through the
+  FastMCP HTTP app and asserts the header. **Every connected client must
+  reconnect once after this deploy** to replace its narrow token.
+
 ## 1.17.2 (2026-09-28)
 
 - New tool `get_email_signature_html(user_email, send_as_email=None)`:
