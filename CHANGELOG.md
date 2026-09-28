@@ -4,6 +4,13 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## 1.17.1 (2026-09-28)
+
+- `get_email_signatures` gains `include_html` (default False). When True each
+  send-as block also prints the current signature HTML exactly as Gmail holds
+  it, so an existing hand-made signature can be read back and rebuilt as a
+  template. The default output is unchanged. Read-only, same caller gate.
+
 ## [1.17.0] - 2026-09-28
 
 ### Changed

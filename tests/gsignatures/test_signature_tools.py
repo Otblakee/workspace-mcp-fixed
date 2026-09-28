@@ -601,6 +601,17 @@ class TestGetEmailSignatures:
         assert "template 1.0.0" in out
 
     @pytest.mark.asyncio
+    async def test_html_is_hidden_by_default_and_shown_on_request(
+        self, runtime, as_owner
+    ):
+        out = await get_email_signatures(ALICE)
+        assert "current signature HTML" not in out
+        assert OLD_PRIMARY not in out
+        out = await get_email_signatures(ALICE, include_html=True)
+        assert "current signature HTML: " + OLD_PRIMARY in out
+        assert "current signature HTML: (empty)" in out
+
+    @pytest.mark.asyncio
     async def test_ledger_unavailable_is_reported_not_raised(
         self, runtime, as_owner, sheets
     ):
