@@ -958,6 +958,21 @@ capabilities, and `serverInfo.version` reading 4.0.10.
 nothing version-specific and were not changed. `fastmcp.json` still uses the
 v1 schema and `fastmcp_server.py` as entrypoint.
 
+## OAuth challenge scopes (v1.17.3)
+
+FastMCP 4 puts `scope="..."` in the 401 `WWW-Authenticate` header, filled
+from `required_scopes`. This server keeps `required_scopes` identity-only
+(v1.11.1) and carries the full enabled-service list as `valid_scopes`, and
+claude.ai requests exactly what the challenge names, so a fresh sign-in on
+FastMCP 4 consented to identity only and every OAuth-token tool failed
+(2026-09-28, triggered by a connector reconnect; FastMCP 3 sent no hint).
+`auth/google_provider.WorkspaceGoogleProvider.get_challenge_scopes` returns
+`valid_scopes` for the default challenge; the gate, the metadata and the
+per-tool checks are unchanged. Rule for future auth upgrades: verify a
+**fresh** sign-in end to end (the scopes in the `/authorize` request and in
+Google's callback), not just that the redirect happens. A token that
+survived on the disk proves nothing about the new flow.
+
 ## Live battery fixes (v1.16.1)
 
 After 1.16.0 went live, every exposed tool was called against the deployed

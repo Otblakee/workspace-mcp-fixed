@@ -218,7 +218,7 @@ class TestOAuthProxyDiskStoreCap:
                 ),
                 patch("auth.oauth_config.get_oauth_config", return_value=config),
                 patch.object(disk_mod, "DiskStore", fake_disk_store),
-                patch.object(core_server, "GoogleProvider", fake_provider_cls),
+                patch.object(core_server, "WorkspaceGoogleProvider", fake_provider_cls),
                 patch.object(core_server, "set_auth_provider", MagicMock()),
             ):
                 core_server.configure_server_for_http()

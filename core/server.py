@@ -15,6 +15,8 @@ from starlette.requests import Request
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
 
+from auth.google_provider import WorkspaceGoogleProvider
+
 from auth.oauth21_session_store import get_oauth21_session_store, set_auth_provider
 from auth.google_auth import handle_auth_callback, start_auth_flow, check_client_secrets
 from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
@@ -562,8 +564,14 @@ def configure_server_for_http():
                 # without it can't be mapped to a user regardless of the gate.
                 from auth.scopes import BASE_SCOPES
 
+                # The 401 challenge must still name the FULL scope set:
+                # FastMCP 4 fills WWW-Authenticate scope="..." from
+                # required_scopes and clients request exactly that, so the
+                # stock provider made a fresh sign-in consent to identity
+                # only (2026-09-28 outage). WorkspaceGoogleProvider widens
+                # the challenge to valid_scopes; the gate is unchanged.
                 identity_gate_scopes = sorted(set(BASE_SCOPES))
-                provider = GoogleProvider(
+                provider = WorkspaceGoogleProvider(
                     client_id=config.client_id,
                     client_secret=config.client_secret,
                     base_url=config.get_oauth_base_url(),
