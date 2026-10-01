@@ -973,6 +973,20 @@ per-tool checks are unchanged. Rule for future auth upgrades: verify a
 Google's callback), not just that the redirect happens. A token that
 survived on the disk proves nothing about the new flow.
 
+## Early-expiry refresh window (v1.17.4)
+
+google-auth's `Credentials.expired` is true 3 min 45 s before the real
+expiry (`_helpers.REFRESH_THRESHOLD`) and the API client refreshes on its
+own inside the request. The per-request OAuth 2.1 credentials carry
+`refresh_token=None`, so a call in that window raised `RefreshError` and the
+handler said "sign in again" (18, 23 and 30 September 2026; pre-dates the
+FastMCP 4 upgrade). `WorkspaceGoogleProvider` defaults
+`token_expiry_threshold_seconds=300` so the proxy's `load_access_token`
+refreshes the upstream token first; `tests/test_oauth_challenge_scopes.py`
+pins the default above google-auth's threshold. The handler branch for the
+"do not contain the necessary fields" `RefreshError` now returns a retry
+message (`tests/test_token_refresh_window.py`).
+
 ## Live battery fixes (v1.16.1)
 
 After 1.16.0 went live, every exposed tool was called against the deployed

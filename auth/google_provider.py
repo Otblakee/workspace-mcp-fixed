@@ -22,10 +22,25 @@ from typing import List, Optional
 from fastmcp.server.auth.providers.google import GoogleProvider
 
 
+# google-auth treats a token as expired REFRESH_THRESHOLD (3 min 45 s) before
+# its real expiry and tries to refresh it inside the API client. The per-request
+# credentials this server builds carry no refresh token (the proxy owns
+# refreshing), so any call in that last window raised RefreshError and the tool
+# failed with "sign in again" (seen 18, 23 and 30 September 2026). With this
+# threshold the proxy refreshes the upstream Google token itself whenever a
+# request arrives within five minutes of expiry, so google-auth never sees a
+# stale token. Five minutes clears google-auth's 3 min 45 s with margin.
+DEFAULT_TOKEN_EXPIRY_THRESHOLD_SECONDS = 300
+
+
 class WorkspaceGoogleProvider(GoogleProvider):
-    """GoogleProvider that challenges with the full valid scope set."""
+    """GoogleProvider that challenges with the full valid scope set and
+    refreshes the upstream token before google-auth's early-expiry window."""
 
     def __init__(self, *args, valid_scopes: Optional[List[str]] = None, **kwargs):
+        kwargs.setdefault(
+            "token_expiry_threshold_seconds", DEFAULT_TOKEN_EXPIRY_THRESHOLD_SECONDS
+        )
         super().__init__(*args, valid_scopes=valid_scopes, **kwargs)
         self._workspace_challenge_scopes: List[str] = list(
             valid_scopes or self.required_scopes or []

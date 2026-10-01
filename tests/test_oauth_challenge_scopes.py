@@ -73,6 +73,38 @@ class TestWorkspaceGoogleProvider:
         assert sorted(p.challenge_scopes) == sorted(IDENTITY)
 
 
+class TestExpiryThreshold:
+    """The proxy must refresh the upstream Google token before google-auth's
+    3 min 45 s early-expiry window, or calls in that window fail with a bogus
+    "sign in again" (seen 18, 23 and 30 September 2026)."""
+
+    def test_default_threshold_clears_google_auth_window(self, provider):
+        from datetime import timedelta
+
+        from google.auth import _helpers
+
+        from auth.google_provider import DEFAULT_TOKEN_EXPIRY_THRESHOLD_SECONDS
+
+        assert provider._token_expiry_threshold_seconds == (
+            DEFAULT_TOKEN_EXPIRY_THRESHOLD_SECONDS
+        )
+        assert timedelta(seconds=DEFAULT_TOKEN_EXPIRY_THRESHOLD_SECONDS) > (
+            _helpers.REFRESH_THRESHOLD
+        )
+
+    def test_explicit_threshold_is_honoured(self):
+        from auth.google_provider import WorkspaceGoogleProvider
+
+        p = WorkspaceGoogleProvider(
+            client_id="x.apps.googleusercontent.com",
+            client_secret="s",
+            base_url="https://mcp.example.test",
+            required_scopes=IDENTITY,
+            token_expiry_threshold_seconds=42,
+        )
+        assert p._token_expiry_threshold_seconds == 42
+
+
 class TestLive401Challenge:
     def test_unauthenticated_mcp_request_is_challenged_with_full_scopes(self, provider):
         from fastmcp import FastMCP
