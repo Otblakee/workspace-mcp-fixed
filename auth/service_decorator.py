@@ -534,6 +534,14 @@ def _resolve_scopes(scopes: Union[str, List[str]]) -> List[str]:
     return resolved
 
 
+MISSING_REFRESH_FIELDS_PHRASE = "do not contain the necessary fields"
+
+
+def _is_missing_refresh_fields_error(error: Exception) -> bool:
+    """google-auth's RefreshError for credentials with no refresh_token."""
+    return MISSING_REFRESH_FIELDS_PHRASE in str(error)
+
+
 def _handle_token_refresh_error(
     error: RefreshError, user_email: str, service_name: str
 ) -> str:
@@ -592,6 +600,25 @@ def _handle_token_refresh_error(
             f"2. Complete the authentication flow in your browser\n"
             f"3. Retry your original command\n\n"
             f"The application will automatically use the new credentials once authentication is complete."
+        )
+    elif _is_missing_refresh_fields_error(error):
+        # The per-request OAuth 2.1 credentials carry no refresh token (the
+        # proxy owns refreshing). google-auth tried to refresh anyway because
+        # the token was inside its early-expiry window. The proxy's expiry
+        # threshold (auth/google_provider.py) is meant to stop this happening;
+        # if it does, the right action is a retry, never a fresh sign-in.
+        logger.warning(
+            "Access token for %s was inside google-auth's early-expiry window and "
+            "the per-request credentials hold no refresh token; the call should "
+            "be retried, not re-authorised: %s",
+            user_email,
+            error,
+        )
+        return (
+            f"Google access token for {user_email} is about to expire and this "
+            "server does not refresh it directly. Retry the call now; your MCP "
+            "client refreshes the token automatically. If it still fails after "
+            "a minute, sign in again via your MCP client's OAuth 2.1 flow."
         )
     else:
         # Handle other types of refresh errors

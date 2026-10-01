@@ -4,6 +4,19 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## 1.17.4 (2026-10-01)
+
+- **Fix: calls in the last 3 min 45 s of each access-token hour failed with
+  "sign in again".** google-auth treats a token as expired that long before
+  its real expiry and refreshes it inside the API client; the per-request
+  OAuth 2.1 credentials carry no refresh token (the proxy owns refreshing),
+  so the refresh raised and the tool failed. Seen on 18, 23 and 30 September
+  2026, on FastMCP 3 and 4 alike. `WorkspaceGoogleProvider` now defaults
+  `token_expiry_threshold_seconds` to 300, so the proxy refreshes the
+  upstream Google token itself whenever a request arrives within five
+  minutes of expiry. If the window is ever hit anyway, the error now says
+  to retry rather than to re-authorise.
+
 ## 1.17.3 (2026-09-28)
 
 - **Fix: fresh OAuth sign-ins consented to identity scopes only.** FastMCP 4
