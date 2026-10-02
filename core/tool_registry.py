@@ -9,6 +9,7 @@ import logging
 from typing import Set, Optional, Callable
 
 from auth.oauth_config import is_oauth21_enabled
+from core.tool_profiles import get_tool_profile, profile_excludes
 from auth.scopes import is_read_only_mode, get_all_read_only_scopes
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,13 @@ def filter_server_tools(server):
     """Remove disabled tools from the server after registration."""
     enabled_tools = get_enabled_tools()
     oauth21_enabled = is_oauth21_enabled()
-    if enabled_tools is None and not oauth21_enabled and not is_read_only_mode():
+    profile = get_tool_profile()
+    if (
+        enabled_tools is None
+        and not oauth21_enabled
+        and not is_read_only_mode()
+        and profile == "all"
+    ):
         return
 
     tools_removed = 0
@@ -120,6 +127,21 @@ def filter_server_tools(server):
         for tool_name in tool_components:
             if not is_tool_enabled(tool_name):
                 tools_to_remove.add(tool_name)
+
+    # 1b. Profile filtering (everyday / admin connector split). Only ever
+    #     removes; a tool the tier already dropped stays dropped.
+    if profile != "all":
+        for tool_name in tool_components:
+            if tool_name not in tools_to_remove and profile_excludes(
+                tool_name, profile
+            ):
+                tools_to_remove.add(tool_name)
+        logger.info(
+            "Tool profile '%s': %d of %d registered tools excluded",
+            profile,
+            sum(1 for t in tool_components if profile_excludes(t, profile)),
+            len(tool_components),
+        )
 
     # 2. OAuth 2.1 filtering
     if oauth21_enabled and "start_google_auth" in tool_components:

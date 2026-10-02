@@ -40,6 +40,7 @@ from gdocs.docs_structure import (
     max_insertion_index,
 )
 from gdocs.docs_tables import extract_table_as_data
+from gdrive.drive_helpers import build_media_upload
 from gdocs.docs_markdown import (
     convert_doc_to_markdown,
     format_comments_inline,
@@ -537,10 +538,9 @@ async def create_doc(
         drive_service = await _create_doc_drive_service(
             user_google_email=user_google_email
         )
-        media = MediaIoBaseUpload(
-            io.BytesIO(content.encode("utf-8")),
-            mimetype="text/markdown",
-            resumable=True,
+        content_bytes = content.encode("utf-8")
+        media = build_media_upload(
+            io.BytesIO(content_bytes), "text/markdown", len(content_bytes)
         )
         file_metadata = {
             "name": title,
@@ -1754,18 +1754,6 @@ async def update_paragraph_style(
         # Create a bulleted list
         update_paragraph_style(document_id="...", start_index=1, end_index=50,
                                list_type="UNORDERED")
-
-        # Create a nested numbered list item
-        update_paragraph_style(document_id="...", start_index=1, end_index=30,
-                               list_type="ORDERED", list_nesting_level=1)
-
-        # Apply H2 heading with custom spacing
-        update_paragraph_style(document_id="...", start_index=1, end_index=30,
-                               heading_level=2, space_above=18, space_below=12)
-
-        # Center-align a paragraph with double spacing
-        update_paragraph_style(document_id="...", start_index=1, end_index=50,
-                               alignment="CENTER", line_spacing=2.0)
     """
     logger.info(
         f"[update_paragraph_style] Doc={document_id}, Range: {start_index}-{end_index}"

@@ -22,7 +22,7 @@ from urllib.request import url2pathname
 from pathlib import Path
 
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload
 
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
@@ -43,6 +43,7 @@ from gdrive.drive_helpers import (
     format_permission_info,
     get_drive_image_url,
     get_holding_folder_id,
+    build_media_upload,
     resolve_drive_item,
     resolve_folder_id,
     validate_expiration_time,
@@ -61,6 +62,35 @@ MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB safety limit for URL downloa
 MAX_BASE64_INPUT_BYTES = 64 * 1024 * 1024
 # Decode base64 in 4 MB ASCII windows (each yields ~3 MB binary).
 _BASE64_DECODE_CHUNK = 4 * 1024 * 1024
+
+
+def _decode_base64_into(payload: str, sink) -> int:
+    """Decode standard base64 ``payload`` into ``sink`` in chunks; return byte count.
+
+    Synchronous on purpose: ``create_drive_file`` runs it in a worker thread.
+    Raises ``ValueError`` / ``binascii.Error`` on malformed input exactly as
+    ``base64.b64decode(validate=True)`` does.
+    """
+    total = 0
+    for i in range(0, len(payload), _BASE64_DECODE_CHUNK):
+        decoded = base64.b64decode(payload[i : i + _BASE64_DECODE_CHUNK], validate=True)
+        sink.write(decoded)
+        total += len(decoded)
+    return total
+
+
+def _stream_size(stream) -> Optional[int]:
+    """Byte length of a seekable stream (position preserved), or None."""
+    try:
+        pos = stream.tell()
+        stream.seek(0, io.SEEK_END)
+        size = stream.tell()
+        stream.seek(pos)
+        return size
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
 # get_drive_file_download_url buffers the whole file in memory (plus a
 # base64 round-trip), so it must refuse very large files up-front and
 # direct callers to the streaming download_drive_file tool instead.
@@ -735,10 +765,10 @@ async def create_drive_file(
                     f"[create_drive_file] Streaming {total_bytes} bytes from local file"
                 )
 
-                media = MediaIoBaseUpload(
+                media = build_media_upload(
                     file_handle,
-                    mimetype=mime_type,
-                    resumable=True,
+                    mime_type,
+                    total_bytes,
                     chunksize=UPLOAD_CHUNK_SIZE_BYTES,
                 )
 
@@ -791,10 +821,10 @@ async def create_drive_file(
                         )
 
                     spool.seek(0)
-                    media = MediaIoBaseUpload(
+                    media = build_media_upload(
                         spool,
-                        mimetype=mime_type,
-                        resumable=True,
+                        mime_type,
+                        total_bytes,
                         chunksize=UPLOAD_CHUNK_SIZE_BYTES,
                     )
 
@@ -851,10 +881,10 @@ async def create_drive_file(
                     # Reset file pointer to beginning for upload
                     temp_file.seek(0)
 
-                    media = MediaIoBaseUpload(
+                    media = build_media_upload(
                         temp_file,
-                        mimetype=mime_type,
-                        resumable=True,
+                        mime_type,
+                        total_bytes,
                         chunksize=UPLOAD_CHUNK_SIZE_BYTES,
                     )
 
@@ -894,11 +924,11 @@ async def create_drive_file(
         total_bytes = 0
         try:
             try:
-                for i in range(0, len(base64_content), _BASE64_DECODE_CHUNK):
-                    chunk = base64_content[i : i + _BASE64_DECODE_CHUNK]
-                    decoded = base64.b64decode(chunk, validate=True)
-                    spool.write(decoded)
-                    total_bytes += len(decoded)
+                # Decode in a worker thread: at the 64 MB cap the loop would
+                # otherwise sit on this for about 150 ms plus the spool writes.
+                total_bytes = await asyncio.to_thread(
+                    _decode_base64_into, base64_content, spool
+                )
             except (ValueError, TypeError) as e:
                 spool.close()
                 raise Exception(
@@ -909,10 +939,10 @@ async def create_drive_file(
                 f"[create_drive_file] Decoded {total_bytes} bytes from base64_content"
             )
 
-            media = MediaIoBaseUpload(
+            media = build_media_upload(
                 spool,
-                mimetype=mime_type,
-                resumable=True,
+                mime_type,
+                total_bytes,
                 chunksize=UPLOAD_CHUNK_SIZE_BYTES,
             )
 
@@ -936,7 +966,7 @@ async def create_drive_file(
             service.files()
             .create(
                 body=file_metadata,
-                media_body=MediaIoBaseUpload(media, mimetype=mime_type, resumable=True),
+                media_body=build_media_upload(media, mime_type, len(file_data)),
                 fields="id, name, webViewLink",
                 supportsAllDrives=True,
             )
@@ -1464,10 +1494,10 @@ async def import_to_google_doc(
 
     try:
         # Upload with conversion
-        media = MediaIoBaseUpload(
+        media = build_media_upload(
             source_stream,
-            mimetype=source_mime_type,  # Source format
-            resumable=True,
+            source_mime_type,  # Source format
+            _stream_size(source_stream),
             chunksize=UPLOAD_CHUNK_SIZE_BYTES,
         )
 

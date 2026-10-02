@@ -62,6 +62,9 @@ logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 # (e.g. tokeninfo?access_token=ya29.xxx)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+# FastMCP 4 talks to Google through httpx2, which logs under its own name.
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logging.getLogger("httpcore2").setLevel(logging.WARNING)
 
 # Reload OAuth configuration after env vars loaded
 reload_oauth_config()

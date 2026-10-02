@@ -775,8 +775,12 @@ def require_google_service(
                     service.close()
                 # googleapiclient's Resource tree holds circular refs that
                 # service.close() doesn't break. Without this sweep, memory
-                # grows on every call.
-                gc.collect()
+                # grows on every call. The tree is young-generation garbage,
+                # so a generation-1 sweep frees it in well under a
+                # millisecond; a full collection walked every object in the
+                # process (about 40 ms with the tool surface loaded) on the
+                # event loop after every tool call.
+                gc.collect(1)
 
         # Set the wrapper's signature to the one without 'service'
         wrapper.__signature__ = wrapper_sig
@@ -918,8 +922,9 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
                     finally:
                         # Match single-service decorator: sweep after services
                         # are closed (via ExitStack callbacks) to release the
-                        # googleapiclient Resource cycles.
-                        gc.collect()
+                        # googleapiclient Resource cycles. Generation 1 is
+                        # enough; see the single-service wrapper.
+                        gc.collect(1)
                 except RefreshError as e:
                     # Handle token refresh errors gracefully
                     error_message = _handle_token_refresh_error(

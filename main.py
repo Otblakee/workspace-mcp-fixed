@@ -39,6 +39,9 @@ logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 # (e.g. tokeninfo?access_token=ya29.xxx)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+# FastMCP 4 talks to Google through httpx2, which logs under its own name.
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logging.getLogger("httpcore2").setLevel(logging.WARNING)
 
 reload_oauth_config()
 
@@ -185,6 +188,17 @@ def main():
         "--tool-tier",
         choices=["core", "extended", "complete"],
         help="Load tools based on tier level. Can be combined with --tools to filter services.",
+    )
+    parser.add_argument(
+        "--tool-profile",
+        choices=["all", "everyday", "admin"],
+        default=None,
+        help=(
+            "Which slice of the tool surface this deployment exposes: 'everyday' "
+            "removes the admin, migration, shared-drive build, banner and signature "
+            "tools; 'admin' keeps only those; 'all' (default) applies no profile. "
+            "See core/tool_profiles.py."
+        ),
     )
     parser.add_argument(
         "--transport",
@@ -396,6 +410,18 @@ def main():
         tools_to_import = [t for t in tool_imports.keys() if t not in OPT_IN_TOOLS]
         # Don't filter individual tools when importing all
         set_enabled_tool_names(None)
+
+    # Profile filtering runs in filter_server_tools after registration, so a
+    # bad name fails here, before any module is imported.
+    from core.tool_profiles import set_tool_profile
+
+    try:
+        active_profile = set_tool_profile(args.tool_profile)
+    except ValueError as exc:
+        safe_print(f"❌ {exc}")
+        sys.exit(2)
+    if active_profile != "all":
+        safe_print(f"   🎛️  Tool profile: {active_profile}")
 
     wrap_server_tool_method(server)
 
