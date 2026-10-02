@@ -1097,3 +1097,77 @@ OTB token has it, a send-only client would get a 403 on that path. Render
 cron `otb-signature-audit` (Mondays 07:00 UTC, fixed all year by the owner's
 choice) audits only; it needs the `signature-sa.json` secret file added in the
 dashboard.
+
+## Latency trims and tool profiles (v1.18.0)
+
+Review of the live service on 2026-10-01 (Render logs and metrics, a code
+path audit, outside research). Findings and the parked items are in
+`FOLLOWUPS.md`, "Latency review of the live service". The server was not the
+main wait (p50 about 0.2 s, CPU under 2%), but five fixed costs sat on every
+call. Tests: `tests/test_latency_trim.py`, `tests/test_tool_profiles.py`.
+
+**Token verification cache.** The OAuth proxy verifies the upstream Google
+token on every POST /mcp by calling tokeninfo and then userinfo, with a new
+HTTP client each time: 150 to 290 ms per request. This is FastMCP's stock
+`GoogleTokenVerifier` and it did the same under FastMCP 3; 4.x only moved the
+calls to the `httpx2` logger, which is why they appeared in the Render log
+after the upgrade. `auth/google_provider.CachedGoogleTokenVerifier` wraps it
+with FastMCP's own `TokenCache` (the pattern its GitHub provider ships):
+successful results only, keyed by SHA-256 of the token, TTL
+`OAUTH_VERIFY_CACHE_TTL_S` (default 300, `0` disables), never past the
+token's expiry, and misses share one lazily built `httpx2.AsyncClient`.
+`WorkspaceGoogleProvider._install_cached_verifier` swaps it in after
+`super().__init__`, keeping the stock verifier's scopes, timeout and
+audience. A refreshed upstream token is a new key, so a refresh is always
+re-verified. Security trade: a Google token revoked mid-window still passes
+the MCP gate for up to the TTL. Google API tools fail anyway (Google refuses
+the token); the signature tools only check the caller's email, so they are
+the exposure. Set the TTL to 60 if that matters more than the round trips.
+
+**`gc.collect(1)`, not `gc.collect()`.** Three sites: both wrappers in
+`auth/service_decorator.py` and the per-user flush in `core/audit.py`. The
+googleapiclient Resource cycle the comment guards against is young
+generation; a generation-1 sweep frees it (checked with a weakref) in under
+a millisecond, where the full sweep walked about 180k objects on the event
+loop after every call.
+
+**Uploads.** `drive_helpers.resolve_folder_id` returns `root` without a
+`files.get`. `drive_helpers.build_media_upload(stream, mime, size)` picks
+multipart for payloads up to `SIMPLE_UPLOAD_MAX_BYTES` (5 MB, Google's own
+threshold) and resumable above it, and is used by every upload branch in
+`create_drive_file`, by `import_to_google_doc` and by `create_doc`'s markdown
+path. `create_drive_upload_session` is unchanged: resumable is its purpose.
+Base64 decoding runs in `asyncio.to_thread` via `_decode_base64_into`.
+
+**SSL context cache.** `core/ssl_context_cache.py` wraps
+`httplib2._build_ssl_context` in an LRU cache; `core/server.py` installs it
+at import. An `ssl.SSLContext` is safe to share across threads once built.
+The TCP and TLS handshake per call remains (parked).
+
+**Tool profiles.** `core/tool_profiles.py` defines `ADMIN_TOOLS` (Directory
+reads, the three group writes, the seven signature tools, shared-drive
+create/update/permission tools, the migration engine bar
+`get_drive_file_metadata`, the four banner tools). `--tool-profile everyday`
+removes them, `admin` keeps only them, `all` (default) does nothing. Env
+`TOOL_PROFILE` feeds the flag through the Dockerfile CMD like `TOOL_TIER`.
+Enforcement is in `core.tool_registry.filter_server_tools`, after tier
+filtering and before read-only filtering, and only ever removes.
+`list_shared_drives` and `create_shortcut` stay everyday because the Drive
+routing skill files into hub drives with them.
+
+**Render order of operations for the split (not done by this release):**
+
+1. Create a second web service from this repo, e.g. `otb-workspace-admin-mcp`
+   (starter plan is enough), with its own 1 GB disk at `/data`, the four
+   `/data` env vars from `render.yaml`, the same secrets, `TOOLS=drive gadmin
+   gsignatures`, `TOOL_PROFILE=admin`, `MCP_ENABLE_OAUTH21=true`, the audit
+   vars and the `signatures` environment group.
+2. Add `https://<admin-host>/oauth2callback` to the Google OAuth client's
+   redirect URIs and set `GOOGLE_OAUTH_REDIRECT_URI` on the new service.
+3. Connect it in claude.ai as a second connector and sign in once.
+4. Only then set `TOOL_PROFILE=everyday` on `otb-workspace-mcp` and drop
+   `gadmin` and `gsignatures` from its `TOOLS`. Doing step 4 first removes
+   those tools with nowhere to go.
+5. `TOOL_TIER` stays unset on the everyday service: complete-tier tools such
+   as `get_gmail_threads_content_batch` are in daily use.
+

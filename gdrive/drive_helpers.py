@@ -225,6 +225,38 @@ def build_drive_list_params(
 
 SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+ROOT_FOLDER_ALIAS = "root"
+
+# Google's guidance: multipart (one request) for media up to 5 MB, resumable
+# above. A resumable upload is two sequential requests (open the session,
+# then PUT the bytes) and was used for every upload regardless of size, so a
+# 13 KB spreadsheet paid for a round trip it never needed. Resumable keeps
+# its retry-safety for anything larger.
+SIMPLE_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
+
+
+def build_media_upload(
+    stream,
+    mime_type: str,
+    size_bytes: Optional[int],
+    *,
+    chunksize: Optional[int] = None,
+):
+    """Return a MediaIoBaseUpload sized to the payload.
+
+    ``size_bytes`` known and at most ``SIMPLE_UPLOAD_MAX_BYTES`` → multipart
+    (``resumable=False``, one request). Unknown or larger → resumable with
+    ``chunksize`` when given.
+    """
+    from googleapiclient.http import MediaIoBaseUpload
+
+    resumable = size_bytes is None or size_bytes > SIMPLE_UPLOAD_MAX_BYTES
+    kwargs = {"mimetype": mime_type, "resumable": resumable}
+    if resumable and chunksize:
+        kwargs["chunksize"] = chunksize
+    return MediaIoBaseUpload(stream, **kwargs)
+
+
 BASE_SHORTCUT_FIELDS = (
     "id, mimeType, parents, shortcutDetails(targetId, targetMimeType)"
 )
@@ -296,7 +328,13 @@ async def resolve_folder_id(
 ) -> str:
     """
     Resolve a folder ID that might be a shortcut and ensure the final target is a folder.
+
+    ``root`` is Drive's alias for My Drive. It can never be a shortcut, so it
+    is returned as-is without the ``files.get`` round trip (one fewer Google
+    call on every upload to My Drive).
     """
+    if folder_id == ROOT_FOLDER_ALIAS:
+        return folder_id
     resolved_id, metadata = await resolve_drive_item(
         service,
         folder_id,

@@ -561,14 +561,14 @@ async def create_event(
         attendees (Optional[List[str]]): Attendee email addresses.
         timezone (Optional[str]): Timezone (e.g., "America/New_York").
         attachments (Optional[List[str]]): List of Google Drive file URLs or IDs to attach to the event.
-        add_google_meet (bool): Whether to add a Google Meet video conference to the event. Defaults to False.
-        reminders (Optional[Union[str, List[Dict[str, Any]]]]): JSON string or list of reminder objects. Each should have 'method' ("popup" or "email") and 'minutes' (0-40320). Max 5 reminders. Example: '[{"method": "popup", "minutes": 15}]' or [{"method": "popup", "minutes": 15}]
-        use_default_reminders (bool): Whether to use calendar's default reminders. If False, uses custom reminders. Defaults to True.
-        transparency (Optional[str]): Event transparency for busy/free status. "opaque" shows as Busy (default), "transparent" shows as Available/Free. Defaults to None (uses Google Calendar default).
-        visibility (Optional[str]): Event visibility. "default" uses calendar default, "public" is visible to all, "private" is visible only to attendees, "confidential" is same as private (legacy). Defaults to None (uses Google Calendar default).
-        guests_can_modify (Optional[bool]): Whether attendees other than the organizer can modify the event. Defaults to None (uses Google Calendar default of False).
-        guests_can_invite_others (Optional[bool]): Whether attendees other than the organizer can invite others to the event. Defaults to None (uses Google Calendar default of True).
-        guests_can_see_other_guests (Optional[bool]): Whether attendees other than the organizer can see who the event's attendees are. Defaults to None (uses Google Calendar default of True).
+        add_google_meet (bool): Add a Google Meet (default False).
+        reminders (Optional[Union[str, List[Dict[str, Any]]]]): JSON string or list of {"method": "popup"|"email", "minutes": 0-40320}. Max 5.
+        use_default_reminders (bool): Use the calendar's default reminders (default True).
+        transparency (Optional[str]): "opaque" (Busy, Google default) or "transparent" (Free).
+        visibility (Optional[str]): "default", "public", "private" or "confidential" (legacy alias of private).
+        guests_can_modify (Optional[bool]): Attendees may edit the event (Google default False).
+        guests_can_invite_others (Optional[bool]): Attendees may invite others (Google default True).
+        guests_can_see_other_guests (Optional[bool]): Attendees may see the guest list (Google default True).
 
     Returns:
         str: Confirmation message of the successful event creation with event link.
@@ -835,17 +835,17 @@ async def modify_event(
         end_time (Optional[str]): New end time (RFC3339, e.g., "2023-10-27T11:00:00-07:00" or "2023-10-28" for all-day).
         description (Optional[str]): New event description.
         location (Optional[str]): New event location.
-        attendees (Optional[Union[List[str], List[Dict[str, Any]]]]): Attendees as email strings or objects with metadata. Supports: ["email@example.com"] or [{"email": "email@example.com", "responseStatus": "accepted", "organizer": true, "optional": true}]. When using objects, existing metadata (responseStatus, organizer, optional) is preserved. New attendees default to responseStatus="needsAction".
+        attendees (Optional[Union[List[str], List[Dict[str, Any]]]]): Email strings, or objects like {"email": "...", "responseStatus": "accepted", "optional": true}. Object metadata is preserved; new attendees default to "needsAction".
         timezone (Optional[str]): New timezone (e.g., "America/New_York").
-        add_google_meet (Optional[bool]): Whether to add or remove Google Meet video conference. If True, adds Google Meet; if False, removes it; if None, leaves unchanged.
-        reminders (Optional[Union[str, List[Dict[str, Any]]]]): JSON string or list of reminder objects to replace existing reminders. Each should have 'method' ("popup" or "email") and 'minutes' (0-40320). Max 5 reminders. Example: '[{"method": "popup", "minutes": 15}]' or [{"method": "popup", "minutes": 15}]
-        use_default_reminders (Optional[bool]): Whether to use calendar's default reminders. If specified, overrides current reminder settings.
-        transparency (Optional[str]): Event transparency for busy/free status. "opaque" shows as Busy, "transparent" shows as Available/Free. If None, preserves existing transparency setting.
-        visibility (Optional[str]): Event visibility. "default" uses calendar default, "public" is visible to all, "private" is visible only to attendees, "confidential" is same as private (legacy). If None, preserves existing visibility setting.
+        add_google_meet (Optional[bool]): True adds a Google Meet, False removes it, None leaves it.
+        reminders (Optional[Union[str, List[Dict[str, Any]]]]): Replacement reminders, as a JSON string or list of {"method": "popup"|"email", "minutes": 0-40320}. Max 5.
+        use_default_reminders (Optional[bool]): Use the calendar's default reminders.
+        transparency (Optional[str]): "opaque" (Busy) or "transparent" (Free). None keeps the current value.
+        visibility (Optional[str]): "default", "public", "private" or "confidential" (legacy alias of private). None keeps the current value.
         color_id (Optional[str]): Event color ID (1-11). If None, preserves existing color.
-        guests_can_modify (Optional[bool]): Whether attendees other than the organizer can modify the event. If None, preserves existing setting.
-        guests_can_invite_others (Optional[bool]): Whether attendees other than the organizer can invite others to the event. If None, preserves existing setting.
-        guests_can_see_other_guests (Optional[bool]): Whether attendees other than the organizer can see who the event's attendees are. If None, preserves existing setting.
+        guests_can_modify (Optional[bool]): Attendees may edit the event. None keeps the current value.
+        guests_can_invite_others (Optional[bool]): Attendees may invite others. None keeps the current value.
+        guests_can_see_other_guests (Optional[bool]): Attendees may see the guest list. None keeps the current value.
 
     Returns:
         str: Confirmation message of the successful event modification with event link.

@@ -1238,31 +1238,6 @@ async def send_gmail_message(
     Sends an email using the user's Gmail account. Supports both new emails and replies with optional attachments.
     Supports Gmail's "Send As" feature to send from configured alias addresses.
 
-    Args:
-        to (str): Recipient email address.
-        subject (str): Email subject.
-        body (str): Email body content.
-        body_format (Literal['plain', 'html']): Email body format. Defaults to 'plain'.
-        attachments (Optional[List[Dict[str, str]]]): Optional list of attachments. Each dict can contain:
-            Option 1 - File path (auto-encodes):
-              - 'path' (required): File path to attach
-              - 'filename' (optional): Override filename
-              - 'mime_type' (optional): Override MIME type (auto-detected if not provided)
-            Option 2 - Base64 content:
-              - 'content' (required): Standard base64-encoded file content (not urlsafe)
-              - 'filename' (required): Name of the file
-              - 'mime_type' (optional): MIME type (defaults to 'application/octet-stream')
-        cc (Optional[str]): Optional CC email address.
-        bcc (Optional[str]): Optional BCC email address.
-        from_name (Optional[str]): Optional sender display name. Must match the display name configured in Gmail for the sending address; any other name is refused. If provided, the From header will be formatted as 'Name <email>'.
-        from_email (Optional[str]): Optional 'Send As' alias email address. The alias must be
-            configured in Gmail settings (Settings > Accounts > Send mail as). If not provided,
-            the email will be sent from the authenticated user's primary email address.
-        user_google_email (str): The user's Google email address. Required for authentication.
-        thread_id (Optional[str]): Optional Gmail thread ID to reply within. When provided, sends a reply.
-        in_reply_to (Optional[str]): Optional Message-ID of the message being replied to. Used for proper threading.
-        references (Optional[str]): Optional chain of Message-IDs for proper threading. Should include all previous Message-IDs.
-
     Returns:
         str: Confirmation message with the sent email's message ID.
 
@@ -1272,63 +1247,6 @@ async def send_gmail_message(
 
         # Send with a custom display name
         send_gmail_message(to="user@example.com", subject="Hello", body="Hi there!", from_name="John Doe")
-
-        # Send an HTML email
-        send_gmail_message(
-            to="user@example.com",
-            subject="Hello",
-            body="<strong>Hi there!</strong>",
-            body_format="html"
-        )
-
-        # Send from a configured alias (Send As)
-        send_gmail_message(
-            to="user@example.com",
-            subject="Business Inquiry",
-            body="Hello from my business address...",
-            from_email="business@mydomain.com"
-        )
-
-        # Send an email with CC and BCC
-        send_gmail_message(
-            to="user@example.com",
-            cc="manager@example.com",
-            bcc="archive@example.com",
-            subject="Project Update",
-            body="Here's the latest update..."
-        )
-
-        # Send an email with attachments (using file path)
-        send_gmail_message(
-            to="user@example.com",
-            subject="Report",
-            body="Please see attached report.",
-            attachments=[{
-                "path": "/path/to/report.pdf"
-            }]
-        )
-
-        # Send an email with attachments (using base64 content)
-        send_gmail_message(
-            to="user@example.com",
-            subject="Report",
-            body="Please see attached report.",
-            attachments=[{
-                "filename": "report.pdf",
-                "content": "JVBERi0xLjQK...",  # base64 encoded PDF
-                "mime_type": "application/pdf"
-            }]
-        )
-
-        # Send a reply
-        send_gmail_message(
-            to="user@example.com",
-            subject="Re: Meeting tomorrow",
-            body="Thanks for the update!",
-            thread_id="thread_123",
-            in_reply_to="<message123@gmail.com>",
-            references="<original@gmail.com> <message123@gmail.com>"
-        )
     """
     logger.info(
         f"[send_gmail_message] Invoked. Email: '{user_google_email}', Subject: '{subject}', Attachments: {len(attachments) if attachments else 0}"
@@ -1438,31 +1356,6 @@ async def draft_gmail_message(
     Creates a draft email in the user's Gmail account. Supports both new drafts and reply drafts with optional attachments.
     Supports Gmail's "Send As" feature to draft from configured alias addresses.
 
-    Args:
-        user_google_email (str): The user's Google email address. Required for authentication.
-        subject (str): Email subject.
-        body (str): Email body (plain text).
-        body_format (Literal['plain', 'html']): Email body format. Defaults to 'plain'.
-        to (Optional[str]): Optional recipient email address. Can be left empty for drafts.
-        cc (Optional[str]): Optional CC email address.
-        bcc (Optional[str]): Optional BCC email address.
-        from_name (Optional[str]): Optional sender display name. Must match the display name configured in Gmail for the sending address; any other name is refused. If provided, the From header will be formatted as 'Name <email>'.
-        from_email (Optional[str]): Optional 'Send As' alias email address. The alias must be
-            configured in Gmail settings (Settings > Accounts > Send mail as). If not provided,
-            the draft will be from the authenticated user's primary email address.
-        thread_id (Optional[str]): Optional Gmail thread ID to reply within. When provided, creates a reply draft.
-        in_reply_to (Optional[str]): Optional Message-ID of the message being replied to. Used for proper threading.
-        references (Optional[str]): Optional chain of Message-IDs for proper threading. Should include all previous Message-IDs.
-        attachments (List[Dict[str, str]]): Optional list of attachments. Each dict can contain:
-            Option 1 - File path (auto-encodes):
-              - 'path' (required): File path to attach
-              - 'filename' (optional): Override filename
-              - 'mime_type' (optional): Override MIME type (auto-detected if not provided)
-            Option 2 - Base64 content:
-              - 'content' (required): Standard base64-encoded file content (not urlsafe)
-              - 'filename' (required): Name of the file
-              - 'mime_type' (optional): MIME type (defaults to 'application/octet-stream')
-
     Returns:
         str: Confirmation message with the created draft's ID.
 
@@ -1476,46 +1369,6 @@ async def draft_gmail_message(
             body="Hello from my business address...",
             to="user@example.com",
             from_email="business@mydomain.com"
-        )
-
-        # Create a plaintext draft with CC and BCC
-        draft_gmail_message(
-            subject="Project Update",
-            body="Here's the latest update...",
-            to="user@example.com",
-            cc="manager@example.com",
-            bcc="archive@example.com"
-        )
-
-        # Create a HTML draft with CC and BCC
-        draft_gmail_message(
-            subject="Project Update",
-            body="<strong>Hi there!</strong>",
-            body_format="html",
-            to="user@example.com",
-            cc="manager@example.com",
-            bcc="archive@example.com"
-        )
-
-        # Create a reply draft in plaintext
-        draft_gmail_message(
-            subject="Re: Meeting tomorrow",
-            body="Thanks for the update!",
-            to="user@example.com",
-            thread_id="thread_123",
-            in_reply_to="<message123@gmail.com>",
-            references="<original@gmail.com> <message123@gmail.com>"
-        )
-
-        # Create a reply draft in HTML
-        draft_gmail_message(
-            subject="Re: Meeting tomorrow",
-            body="<strong>Thanks for the update!</strong>",
-            body_format="html",
-            to="user@example.com",
-            thread_id="thread_123",
-            in_reply_to="<message123@gmail.com>",
-            references="<original@gmail.com> <message123@gmail.com>"
         )
     """
     logger.info(

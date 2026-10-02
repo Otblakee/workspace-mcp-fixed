@@ -546,3 +546,51 @@ Unit-scope only so far (`tests/gsignatures/`). Before the first live apply:
    as a dry run on the owner's `bir-d.co.uk` alias to confirm the ledger row
    resolves and the previous HTML is the one expected; do a live restore
    and re-apply only if the pilot signature needs pulling.
+
+## Latency review of the live service (2026-10-01)
+
+Measured from Render logs and metrics over 24 to 30 September and 1 October
+2026, plus a code-path audit. Recorded so the next review has a baseline.
+
+**Server side (Render request log, `responseTimeMS`, POST /mcp, n=93 on
+1 October):** p50 201 ms, p90 873 ms, max 2,253 ms. Instance CPU peaked at
+1.5% of one core; memory 200 to 460 MB of 2 GB. No cold starts (paid plan).
+
+**Per-tool server time (audit log `latency_ms`, September sample):** Gmail
+reads 300 to 350 ms; `search_drive_files` about 510 ms; `list_drive_items`
+800 to 860 ms; `modify_sheet_values` 660 to 1,300 ms; `read_sheet_values` 600
+to 1,600 ms; `import_to_google_doc` 4.2 to 4.5 s; `set_shared_drive_theme`
+2.7 to 6.9 s (Google's image processing). The 25 September banner batch ran
+one call every 5.5 s with 3 s of server time each: the other 2.5 s was the
+model's turn.
+
+**Where the wait really is.** (1) Tool arguments are model output: a 30 KB
+file as base64 is roughly 28k output tokens before the server sees a byte.
+(2) The connector advertised 123 tools, about 154 KB of JSON, read on every
+turn. (3) Fixed per-call overhead on this server, now removed in v1.18.0.
+
+**Not fixed, parked:**
+
+- `googleapiclient` opens a new TLS connection to Google on every tool call
+  (the service is built and closed per call). The SSL context is now cached;
+  the TCP and TLS handshake (roughly 10 to 30 ms from Frankfurt) is not.
+  Reusing a thread-local `httplib2.Http` per worker thread, wrapped in
+  `AuthorizedHttp` per request, would remove it. httplib2 is not thread-safe,
+  so a shared instance is not an option.
+- `create_doc(content_format="markdown")` runs two decorator wrappers (Docs
+  and Drive) and so two auth passes. Give it both services through
+  `require_multiple_services`, or check `content_format` before acquiring
+  the Docs service.
+- Google's first-party Workspace MCP servers (developer preview, May 2026)
+  remove the Render hop but carry none of the OTB guardrails (denylist,
+  soft-delete, groups-only sharing, audit log). Not a replacement.
+- Steer the OTB skills (drive routing, document styles) to prefer
+  `fileUrl`, template copies, formulas and markdown import over base64 and
+  literal cell values. That is where the minutes go, and no server change
+  touches it.
+- Confirm the Render `TOOL_TIER` value: CLAUDE.md said `extended`, but the
+  live tool list on 1 October included complete-tier tools
+  (`get_gmail_threads_content_batch`, the Docs comment tools), so the tier is
+  unset (= complete). Leave it: `get_gmail_threads_content_batch` runs every
+  morning at 06:02 UTC.
+

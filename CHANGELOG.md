@@ -4,6 +4,61 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## 1.18.0 (2026-10-02)
+
+Latency trims from the 2026-10-01 review of the live Render service (logs,
+metrics and a code-path audit). The server itself was never the main wait:
+median request time was about 0.17 s and the instance sat under 2% CPU. The
+fixed overhead on every call was, though, and it is gone. See CLAUDE.md
+"Latency trims and tool profiles (v1.18.0)" for the measurements.
+
+- **Upstream token verification is cached.** The OAuth proxy verified the
+  upstream Google token with two sequential Google calls (tokeninfo, then
+  userinfo) over a fresh HTTP client on every POST /mcp, including
+  `tools/list`: 150 to 290 ms per request before the tool ran. FastMCP 3 did
+  the same; FastMCP 4 only made it visible in the logs by moving the calls to
+  the `httpx2` logger. `WorkspaceGoogleProvider` now installs
+  `CachedGoogleTokenVerifier`: successful verifications are cached for
+  `OAUTH_VERIFY_CACHE_TTL_S` seconds (default 300, never past the token's own
+  expiry, `0` disables) and misses reuse one pooled `httpx2.AsyncClient`.
+  Trade-off: a token revoked at Google passes the MCP gate for up to the TTL;
+  every Google API tool still fails on its own, so the exposure is limited to
+  tools that act on the caller's identity alone (the signature tools).
+- **No full-heap `gc.collect()` on the request path.** The service decorator
+  (both wrappers) and the audit flusher ran a full collection on the event
+  loop after every tool call, about 40 ms with the tool surface loaded.
+  Generation 1 frees the googleapiclient Resource cycle the comment was
+  worried about in well under a millisecond.
+- **One Drive request for small uploads instead of three.**
+  `resolve_folder_id` returns `root` without a `files.get`, and
+  `create_drive_file` (all four sources), `import_to_google_doc` and
+  `create_doc(content_format="markdown")` upload payloads of 5 MB or less as
+  multipart (one request) rather than opening a resumable session first.
+  Larger payloads stay resumable with the same chunk size. Base64 decoding in
+  `create_drive_file` now runs in a worker thread.
+- **One SSL context per argument set for Google API connections.**
+  `core/ssl_context_cache.py` wraps `httplib2._build_ssl_context` in an LRU
+  cache (installed when `core.server` imports), so each new connection no
+  longer builds a context and re-reads the certifi bundle (about 18 ms CPU).
+- **`httpx2` and `httpcore2` loggers silenced at INFO** in both entrypoints,
+  as `httpx` and `httpcore` already were.
+- **Tool profiles for a two-connector split.** New `core/tool_profiles.py`
+  and `--tool-profile {all,everyday,admin}` (env `TOOL_PROFILE` through the
+  Dockerfile CMD). `everyday` removes the Directory, group-write, signature,
+  shared-drive build, migration and banner tools (`ADMIN_TOOLS`, 39 names);
+  `admin` keeps only those; `all` (default) changes nothing. Applied in
+  `filter_server_tools` after tier filtering; a profile never adds a tool.
+  The live connector advertises 124 tools, about 154 KB of JSON read by the
+  model on every turn; with the live service set, `everyday` lists 88 and
+  `admin` 36 (`--cli` count, OAuth 2.1 mode).
+  `tests/test_tool_profiles.py` pins the membership against the source
+  modules. No Render change is made by this release: see CLAUDE.md for the
+  order of operations.
+- **Five long tool descriptions trimmed** (`send_gmail_message`,
+  `draft_gmail_message`, `modify_event`, `create_event`,
+  `update_paragraph_style`): duplicated Args blocks and surplus examples
+  removed, every parameter still described. About 9 KB less per turn.
+
 ## 1.17.4 (2026-10-01)
 
 - **Fix: calls in the last 3 min 45 s of each access-token hour failed with

@@ -667,7 +667,9 @@ class AuditLogger:
                 # Drop the per-user sheets client; googleapiclient Resource
                 # trees retain circular refs that defy refcount cleanup.
                 await asyncio.to_thread(sheets.close)
-                gc.collect()
+                # Generation 1 frees the young Resource cycle without walking
+                # the whole heap on the event loop (see service_decorator).
+                gc.collect(1)
 
         # Partial failure: return the unwritten entries instead of raising.
         # Raising here used to make the caller stdout-dump the ENTIRE batch

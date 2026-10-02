@@ -51,6 +51,7 @@ ENV PYTHONIOENCODING=utf-8
 # Set environment variables for Python startup args
 ENV TOOL_TIER=""
 ENV TOOLS=""
+ENV TOOL_PROFILE=""
 
 # Don't re-sync the environment at container start: dependencies were already
 # installed at build time with `uv sync --no-dev`. A plain `uv run` would
@@ -61,4 +62,4 @@ ENV UV_NO_SYNC=1
 # entrypoint.sh fixes disk ownership (if /data is mounted), drops to "app",
 # and runs CMD through /bin/sh -c so the env expansions below still work.
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
+CMD ["uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOL_PROFILE:+--tool-profile \"$TOOL_PROFILE\"} ${TOOLS:+--tools $TOOLS}"]

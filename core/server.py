@@ -43,6 +43,12 @@ from core.tool_policy import BLOCKED_TOOLS
 
 logger = logging.getLogger(__name__)
 
+# One SSL context per argument set for every googleapiclient connection,
+# instead of a fresh context (and certifi read) per tool call.
+from core.ssl_context_cache import install_httplib2_ssl_context_cache  # noqa: E402
+
+install_httplib2_ssl_context_cache()
+
 
 def get_package_version() -> str:
     """Resolve the installed distribution version.
