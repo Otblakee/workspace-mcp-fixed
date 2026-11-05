@@ -2121,6 +2121,49 @@ def _format_thread_content(
     return "\n".join(content_lines)
 
 
+def _thread_get_request(service, thread_id: str, body_format: str):
+    """The threads.get request for a body_format. "raw" has no threads.get
+    equivalent, so it fetches metadata (headers for the display lines) and the
+    caller then fetches each message raw; "text" and "html" fetch full."""
+    if body_format == "raw":
+        return (
+            service.users()
+            .threads()
+            .get(
+                userId="me",
+                id=thread_id,
+                format="metadata",
+                metadataHeaders=THREAD_HEADER_NAMES,
+            )
+        )
+    return service.users().threads().get(userId="me", id=thread_id, format="full")
+
+
+async def _thread_body_sections(
+    service, thread_data: dict, body_format: str
+) -> Optional[Dict[str, str]]:
+    """Pre-render each message's body for body_format="html" / "raw".
+
+    Returns None for "text" so _format_thread_content takes its unchanged
+    path. For "raw", one messages.get(format="raw") per message.
+    """
+    if body_format == "text":
+        return None
+    sections: Dict[str, str] = {}
+    for message in thread_data.get("messages", []):
+        mid = message.get("id")
+        if not mid:
+            continue
+        if body_format == "raw":
+            shown, total, truncated = await _fetch_raw_source(service, mid)
+            sections[mid] = _render_raw_section(shown, total, truncated)
+        else:
+            sections[mid] = await _render_html_body_section(
+                service, mid, message.get("payload", {})
+            )
+    return sections
+
+
 @server.tool()
 @require_google_service("gmail", "gmail_read")
 @handle_http_errors("get_gmail_thread_content", is_read_only=True, service_type="gmail")
@@ -2152,46 +2195,14 @@ async def get_gmail_thread_content(
     )
     _validate_body_format(body_format)
 
-    if body_format == "raw":
-        # threads.get does not accept format=raw. Fetch the headers once, then
-        # each message's source individually.
-        thread_response = await asyncio.to_thread(
-            service.users()
-            .threads()
-            .get(
-                userId="me",
-                id=thread_id,
-                format="metadata",
-                metadataHeaders=THREAD_HEADER_NAMES,
-            )
-            .execute
-        )
-        body_sections: Dict[str, str] = {}
-        for message in thread_response.get("messages", []):
-            mid = message.get("id")
-            if not mid:
-                continue
-            shown, total, truncated = await _fetch_raw_source(service, mid)
-            body_sections[mid] = _render_raw_section(shown, total, truncated)
-        return _format_thread_content(thread_response, thread_id, body_sections)
-
-    # Fetch the complete thread with all messages
+    # Fetch the complete thread with all messages ("raw" fetches headers only,
+    # then each message's source: threads.get does not accept format=raw).
     thread_response = await asyncio.to_thread(
-        service.users().threads().get(userId="me", id=thread_id, format="full").execute
+        _thread_get_request(service, thread_id, body_format).execute
     )
 
-    if body_format == "html":
-        body_sections = {}
-        for message in thread_response.get("messages", []):
-            mid = message.get("id")
-            if not mid:
-                continue
-            body_sections[mid] = await _render_html_body_section(
-                service, mid, message.get("payload", {})
-            )
-        return _format_thread_content(thread_response, thread_id, body_sections)
-
-    return _format_thread_content(thread_response, thread_id)
+    body_sections = await _thread_body_sections(service, thread_response, body_format)
+    return _format_thread_content(thread_response, thread_id, body_sections)
 
 
 @server.tool()
@@ -2203,6 +2214,7 @@ async def get_gmail_threads_content_batch(
     service,
     thread_ids: List[str],
     user_google_email: str,
+    body_format: BodyFormat = "text",
 ) -> str:
     """
     Retrieves the content of multiple Gmail threads in a single batch request.
@@ -2211,13 +2223,21 @@ async def get_gmail_threads_content_batch(
     Args:
         thread_ids (List[str]): A list of Gmail thread IDs to retrieve. The function will automatically batch requests in chunks of 25.
         user_google_email (str): The user's Google email address. Required.
+        body_format (Literal["text", "html", "raw"]): Which body to return for each message.
+            Defaults to "text" (the historical output, unchanged). "html" returns each message's
+            text/html part verbatim with a header block listing every <img src> URL and every
+            cid: reference (filename and attachmentId); falls back to text/plain with a note when
+            a message has no html part. "raw" returns each message's RFC 2822 source (one
+            format=raw fetch per message after the batched header fetch, since threads.get has
+            no raw format). Both are capped at 1 MB per message.
 
     Returns:
         str: A formatted list of thread contents with separators.
     """
     logger.info(
-        f"[get_gmail_threads_content_batch] Invoked. Thread count: {len(thread_ids)}, Email: '{user_google_email}'"
+        f"[get_gmail_threads_content_batch] Invoked. Thread count: {len(thread_ids)}, Email: '{user_google_email}', body_format: '{body_format}'"
     )
+    _validate_body_format(body_format)
 
     if not thread_ids:
         raise ValueError("No thread IDs provided")
@@ -2238,7 +2258,7 @@ async def get_gmail_threads_content_batch(
             batch = service.new_batch_http_request(callback=_batch_callback)
 
             for tid in chunk_ids:
-                req = service.users().threads().get(userId="me", id=tid, format="full")
+                req = _thread_get_request(service, tid, body_format)
                 batch.add(req, request_id=tid)
 
             # Execute batch request
@@ -2255,10 +2275,7 @@ async def get_gmail_threads_content_batch(
                 for attempt in range(max_retries):
                     try:
                         thread = await asyncio.to_thread(
-                            service.users()
-                            .threads()
-                            .get(userId="me", id=tid, format="full")
-                            .execute
+                            _thread_get_request(service, tid, body_format).execute
                         )
                         return tid, thread, None
                     except ssl.SSLError as ssl_error:
@@ -2296,7 +2313,12 @@ async def get_gmail_threads_content_batch(
                     output_threads.append(f"⚠️ Thread {tid}: No data returned\n")
                     continue
 
-                output_threads.append(_format_thread_content(thread, tid))
+                body_sections = await _thread_body_sections(
+                    service, thread, body_format
+                )
+                output_threads.append(
+                    _format_thread_content(thread, tid, body_sections)
+                )
 
     # Combine all threads with separators
     header = f"Retrieved {len(thread_ids)} threads:"

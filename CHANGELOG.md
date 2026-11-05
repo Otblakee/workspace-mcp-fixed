@@ -7,8 +7,9 @@ releases are recorded in the git history and in `CLAUDE.md`.
 ## 1.18.0 (2026-11-05)
 
 - **New: `body_format` on the Gmail read tools.** `get_gmail_message_content`,
-  `get_gmail_messages_content_batch` and `get_gmail_thread_content` take an
-  optional `body_format` of `"text"` (default), `"html"` or `"raw"`. The
+  `get_gmail_messages_content_batch`, `get_gmail_thread_content` and
+  `get_gmail_threads_content_batch` take an optional `body_format` of
+  `"text"` (default), `"html"` or `"raw"`. The
   default output is byte-identical to 1.17.4; the goldens in
   `tests/gmail/body_format_goldens.json` were generated from the pre-change
   code and every text-path test compares against them. `"html"` returns the
@@ -22,8 +23,8 @@ releases are recorded in the git history and in `CLAUDE.md`.
   `get_gmail_attachment_content`. A message with no html part shows
   text/plain under the note "(no text/html part; showing text/plain)".
   `"raw"` fetches `format=raw` and returns the decoded RFC 2822 source;
-  `threads.get` has no raw format, so the thread tool fetches headers once
-  and then each message's source. Both html and raw are capped at 1 MB per
+  `threads.get` has no raw format, so the two thread tools fetch headers
+  (one batched `metadata` request per thread) and then each message's source. Both html and raw are capped at 1 MB per
   message with the full size stated when truncated. The batch tool's
   existing `format` parameter is unchanged; `body_format` applies only with
   `format="full"`. Read-only: no new scopes, no write tool touched.
