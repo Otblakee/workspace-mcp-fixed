@@ -4,6 +4,31 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## 1.18.0 (2026-11-05)
+
+- **New: `body_format` on the Gmail read tools.** `get_gmail_message_content`,
+  `get_gmail_messages_content_batch` and `get_gmail_thread_content` take an
+  optional `body_format` of `"text"` (default), `"html"` or `"raw"`. The
+  default output is byte-identical to 1.17.4; the goldens in
+  `tests/gmail/body_format_goldens.json` were generated from the pre-change
+  code and every text-path test compares against them. `"html"` returns the
+  text/html MIME part verbatim after walking the whole tree
+  (multipart/alternative, mixed, related, nested), preferring the html part
+  that sits beside the text/plain part, fetching a body stored under
+  `body.attachmentId` with `messages.attachments.get`, and honouring the
+  part's declared charset. A header block lists every `<img src>` URL and
+  every `cid:` reference with the matching part's filename and
+  `attachmentId`, so inline images can be pulled with
+  `get_gmail_attachment_content`. A message with no html part shows
+  text/plain under the note "(no text/html part; showing text/plain)".
+  `"raw"` fetches `format=raw` and returns the decoded RFC 2822 source;
+  `threads.get` has no raw format, so the thread tool fetches headers once
+  and then each message's source. Both html and raw are capped at 1 MB per
+  message with the full size stated when truncated. The batch tool's
+  existing `format` parameter is unchanged; `body_format` applies only with
+  `format="full"`. Read-only: no new scopes, no write tool touched.
+  Tests in `tests/gmail/test_gmail_body_format.py`.
+
 ## 1.17.4 (2026-10-01)
 
 - **Fix: calls in the last 3 min 45 s of each access-token hour failed with
