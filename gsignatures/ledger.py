@@ -13,7 +13,10 @@ the comparison; this module only stores and retrieves the rows.
 Sheet layout:
 
 * ``Ledger`` tab, append-only, two rows per (live apply, send-as address),
-  columns in ``LEDGER_HEADER`` order: a ``pending`` row written BEFORE the
+  columns in ``LEDGER_HEADER`` order (v1.19.0 added ``overrides``, the JSON
+  of any per-send-as override applied; a tab still carrying the twelve
+  original columns is read as-is and its header is extended on the next
+  write probe): a ``pending`` row written BEFORE the
   Gmail patch (``readback_hash`` is the literal ``pending``; the rollback
   record ``previous_signature_html`` is already complete) and a completed
   row written after the read-back, same ``run_id``. ``applied_at`` is an
@@ -62,6 +65,7 @@ __all__ = [
     "PENDING_READBACK",
     "is_pending_ledger_row",
     "outranks",
+    "LEDGER_LEGACY_HEADERS",
 ]
 
 LEDGER_HEADER: List[str] = [
@@ -77,7 +81,13 @@ LEDGER_HEADER: List[str] = [
     "previous_hash",
     "previous_signature_html",
     "run_id",
+    "overrides",
 ]
+
+# Header layouts older ledgers may still carry. Each is a strict prefix of
+# ``LEDGER_HEADER``: rows are read with the missing columns empty and the
+# header row is upgraded in place by ``ensure_tab`` on the next write path.
+LEDGER_LEGACY_HEADERS: List[List[str]] = [LEDGER_HEADER[:12]]
 
 AUDIT_HEADER: List[str] = [
     "audited_at",
@@ -91,6 +101,7 @@ AUDIT_HEADER: List[str] = [
     "status",
     "reason",
     "current_hash",
+    "overrides",
 ]
 
 # A ledger row without these cannot be attributed to an apply. Refused
@@ -183,6 +194,20 @@ def _check_header(header: List[str]) -> List[str]:
     return [str(h) for h in header]
 
 
+def _is_legacy_prefix(found: List[str], header: List[str]) -> bool:
+    """Whether ``found`` is one of the documented older layouts of ``header``.
+
+    Only the ledger has legacy layouts; a strict prefix is accepted only when
+    it is listed in ``LEDGER_LEGACY_HEADERS``, never any shorter row.
+    """
+    if header != LEDGER_HEADER:
+        return False
+    trimmed = list(found)
+    while trimmed and not trimmed[-1]:
+        trimmed = trimmed[:-1]
+    return any(trimmed == legacy for legacy in LEDGER_LEGACY_HEADERS)
+
+
 async def _tab_titles(sheets, sheet_id: str) -> List[str]:
     meta = await execute_with_backoff(
         lambda: sheets.spreadsheets().get(
@@ -258,6 +283,18 @@ async def ensure_tab(sheets, sheet_id: str, tab: str, header: List[str]) -> None
     first_row = [_cell(v).strip() for v in (existing[0] if existing else [])]
     if not any(first_row):
         await _write_values(sheets, sheet_id, header_range, [header])
+        return
+    if _is_legacy_prefix(first_row, header):
+        # An older ledger: extend the header row with the new column names.
+        # Existing data rows are untouched and read with the new columns
+        # empty.
+        await _write_values(sheets, sheet_id, header_range, [header])
+        logger.info(
+            "upgraded ledger tab %r header from %d to %d columns",
+            tab,
+            len([c for c in first_row if c]),
+            len(header),
+        )
         return
     if first_row[: len(header)] != header or any(first_row[len(header) :]):
         raise LedgerError(
@@ -378,7 +415,9 @@ async def read_ledger_rows(sheets, sheet_id: str) -> List[Dict[str, str]]:
         return []
 
     header = [_cell(v).strip() for v in rows[0]]
-    if header[: len(LEDGER_HEADER)] != LEDGER_HEADER:
+    if header[: len(LEDGER_HEADER)] != LEDGER_HEADER and not _is_legacy_prefix(
+        header, LEDGER_HEADER
+    ):
         raise LedgerError(
             f"The {LEDGER_TAB!r} tab does not start with the ledger header. "
             f"Expected {LEDGER_HEADER}; found {header}."

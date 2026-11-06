@@ -4,6 +4,47 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## 1.19.0 (2026-11-06)
+
+- **Signature template 2.0.0 (gsignatures).** Reproduces the live OTB
+  signature layout: logo, coloured rule, name | title, entity, T / DDI / M
+  line, E / W line, address and a statutory footer. Values come from the
+  Directory (name, title, send-as email, mobile, and the new `ddi` from the
+  work phone) and from a brand partial per entity
+  (`gsignatures/config/partials/<CODE>.yaml`: entity name, logo URL and
+  size, three colours, office number, website, address, `verified` flag).
+  The statutory numbers stay in `entities.yaml` as the single source;
+  `company_no` and `vat_no` read them from there, and `statutory_verified`
+  keeps its warning. OTB (read back from the live signature) and BIR
+  (owner-supplied values) are verified and pinned to 2.0.0; JIT and VALE
+  have partials with nulls for phone, logo and colours, `verified: false`,
+  and stay on 1.0.0. The pin rule is enforced at config load: a template
+  that uses partial placeholders needs a verified partial or the config
+  refuses to load. Templates may write optional blocks as
+  `{{#if x}}...{{/if}}`. AHWE is untouched.
+- **Per-send-as overrides.** `overrides:` in `entities.yaml`, keyed by
+  send-as address, may set `title`, `name`, `mobile` or `ddi` for that
+  address only (shipped: `oliver@bir-d.co.uk` renders "Managing Director").
+  The override is recorded on every ledger row (new `overrides` column,
+  JSON) and audit row, named on the dry-run row's reason, and printed by
+  `preview_email_signature` together with the template version actually
+  used and the DDI. A ledger written before this release (twelve columns)
+  is read as-is and its header is extended on the next live run's write
+  probe. Tests in `tests/gsignatures/test_template_v2.py`, including a
+  snapshot of the OTB render against the live HTML read back on
+  2026-11-06.
+- **New opt-in service `gcdn`: `upload_cdn_asset` and `list_cdn_assets`.**
+  Uploads a versioned object (`name-vN.ext`, never an overwrite) to the
+  Cloudflare R2 bucket behind cdn.otbgroup.co.uk through the Cloudflare
+  REST API (`api.cloudflare.com`, not the S3 endpoint), then HEADs the
+  public URL and prints the ETag against the local MD5 plus the sha256
+  (falling back to a sha256 of the served bytes when the ETag is not an
+  MD5). Server-held token (`CF_ACCOUNT_ID`, `CF_R2_BUCKET`, `CF_R2_TOKEN`;
+  Cloudflare permission "Workers R2 Storage: Edit" scoped to the one
+  bucket), caller gate on `CDN_ADMIN_EMAILS` through the OAuth 2.1 paths
+  only, write marker so `--read-only` drops the upload tool. Enable with
+  `gcdn` in `TOOLS`. Tests in `tests/gcdn/` mock every HTTP call.
+
 ## 1.18.0 (2026-11-05)
 
 - **New: `body_format` on the Gmail read tools.** `get_gmail_message_content`,

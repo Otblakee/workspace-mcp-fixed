@@ -489,7 +489,8 @@ class TestPreview:
         out = await preview_email_signature(ALICE)
         assert ALICE in out
         assert "Entity: OTB" in out
-        assert "template 1.0.0" in out and "statutory 1.0.0" in out
+        assert "template 2.0.0" in out and "statutory 1.0.0" in out
+        assert "Template version used: 2.0.0" in out
         assert "Alice Able" in out
         assert "Director" in out
         assert "Mobile: (none)" in out
@@ -579,13 +580,14 @@ class TestGetEmailSignatures:
                     ALICE,
                     ALICE,
                     "OTB",
-                    "1.0.0",
+                    config.entities["OTB"].template_version,
                     "1.0.0",
                     plan.rendered_hash,
                     signature_hash(OLD_PRIMARY),
                     "",
                     "",
                     "run-old",
+                    "",
                 ],
             )
         )

@@ -128,6 +128,7 @@ SENSITIVE = {
 _MODULE_SERVICE_MAP = {
     "gadmin": "gadmin",
     "gsignatures": "gsignatures",
+    "gcdn": "cdn",
     "gdrive": "drive",
     "gmail": "gmail",
     "gcalendar": "calendar",

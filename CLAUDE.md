@@ -1141,3 +1141,76 @@ raw, with the full size stated when truncated. The text path keeps its own
 Live acceptance check (message
 `19bc6d5d4aaca174`, BIR Developments signature, two `<img src>` URLs) is to be
 run after the Render deploy, which the owner triggers.
+
+## Signature template 2.0.0, overrides and the CDN (v1.19.0)
+
+**Template 2.0.0.** `gsignatures/templates/<CODE>/<CODE>-signature-v2.0.0.html`
+(same file for OTB, JIT, VALE, BIR) is the live OTB layout. Values: the
+Directory (`name`, `title`, send-as `email`, `mobile`, and `ddi`, the
+Directory `work` phone via `engine._pick_ddi`), the brand partial
+`gsignatures/config/partials/<CODE>.yaml` (`engine.BrandPartial`:
+`entity_name`, `logo_url`, `logo_w`, optional `logo_h`, `rule_rgb`,
+`name_rgb`, `label_rgb`, `office_tel`, `website`, `address`, `verified`),
+and the entity's statutory numbers as `company_no` / `vat_no`
+(`engine.partial_values`). The statutory values were NOT moved into the
+partials: one source, `statutory_verified` and its preview warning unchanged.
+`{{#if x}}...{{/if}}` is rewritten to `{{#x}}...{{/x}}` in `_render`.
+
+**Pin rule (enforced in `load_config`).** If the pinned signature template
+uses a partial placeholder (`engine.template_uses_partial`) the entity's
+partial must exist and be `verified: true`, else `SignatureConfigError`.
+OTB (values read back from the live signature on 2026-11-06) and BIR
+(owner-supplied values) are verified and pinned 2.0.0. JIT and VALE ship
+partials with nulls for phone, logo and colours (`verified: false`) and stay
+on 1.0.0: fill the file, set `verified: true`, bump the pin. A verified
+partial is validated (required fields, no placeholder words, https logo,
+integer sizes, `rgb(r,g,b)` colours). `render_signature` takes
+`partial=` and refuses a 2.0.0 template without a verified one. AHWE has no
+partial and no 2.0.0 file.
+
+**Overrides.** Top-level `overrides:` in `entities.yaml`, address ->
+`{title|name|mobile|ddi}` (`engine.OVERRIDE_FIELDS`), applied in
+`plan_for_user` with `dataclasses.replace` after the send-as email, for that
+address only; `PlannedSignature.overrides` carries it. Shipped:
+`oliver@bir-d.co.uk: {title: Managing Director}`. Recorded as JSON in the
+new `overrides` ledger column (`ledger.LEDGER_HEADER`, 13 columns; `A:M`)
+and on the audit row; named on the dry-run / applied row reason
+(`operations.overrides_note`). `ledger.LEDGER_LEGACY_HEADERS` lists the
+twelve-column layout: `read_ledger_rows` accepts it and `ensure_tab`
+extends the header row in place on the next write path, data rows
+untouched. The preview prints `Template version used: X (brand partial
+CODE.yaml, verified | NOT verified, unused | no brand partial)`, `DDI:` and
+`Overrides for this send-as:`.
+
+**Snapshot test.** `tests/gsignatures/fixtures/otb_live_signature_2026-11-06.html`
+is the live OTB HTML; `test_template_v2._gmail_normalise` lists what
+Gmail's sanitiser changed (image proxy prefix, `<span> </span>` fillers,
+`target="_blank"`, dropped `alt` / `style="display:block"` /
+`font-family`, a `<br>` after the image) and the render must equal the
+live HTML once both are normalised. If Gmail's sanitiser changes, update
+that list, nothing else.
+
+**gcdn.** Opt-in service (`OPT_IN_TOOLS`), `gcdn/r2_client.py` (pure httpx
+client for `api.cloudflare.com/client/v4/accounts/{id}/r2/buckets/{bucket}/objects`,
+`validate_key`, `verify_public`) and `gcdn/cdn_tools.py` (`upload_cdn_asset`,
+`list_cdn_assets`). Rules: versioned names only (`VERSIONED_NAME_RE`,
+`name-vN.ext`), existence check by list-with-prefix before any PUT, never
+an overwrite, HEAD the public URL after and compare ETag to MD5 (R2 sets
+the single-upload ETag to the MD5) with a sha256-of-body fallback, print
+all three. Caller gate as the signature tools (`CDN_ADMIN_EMAILS`, default
+owner; OAuth 2.1 paths only). `_workspace_write_tool` marker on the upload
+tool. Env: `CF_ACCOUNT_ID`, `CF_R2_BUCKET`, `CF_R2_TOKEN` (token permission
+"Workers R2 Storage: Edit" scoped to the bucket), optional
+`CDN_PUBLIC_BASE_URL`, `CDN_MAX_UPLOAD_BYTES`, `CDN_ADMIN_EMAILS`. The S3
+endpoint is never used (a test scans for it). Tests mock the API with
+`httpx.MockTransport`.
+
+**Render for 1.19.0.** Set the three `CF_*` vars, add `gcdn` to `TOOLS`
+(`gmail drive calendar docs sheets contacts gsignatures gcdn`). Acceptance
+after deploy: (1) `upload_cdn_asset("bir/bir-logo-black-v1.png", ...)`
+returns verified and the URL serves the image; (2)
+`preview_email_signature(user_email="oliver@otbgroup.co.uk",
+send_as_email="oliver@bir-d.co.uk")` shows 2.0.0, "Managing Director" and
+the CDN logo URL; (3) `preview_email_signature(user_email="ben@bir-d.co.uk")`
+shows his Directory title. The first live apply of 2.0.0 extends the ledger
+header to 13 columns.
