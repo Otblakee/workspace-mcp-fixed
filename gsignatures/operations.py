@@ -46,6 +46,7 @@ Rules carried by this module (owner decisions, see CLAUDE.md):
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -463,6 +464,20 @@ def _ledger_match(
     return True, f"ledger and Gmail match (readback {readback[:12]})"
 
 
+def overrides_cell(overrides: Optional[Dict[str, str]]) -> str:
+    """The ledger / audit cell for a plan's overrides: JSON, or '' when none."""
+    if not overrides:
+        return ""
+    return json.dumps(dict(sorted(overrides.items())), ensure_ascii=False)
+
+
+def overrides_note(overrides: Optional[Dict[str, str]]) -> str:
+    """Human-readable suffix naming the overrides applied, or ''."""
+    if not overrides:
+        return ""
+    return "overrides " + ", ".join(f"{k}={v!r}" for k, v in sorted(overrides.items()))
+
+
 def _row(
     plan: PlannedSignature,
     action: str,
@@ -581,6 +596,10 @@ async def _apply_loaded(
             continue
         if force:
             why = "force=True" + (f" ({why})" if unchanged else f"; {why}")
+        if plan.overrides:
+            # Name the per-send-as override on the row so a dry run shows
+            # what the Directory value was replaced with.
+            why = f"{why}; {overrides_note(plan.overrides)}"
 
         if dry_run:
             if ledger_note:
@@ -623,6 +642,7 @@ async def _apply_loaded(
             "previous_hash": current_hash,
             "previous_signature_html": current_html,
             "run_id": run_id,
+            "overrides": overrides_cell(plan.overrides),
         }
         try:
             await append_ledger_rows(sheets, sheet_id or "", [ledger_entry])
@@ -956,6 +976,7 @@ async def _restore_address(
         "previous_hash": current_hash,
         "previous_signature_html": current_html,
         "run_id": run_id,
+        "overrides": "",
     }
     try:
         await append_ledger_rows(sheets, sheet_id, [ledger_entry])
@@ -1455,6 +1476,7 @@ def _audit_row(
         "status": status,
         "reason": reason,
         "current_hash": current_hash,
+        "overrides": overrides_cell(plan.overrides),
     }
 
 
@@ -1473,6 +1495,7 @@ def _audit_user_error_row(
         "status": "error",
         "reason": _error_text(exc),
         "current_hash": "",
+        "overrides": "",
     }
 
 
@@ -1636,6 +1659,8 @@ __all__ = [
     "gate_live",
     "has_drift",
     "new_run_id",
+    "overrides_cell",
+    "overrides_note",
     "plan_user",
     "prepare_ledger",
     "read_ledger_best_effort",

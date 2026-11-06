@@ -37,6 +37,14 @@ Design rules carried by this module:
 * The optional ``mobile`` field is rendered only when the Directory has one.
   Its absence is never an error and never leaves an empty line, provided the
   template wraps it in ``{{#mobile}} ... {{/mobile}}``.
+* Template 2.0.0 (v1.19.0) adds the optional ``ddi`` field (the Directory
+  work phone), a brand partial per entity (``config/partials/<CODE>.yaml``:
+  logo, colours, office number, website, address) and per-send-as
+  ``overrides``. A template that uses partial placeholders loads only when
+  the entity's partial is marked ``verified: true``; until then the entity
+  stays pinned to a template that does not need one. The statutory values
+  stay in ``entities.yaml`` as the single source: ``company_no`` and
+  ``vat_no`` read them from there.
 """
 
 from __future__ import annotations
@@ -57,11 +65,58 @@ import yaml
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config" / "entities.yaml"
 DEFAULT_TEMPLATES_DIR = Path(__file__).parent / "templates"
+DEFAULT_PARTIALS_DIR = Path(__file__).parent / "config" / "partials"
 
 # Names a signature template may use. ``email`` is the send-as address the
 # signature belongs to; ``statutory`` is the rendered statutory partial and is
 # the one value inserted without HTML escaping.
 SIGNATURE_PLACEHOLDERS = {"name", "title", "mobile", "email", "statutory"}
+
+# Person fields template 2.0.0 adds. ``ddi`` is the Directory work phone.
+SIGNATURE_V2_PERSON_PLACEHOLDERS = {"ddi"}
+
+# Brand-partial placeholders (template 2.0.0). ``company_no`` and ``vat_no``
+# are the entity's statutory values from entities.yaml; everything else comes
+# from ``config/partials/<CODE>.yaml``. ``logo_h`` is optional.
+PARTIAL_PLACEHOLDERS = {
+    "entity_name",
+    "logo_url",
+    "logo_w",
+    "logo_h",
+    "rule_rgb",
+    "name_rgb",
+    "label_rgb",
+    "office_tel",
+    "website",
+    "address",
+    "company_no",
+    "vat_no",
+}
+# Partial file keys (the two statutory names are not in the file).
+PARTIAL_FILE_FIELDS = (
+    "entity_name",
+    "logo_url",
+    "logo_w",
+    "logo_h",
+    "rule_rgb",
+    "name_rgb",
+    "label_rgb",
+    "office_tel",
+    "website",
+    "address",
+)
+PARTIAL_OPTIONAL_FIELDS = ("logo_h",)
+_PARTIAL_INT_FIELDS = ("logo_w", "logo_h")
+_PARTIAL_RGB_FIELDS = ("rule_rgb", "name_rgb", "label_rgb")
+_RGB_RE = re.compile(r"^rgb\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\)$")
+
+# Every name a signature template may use once a verified partial is loaded.
+SIGNATURE_V2_PLACEHOLDERS = (
+    SIGNATURE_PLACEHOLDERS | SIGNATURE_V2_PERSON_PLACEHOLDERS | PARTIAL_PLACEHOLDERS
+)
+
+# Person fields a per-send-as override may set (entities.yaml ``overrides``).
+OVERRIDE_FIELDS = ("title", "name", "mobile", "ddi")
 
 # Names a statutory partial may use. ``email`` here is the entity's contact
 # address, not the person's.
@@ -91,7 +146,7 @@ _LIMITED_COMPANY_REQUIRED = (
 
 # Person fields the Directory can supply. ``required_fields`` and
 # ``optional_fields`` in config must draw from this set.
-PERSON_FIELDS = ("name", "title", "mobile")
+PERSON_FIELDS = ("name", "title", "mobile", "ddi")
 
 _DEFAULT_REQUIRED_FIELDS = ["name", "title"]
 _DEFAULT_OPTIONAL_FIELDS = ["mobile"]
@@ -114,12 +169,21 @@ _PLACEHOLDER_WORD_RE = re.compile(r"\b(TODO|MISSING|TBC|PLACEHOLDER)\b", re.IGNO
 
 # Directory phone types that count as a mobile number.
 _MOBILE_PHONE_TYPES = ("mobile", "work_mobile")
+# Directory phone types that count as a direct dial (DDI).
+_DDI_PHONE_TYPES = ("work",)
 
 # Template syntax. Blocks are ``{{#name}} ... {{/name}}``; placeholders are
 # ``{{name}}``. Names are lower-case identifiers.
 _BLOCK_RE = re.compile(r"\{\{#\s*([A-Za-z_]+)\s*\}\}(.*?)\{\{/\s*\1\s*\}\}", re.DOTALL)
 _BLOCK_MARKER_RE = re.compile(r"\{\{[#/]\s*([A-Za-z_]+)\s*\}\}")
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
+# ``{{#if x}} ... {{/if}}`` is an alias of ``{{#x}} ... {{/x}}`` (template
+# 2.0.0 is written in that form). Rewritten before the block pass; blocks
+# still may not nest.
+_IF_BLOCK_RE = re.compile(
+    r"\{\{#if\s+([A-Za-z_]+)\s*\}\}(.*?)\{\{/if\s*\}\}", re.DOTALL
+)
+_IF_MARKER_RE = re.compile(r"\{\{(#if\b|/if\b)[^{}]*\}\}")
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -196,6 +260,21 @@ class PrimaryRule:
 
 
 @dataclass
+class BrandPartial:
+    """One entity's brand values (``config/partials/<CODE>.yaml``).
+
+    ``verified`` is the owner's confirmation that every value is right. A
+    template that needs the partial loads only when it is True; an
+    unverified partial may hold nulls for what is not yet known.
+    """
+
+    code: str
+    verified: bool
+    values: Dict[str, Optional[str]]
+    path: Path
+
+
+@dataclass
 class SignatureConfig:
     version: int
     entities: Dict[str, Entity]
@@ -207,6 +286,10 @@ class SignatureConfig:
     # Exact send-as addresses (lower-cased) that are never managed, whatever
     # the rules would say: shared mailboxes that have no template yet.
     skip_addresses: List[str] = dataclasses.field(default_factory=list)
+    # Brand partials by entity code (only entities that have a partial file).
+    partials: Dict[str, BrandPartial] = dataclasses.field(default_factory=dict)
+    # Per-send-as person overrides, keyed by lower-cased address.
+    overrides: Dict[str, Dict[str, str]] = dataclasses.field(default_factory=dict)
 
 
 @dataclass
@@ -219,6 +302,7 @@ class Person:
     family_name: str
     title: str
     mobile: Optional[str]
+    ddi: Optional[str] = None
 
 
 @dataclass
@@ -246,6 +330,9 @@ class PlannedSignature:
     rendered_hash: Optional[str]
     status: str  # 'planned' | 'skipped' | 'error'
     reason: str
+    # Per-send-as overrides applied to the Directory data (entities.yaml
+    # ``overrides``), empty when none. Recorded on the ledger row.
+    overrides: Dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclass
@@ -463,6 +550,130 @@ def _parse_entity(
     )
 
 
+def partial_path(partials_dir: Path, code: str) -> Path:
+    """The brand partial file an entity resolves to."""
+    return Path(partials_dir) / f"{code}.yaml"
+
+
+def _parse_partial(
+    code: str, path: Path, problems: List[str]
+) -> Optional[BrandPartial]:
+    """Load and validate one ``config/partials/<CODE>.yaml``; None when absent.
+
+    An unverified partial may carry nulls (nothing is invented for JIT and
+    VALE until the owner supplies the values). A verified partial must have
+    every required field, no placeholder words, an https logo URL, integer
+    logo sizes and ``rgb(r,g,b)`` colours.
+    """
+    if not path.is_file():
+        return None
+    where = f"partial {path.name}"
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        problems.append(f"{where}: not valid YAML ({exc})")
+        return None
+    if not isinstance(raw, dict):
+        problems.append(f"{where}: must be a mapping")
+        return None
+
+    declared = raw.get("entity")
+    if declared is not None and str(declared) != code:
+        problems.append(f"{where}: entity is {declared!r}, expected {code!r}")
+    verified = raw.get("verified", False)
+    if not isinstance(verified, bool):
+        problems.append(f"{where}: verified must be true or false")
+        verified = False
+    unknown = sorted(
+        set(raw) - set(PARTIAL_FILE_FIELDS) - {"entity", "verified", "notes"}
+    )
+    if unknown:
+        problems.append(f"{where}: unknown keys {unknown}")
+
+    values: Dict[str, Optional[str]] = {}
+    for name in PARTIAL_FILE_FIELDS:
+        value = raw.get(name)
+        if value is not None and not isinstance(value, (str, int)):
+            problems.append(f"{where}: {name} must be a string, number or null")
+            value = None
+        if name in _PARTIAL_INT_FIELDS and value is not None:
+            if (
+                isinstance(value, bool)
+                or not str(value).strip().isdigit()
+                or int(value) <= 0
+            ):
+                problems.append(f"{where}: {name} must be a positive integer")
+                value = None
+        cleaned = _clean(value)
+        if cleaned is not None and verified and _PLACEHOLDER_WORD_RE.search(cleaned):
+            problems.append(
+                f"{where}: {name} still contains a placeholder word but the "
+                f"partial is marked verified: {cleaned!r}"
+            )
+        values[name] = cleaned
+
+    if verified:
+        for name in PARTIAL_FILE_FIELDS:
+            if name in PARTIAL_OPTIONAL_FIELDS:
+                continue
+            if values[name] is None:
+                problems.append(f"{where}: {name} is required when verified is true")
+        logo = values.get("logo_url")
+        if logo is not None and not logo.startswith("https://"):
+            problems.append(f"{where}: logo_url must be an absolute https:// URL")
+        for name in _PARTIAL_RGB_FIELDS:
+            colour = values.get(name)
+            if colour is not None and not _RGB_RE.match(colour):
+                problems.append(
+                    f"{where}: {name} must look like rgb(r,g,b); got {colour!r}"
+                )
+    return BrandPartial(code=code, verified=verified, values=values, path=path)
+
+
+def _parse_overrides(raw: Any, problems: List[str]) -> Dict[str, Dict[str, str]]:
+    """Validate the top-level ``overrides`` mapping: address -> person fields."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        problems.append("overrides: must be a mapping of send-as address to fields")
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for address, fields in raw.items():
+        where = f"overrides[{address!r}]"
+        key = str(address).strip().lower()
+        if "@" not in key or key.startswith("@") or key.endswith("@"):
+            problems.append(f"{where}: key must be a send-as email address")
+            continue
+        if not isinstance(fields, dict) or not fields:
+            problems.append(
+                f"{where}: must be a non-empty mapping of {list(OVERRIDE_FIELDS)}"
+            )
+            continue
+        cleaned: Dict[str, str] = {}
+        for name, value in fields.items():
+            if name not in OVERRIDE_FIELDS:
+                problems.append(
+                    f"{where}: unknown field {name!r}; allowed {list(OVERRIDE_FIELDS)}"
+                )
+                continue
+            text = _clean(value)
+            if text is None:
+                problems.append(f"{where}: {name} must be a non-empty string")
+                continue
+            cleaned[str(name)] = text
+        if cleaned:
+            out[key] = cleaned
+    return out
+
+
+def template_uses_partial(signature_html: str) -> bool:
+    """Whether a signature template references any brand-partial placeholder."""
+    names = set(_PLACEHOLDER_RE.findall(signature_html))
+    names |= set(_BLOCK_MARKER_RE.findall(signature_html))
+    names |= {m.group(1) for m in _IF_BLOCK_RE.finditer(signature_html)}
+    return bool({n.strip() for n in names} & PARTIAL_PLACEHOLDERS)
+
+
 def _parse_rules(
     raw_rules: Any, entity_codes: Iterable[str], problems: List[str]
 ) -> Tuple[List[PrimaryRule], List[str], List[str], List[str]]:
@@ -547,16 +758,31 @@ def _parse_rules(
 
 
 def load_config(
-    path: Optional[Path] = None, templates_dir: Optional[Path] = None
+    path: Optional[Path] = None,
+    templates_dir: Optional[Path] = None,
+    partials_dir: Optional[Path] = None,
 ) -> SignatureConfig:
-    """Load and fully validate ``entities.yaml``.
+    """Load and fully validate ``entities.yaml`` and the brand partials.
 
     Every problem is collected and raised in one ``SignatureConfigError`` so
     the file can be fixed in a single pass. Nothing is returned from a file
-    that fails any check.
+    that fails any check. ``partials_dir`` defaults to ``config/partials``
+    beside the config file's shipped location; a config under another path
+    without a partials directory simply has no partials.
+
+    Pin rule: an entity whose pinned signature template uses brand-partial
+    placeholders must have a partial marked ``verified: true``; otherwise
+    the config refuses to load and the entity must stay pinned to a template
+    that needs none.
     """
     config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     tdir = Path(templates_dir) if templates_dir is not None else DEFAULT_TEMPLATES_DIR
+    if partials_dir is not None:
+        pdir = Path(partials_dir)
+    elif path is None:
+        pdir = DEFAULT_PARTIALS_DIR
+    else:
+        pdir = config_path.parent / "partials"
 
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -604,6 +830,34 @@ def load_config(
         raw.get("rules"), entities.keys(), problems
     )
 
+    partials: Dict[str, BrandPartial] = {}
+    for code, entity in entities.items():
+        partial = _parse_partial(code, partial_path(pdir, code), problems)
+        if partial is not None:
+            partials[code] = partial
+        signature_path, _ = template_paths(
+            tdir, code, entity.template_version, entity.statutory_version
+        )
+        if signature_path.is_file() and template_uses_partial(
+            signature_path.read_text(encoding="utf-8")
+        ):
+            if partial is None:
+                problems.append(
+                    f"entity {code}: template {entity.template_version} uses brand "
+                    f"partial placeholders but {partial_path(pdir, code)} does not "
+                    "exist; add the partial (verified: true) or pin a template "
+                    "that needs none"
+                )
+            elif not partial.verified:
+                problems.append(
+                    f"entity {code}: template {entity.template_version} uses brand "
+                    f"partial placeholders but {partial.path.name} has verified: "
+                    "false; keep the entity on its previous template_version "
+                    "until the partial values are confirmed"
+                )
+
+    overrides = _parse_overrides(raw.get("overrides"), problems)
+
     domain_to_entity: Dict[str, str] = {}
     for code, entity in entities.items():
         for domain in entity.domains:
@@ -637,6 +891,8 @@ def load_config(
         templates_dir=tdir,
         domain_to_entity=domain_to_entity,
         skip_addresses=skip_addresses,
+        partials=partials,
+        overrides=overrides,
     )
 
 
@@ -672,6 +928,21 @@ def _pick_mobile(phones: Any) -> Optional[str]:
     return _clean(candidates[0]["value"]) if candidates else None
 
 
+def _pick_ddi(phones: Any) -> Optional[str]:
+    """The Directory work phone (type ``work``), primary first."""
+    if not isinstance(phones, list):
+        return None
+    candidates = [
+        p
+        for p in phones
+        if isinstance(p, dict)
+        and str(p.get("type") or "").lower() in _DDI_PHONE_TYPES
+        and _is_set(p.get("value"))
+    ]
+    candidates.sort(key=lambda p: 0 if p.get("primary") else 1)
+    return _clean(candidates[0]["value"]) if candidates else None
+
+
 def extract_person(user: Dict[str, Any], entity: Entity) -> Person:
     """Pull the signature fields out of a ``users.get`` resource.
 
@@ -690,6 +961,7 @@ def extract_person(user: Dict[str, Any], entity: Entity) -> Person:
         "name": name,
         "title": _pick_title(user.get("organizations")),
         "mobile": _pick_mobile(user.get("phones")),
+        "ddi": _pick_ddi(user.get("phones")),
     }
 
     missing = [f for f in entity.required_fields if not found.get(f)]
@@ -705,6 +977,7 @@ def extract_person(user: Dict[str, Any], entity: Entity) -> Person:
         family_name=family,
         title=found["title"] or "",
         mobile=found["mobile"],
+        ddi=found["ddi"],
     )
 
 
@@ -813,6 +1086,17 @@ def _render(
     allowed_set = set(allowed)
     raw_set = set(raw_names)
 
+    # ``{{#if x}}...{{/if}}`` -> ``{{#x}}...{{/x}}`` before the block pass.
+    text = _IF_BLOCK_RE.sub(
+        lambda m: f"{{{{#{m.group(1)}}}}}{m.group(2)}{{{{/{m.group(1)}}}}}", text
+    )
+    stray_if = _IF_MARKER_RE.search(text)
+    if stray_if:
+        raise TemplateError(
+            f"{label}: unbalanced block marker {stray_if.group(0)}; every "
+            "{{#if x}} needs a matching {{/if}} and blocks may not nest"
+        )
+
     def block_sub(match: re.Match) -> str:
         name, body = match.group(1), match.group(2)
         if name not in allowed_set:
@@ -865,31 +1149,55 @@ def render_statutory(template: LoadedTemplate, entity: Entity) -> str:
     )
 
 
+def partial_values(partial: BrandPartial, entity: Entity) -> Dict[str, Optional[str]]:
+    """The brand-partial placeholder values: the file's fields plus the
+    entity's statutory numbers (``company_no``, ``vat_no``)."""
+    values: Dict[str, Optional[str]] = dict(partial.values)
+    values["company_no"] = entity.company_number
+    values["vat_no"] = entity.vat_number
+    return values
+
+
 def render_signature(
     template: LoadedTemplate,
     person: Person,
     entity: Entity,
     statutory_html: Optional[str] = None,
+    partial: Optional[BrandPartial] = None,
 ) -> str:
     """Render a person's signature for one entity.
 
     ``statutory_html`` is inserted as-is for ``{{statutory}}``. When it is
     ``None`` the entity's statutory partial is rendered first. Every other
-    value is HTML-escaped.
+    value is HTML-escaped. With a verified ``partial`` the brand placeholders
+    (``PARTIAL_PLACEHOLDERS``) are available too; a template that uses them
+    without one is refused with a message naming the partial file.
     """
     if statutory_html is None:
         statutory_html = render_statutory(template, entity)
-    values = {
+    values: Dict[str, Any] = {
         "name": person.name,
         "title": person.title,
         "mobile": person.mobile,
+        "ddi": person.ddi,
         "email": person.email,
         "statutory": statutory_html,
     }
+    allowed = SIGNATURE_PLACEHOLDERS | SIGNATURE_V2_PERSON_PLACEHOLDERS
+    if partial is not None and partial.verified:
+        values.update(partial_values(partial, entity))
+        allowed = SIGNATURE_V2_PLACEHOLDERS
+    elif template_uses_partial(template.signature_html):
+        raise TemplateError(
+            f"{template.signature_path.name}: uses brand partial placeholders but "
+            f"entity {entity.code} has no verified partial "
+            f"(config/partials/{entity.code}.yaml); mark it verified: true once "
+            "its values are confirmed, or pin a template that needs none"
+        )
     rendered = _render(
         template.signature_html,
         values,
-        SIGNATURE_PLACEHOLDERS,
+        allowed,
         raw_names=("statutory",),
         label=f"{template.signature_path.name}",
     )
@@ -984,14 +1292,19 @@ def plan_for_user(
         entity = config.entities[code]
         row.template_version = entity.template_version
         row.statutory_version = entity.statutory_version
+        override = dict(config.overrides.get(send_as_email.strip().lower(), {}))
+        row.overrides = override
         try:
             template = load_template(config, code)
             person = extract_person(user, entity)
             # The signature shows the address it is attached to, not always
-            # the primary one.
-            person = dataclasses.replace(person, email=send_as_email)
+            # the primary one. A per-send-as override (entities.yaml
+            # ``overrides``) wins over the Directory for that address only.
+            person = dataclasses.replace(person, email=send_as_email, **override)
             statutory = render_statutory(template, entity)
-            rendered = render_signature(template, person, entity, statutory)
+            rendered = render_signature(
+                template, person, entity, statutory, partial=config.partials.get(code)
+            )
         except MissingDirectoryDataError as exc:
             row.status = "error"
             row.reason = f"missing Directory fields: {', '.join(exc.missing)}"
@@ -1148,7 +1461,16 @@ def result_rows_as_dicts(rows: List[ResultRow]) -> List[Dict[str, Any]]:
 __all__ = [
     "DEFAULT_CONFIG_PATH",
     "DEFAULT_TEMPLATES_DIR",
+    "DEFAULT_PARTIALS_DIR",
     "SIGNATURE_PLACEHOLDERS",
+    "SIGNATURE_V2_PLACEHOLDERS",
+    "PARTIAL_PLACEHOLDERS",
+    "PARTIAL_FILE_FIELDS",
+    "OVERRIDE_FIELDS",
+    "BrandPartial",
+    "partial_path",
+    "partial_values",
+    "template_uses_partial",
     "STATUTORY_PLACEHOLDERS",
     "LEGAL_FORMS",
     "MAX_SIGNATURE_CHARS",

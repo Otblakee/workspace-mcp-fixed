@@ -19,7 +19,17 @@ version: 1
 defaults:
   place_of_registration: England and Wales
   required_fields: [name, title]
-  optional_fields: [mobile]
+  # mobile and ddi (the Directory work phone) are rendered only when set.
+  optional_fields: [mobile, ddi]
+
+# Per-send-as overrides of the Directory data, for that address only. Allowed
+# fields: title, name, mobile, ddi. Recorded on every ledger row so the audit
+# shows them. The Directory itself is not changed.
+overrides:
+  # Oli signs BIR mail as its Managing Director; the Directory title stays
+  # "Group Managing Director" for every other address.
+  oliver@bir-d.co.uk:
+    title: Managing Director
 
 rules:
   # /99 _SYSTEM as a whole is not excluded because the AHWE mailbox lives in
@@ -63,7 +73,9 @@ entities:
     email: info@otbgroup.co.uk
     domains: [otbgroup.co.uk]
     group_branding: true
-    template_version: 1.0.0
+    # 2.0.0 needs config/partials/OTB.yaml (verified: true, read back from
+    # the live signature on 2026-11-06).
+    template_version: 2.0.0
     statutory_version: 1.0.0
     statutory_verified: true  # verified by the owner against Companies House on 2026-09-28
 
@@ -79,6 +91,7 @@ entities:
     email: office.admin@jit-logistics.com
     domains: [jit-logistics.com]
     group_branding: true
+    # Stays on 1.0.0 until config/partials/JIT.yaml is filled in and verified.
     template_version: 1.0.0
     statutory_version: 1.0.0
     statutory_verified: true  # verified by the owner against Companies House on 2026-09-28
@@ -95,6 +108,7 @@ entities:
     email: enquiries@valeautomotive.co.uk
     domains: [valeautomotive.co.uk]
     group_branding: true
+    # Stays on 1.0.0 until config/partials/VALE.yaml is filled in and verified.
     template_version: 1.0.0
     statutory_version: 1.0.0
     statutory_verified: true  # verified by the owner against Companies House on 2026-09-28
@@ -111,7 +125,9 @@ entities:
     email: info@bir-d.co.uk
     domains: [bir-d.co.uk]
     group_branding: true
-    template_version: 1.0.0
+    # 2.0.0 needs config/partials/BIR.yaml (verified: true, owner-supplied
+    # values, 2026-11-06).
+    template_version: 2.0.0
     statutory_version: 1.0.0
     statutory_verified: true  # verified by the owner against Companies House on 2026-09-28
 

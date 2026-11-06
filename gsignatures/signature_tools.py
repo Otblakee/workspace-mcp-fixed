@@ -290,13 +290,31 @@ async def _preview(user_email: str, send_as_email: Optional[str]) -> str:
             f"   Versions: template {entity.template_version}, "
             f"statutory {entity.statutory_version}"
         )
+        partial = rt.config.partials.get(entity.code)
+        if partial is not None and partial.verified:
+            partial_note = f"brand partial {partial.path.name}, verified"
+        elif partial is not None:
+            partial_note = f"brand partial {partial.path.name} NOT verified, unused"
+        else:
+            partial_note = "no brand partial"
+        lines.append(
+            f"   Template version used: {plan.template_version} ({partial_note})"
+        )
         try:
             person = extract_person(user, entity)
             lines.append(f"   Name: {person.name}")
             lines.append(f"   Title: {person.title}")
             lines.append(f"   Mobile: {person.mobile or '(none)'}")
+            lines.append(f"   DDI: {person.ddi or '(none)'}")
         except ValueError as exc:  # MissingDirectoryDataError
             lines.append(f"   Directory data: {exc}")
+        if plan.overrides:
+            lines.append(
+                "   Overrides for this send-as: "
+                + ", ".join(f"{k}={v!r}" for k, v in sorted(plan.overrides.items()))
+            )
+        else:
+            lines.append("   Overrides for this send-as: (none)")
         lines.append(f"   Email in signature: {plan.send_as_email}")
         if not entity.statutory_verified:
             lines.append(
@@ -723,8 +741,11 @@ async def preview_email_signature(
     Renders the signature one user would get, without writing anything.
 
     Shows the entity, the pinned template and statutory versions, the
-    Directory fields used (name, title, mobile or '(none)'), a warning when
-    the entity's statutory values are not yet verified, then the HTML.
+    template version actually used and whether a verified brand partial
+    (config/partials/<CODE>.yaml, template 2.0.0) backs it, the Directory
+    fields used (name, title, mobile and DDI or '(none)'), any per-send-as
+    override from entities.yaml applied to this address, a warning when the
+    entity's statutory values are not yet verified, then the HTML.
     Caller must be on SIGNATURE_ADMIN_EMAILS.
 
     Args:
@@ -811,10 +832,13 @@ async def set_email_signature(
 
     Dry run by default. A live write needs dry_run=False AND confirm=True,
     and a reachable ledger Sheet; every live apply is recorded there with
-    the previous signature HTML. An address whose ledger row already matches
-    Gmail is reported 'unchanged' unless force=True. force never touches an
-    address the rules skip (personal alias, suspended user, excluded OU).
-    Refused on a read-only server. Caller must be on SIGNATURE_ADMIN_EMAILS.
+    the previous signature HTML and any per-send-as override applied
+    (entities.yaml overrides, named on the row's reason too). The result
+    table's template column is the version actually used. An address whose
+    ledger row already matches Gmail is reported 'unchanged' unless
+    force=True. force never touches an address the rules skip (personal
+    alias, suspended user, excluded OU). Refused on a read-only server.
+    Caller must be on SIGNATURE_ADMIN_EMAILS.
 
     Args:
         user_email (str): The user's primary address. Required.
@@ -859,9 +883,10 @@ async def apply_email_signatures(
     count). A scope with more users than max_users is refused with the
     count (never truncated). One failing address or user is an error row;
     the rest continue, except that after a failed ledger append nothing
-    further is patched in that run. Every row is also written as a JSONL
-    report. Refused on a read-only server. Caller must be on
-    SIGNATURE_ADMIN_EMAILS.
+    further is patched in that run. Every row names the template version
+    actually used and any per-send-as override applied, and is also
+    written as a JSONL report. Refused on a read-only server. Caller must
+    be on SIGNATURE_ADMIN_EMAILS.
 
     Args:
         ou_path (Optional[str]): Organisational unit path, e.g. '/01 OTB'
@@ -916,9 +941,10 @@ async def audit_email_signatures(
     pre-patch pending row of an apply that never recorded its read-back;
     re-apply or restore), stale_template, stale_directory (the person's
     Directory data changed since the apply, so the signature is out of
-    date), changed_since_apply, error. With write_report=True the rows are
-    also written to an 'Audit_<UTC date>' tab of the ledger Sheet. Caller
-    must be on SIGNATURE_ADMIN_EMAILS.
+    date), changed_since_apply, error. Each row carries the per-send-as
+    overrides the plan applies, so the audit shows them. With
+    write_report=True the rows are also written to an 'Audit_<UTC date>' tab
+    of the ledger Sheet. Caller must be on SIGNATURE_ADMIN_EMAILS.
 
     Args:
         ou_path (Optional[str]): Organisational unit path (includes children).

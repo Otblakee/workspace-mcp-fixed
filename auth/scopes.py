@@ -305,6 +305,9 @@ TOOL_SCOPES_MAP = {
     # Admin console as domain-wide delegation for gsignatures.sa_auth.
     # DELEGATED_SCOPES, not here.
     "gsignatures": [],
+    # OTB CDN uploads: a server-held Cloudflare token (gcdn/r2_client.py),
+    # no Google scope at all.
+    "gcdn": [],
 }
 
 # Tool-to-read-only-scopes mapping
@@ -329,6 +332,7 @@ TOOL_READONLY_SCOPES_MAP = {
     # Managed Gmail signatures: delegated service account, never the user's
     # OAuth token (see TOOL_SCOPES_MAP). Nothing to request in either mode.
     "gsignatures": [],
+    "gcdn": [],
     "search": CUSTOM_SEARCH_SCOPES,
     "appscript": [
         SCRIPT_PROJECTS_READONLY_SCOPE,
