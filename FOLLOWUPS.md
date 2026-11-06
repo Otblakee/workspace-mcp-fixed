@@ -493,6 +493,39 @@ per folder. If it means "surface this folder in the hub" rather than "this is
 the hub drive", the `hub` flag precedence will mislabel drives as Hub. The
 dry run shows the reason per drive; adjust `classify_registry_drive` if so.
 
+## Folder Registry bloat (found 2026-11-06, tools shipped in v1.18.0)
+
+A git checkout synced into a JIT working folder put hundreds of `.git` rows
+into `FolderRegistry` through the Apps Script scanner, and every lookup
+slowed down. v1.18.0 ships `audit_folder_registry`, `prune_folder_registry`,
+the `walk_drive` exclusions and the reader guardrail. Still to do, in order:
+
+1. **Scanner.gs blocklist, depth cap and child budget.** The scanner is the
+   source of the rows, so it must carry the same rules as
+   `gdrive/drive_batch.py::EXCLUDED_PATH_SEGMENTS`: skip any path segment on
+   the list or starting with a dot, stop at depth 4, and when one parent
+   would add more than 200 rows write a single summary row instead. Owner
+   pastes the rewritten script; keep the two lists identical by hand until
+   the scanner can read the list from the Sheet.
+2. **Run the audit, then the prune, on the live registry.** Dry run first;
+   check the per-drive counts and the noise-segment breakdown; then
+   `dry_run=False, confirm=True`. The `RegistryArchive` tab is the undo.
+   Record the before and after row counts here.
+3. **`exclude` column on the registry.** TRUE on the root row of any working
+   or scratch folder. The scanner skips that subtree; the readers already
+   treat `exclude=TRUE` and `action=skip` rows as opted out, and the prune
+   tool never touches them. Decide whether `_read_registry_rows` should drop
+   opted-out rows for `rebuild_hub` and the banner tools, or leave that to
+   each caller.
+4. **Split inventory from registry.** The scanner's full crawl belongs in an
+   `Inventory` tab or in a `walk_drive` JSONL, not in `FolderRegistry`. The
+   registry only gains rows by a deliberate add (`create_folder_tree`
+   write-back, see "Registry write-back" above). Update
+   OTB_IT_TargetDriveArchitecture to say so.
+5. **Move the code checkout out of Drive**, or mark its root `exclude`.
+   Drive for Desktop plus git is a known source of lock-file and half-sync
+   trouble regardless of the registry.
+
 ## `rebuild_hub` defaults do not match the live Folder Registry
 
 Found while building the banner tools (2026-09-25). The live registry's tab is

@@ -1182,12 +1182,14 @@ set_shared_drive_themes_from_registry(
 
 | Tool | Description |
 |------|-------------|
-| `walk_drive` | Complete recursive inventory. Parent walk **plus** an independent drive-wide sweep, reconciled against each other; writes a deterministic JSONL manifest |
+| `walk_drive` | Complete recursive inventory. Parent walk **plus** an independent drive-wide sweep, reconciled against each other; writes a deterministic JSONL manifest. Skips working-folder noise (`.git`, `node_modules`, …) by default; `apply_default_excludes=False` for a full inventory, `exclude_names` and `max_depth` to narrow further |
 | `get_drive_file_metadata` | `files.get` with selectable fields including `md5Checksum`/`sha1Checksum`/`sha256Checksum`, `properties`, `parents`, `driveId` |
 | `create_folder_tree` | Idempotent batch folder creation from a path manifest; returns folder IDs for registry write-back |
 | `batch_copy_from_manifest` | Manifest-driven `files.copy`. Idempotent on a provenance key, provenance-stamped, partial-failure tolerant, rate-limit aware; writes a per-row JSONL result log |
 | `reconcile_folders` | Source-vs-destination comparison (counts, sizes, checksums) emitting a discrepancy report |
 | `rebuild_hub` | Rebuilds the hub shortcut layer from the Folder Registry's `hub_section` column |
+| `audit_folder_registry` | Read-only. Rows per drive, depth histogram, noise rows (same rules as `walk_drive`), parents over the child budget, duplicated folder IDs; JSONL hit list |
+| `prune_folder_registry` | Copies the noise rows to a `RegistryArchive` tab, verifies, then deletes them from the registry bottom-up in one batch. Dry run by default; live needs `dry_run=False` and `confirm=True` |
 
 Every bulk or mutating tool above accepts `dry_run=True`. Reports are written
 as JSONL into the attachment store (served at `/attachments/{id}` on HTTP
