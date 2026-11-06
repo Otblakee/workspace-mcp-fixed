@@ -493,11 +493,11 @@ per folder. If it means "surface this folder in the hub" rather than "this is
 the hub drive", the `hub` flag precedence will mislabel drives as Hub. The
 dry run shows the reason per drive; adjust `classify_registry_drive` if so.
 
-## Folder Registry bloat (found 2026-11-06, tools shipped in v1.18.0)
+## Folder Registry bloat (found 2026-11-06, tools shipped in v1.19.0)
 
 A git checkout synced into `JIT-Operations/JIT_DeereData_Working` put 259
 `.git` folders (plus a `__pycache__`) into `FolderRegistry` through the Apps
-Script scanner, and every lookup slowed down. v1.18.0 ships
+Script scanner, and every lookup slowed down. v1.19.0 ships
 `audit_folder_registry`, `prune_folder_registry`, the `walk_drive` exclusions
 and the reader guardrail.
 
