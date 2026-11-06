@@ -65,6 +65,17 @@ from gsignatures.engine import (  # noqa: E402
 GROUP_CODES = ("OTB", "JIT", "VALE", "BIR")
 ALL_CODES = GROUP_CODES + ("AHWE",)
 
+# What entities.yaml pins today: 2.0.0 needs a verified brand partial, which
+# OTB (read back from the live signature) and BIR (owner-supplied) have; JIT
+# and VALE stay on 1.0.0 until theirs are filled in; AHWE has no partial.
+PINNED_TEMPLATE_VERSIONS = {
+    "OTB": "2.0.0",
+    "JIT": "1.0.0",
+    "VALE": "1.0.0",
+    "BIR": "2.0.0",
+    "AHWE": "1.0.0",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -227,6 +238,9 @@ def shipped_copy(tmp_path):
     shutil.copy(DEFAULT_CONFIG_PATH, cfg_copy)
     templates_copy = tmp_path / "templates"
     shutil.copytree(DEFAULT_TEMPLATES_DIR, templates_copy)
+    # The brand partials sit beside the config file (config/partials) and
+    # load_config looks for them there when given an explicit path.
+    shutil.copytree(engine.DEFAULT_PARTIALS_DIR, tmp_path / "partials")
     return cfg_copy, templates_copy
 
 
@@ -296,8 +310,12 @@ def test_shipped_config_loads_and_templates_resolve(shipped_config):
         tpl = load_template(cfg, code)
         assert tpl.signature_path.is_file()
         assert tpl.statutory_path.is_file()
-        assert tpl.template_version == "1.0.0"
+        assert tpl.template_version == PINNED_TEMPLATE_VERSIONS[code]
         assert tpl.statutory_version == "1.0.0"
+    # The 2.0.0 pins are exactly the entities whose brand partial is verified.
+    assert {c for c, v in PINNED_TEMPLATE_VERSIONS.items() if v == "2.0.0"} == {
+        c for c, p in cfg.partials.items() if p.verified
+    }
 
 
 def test_shipped_config_seed_values(shipped_config):
@@ -309,7 +327,7 @@ def test_shipped_config_seed_values(shipped_config):
     assert otb.group_branding is True
     assert otb.statutory_verified is True
     assert otb.required_fields == ["name", "title"]
-    assert otb.optional_fields == ["mobile"]
+    assert otb.optional_fields == ["mobile", "ddi"]
     assert cfg.entities["JIT"].company_number == "03281238"
     assert cfg.entities["VALE"].company_number == "13811748"
     assert cfg.entities["BIR"].company_number == "13838584"
@@ -1015,7 +1033,7 @@ def test_plan_for_user_oli(shipped_config):
     assert rows[4].html is None and rows[4].rendered_hash is None
     for row in rows[:4]:
         assert row.user_email == "oliver@otbgroup.co.uk"
-        assert row.template_version == "1.0.0"
+        assert row.template_version == PINNED_TEMPLATE_VERSIONS[row.entity]
         assert row.statutory_version == "1.0.0"
         assert row.html and "Oliver Blake" in row.html
         assert row.rendered_hash == signature_hash(row.html)
@@ -1477,22 +1495,32 @@ def test_ahwe_statutory_is_name_and_website_only(shipped_config):
 def test_shipped_templates_render(shipped_config, code):
     entity = shipped_config.entities[code]
     tpl = load_template(shipped_config, code)
+    partial = shipped_config.partials.get(code)
     person = _person(mobile="07700 900000")
     statutory = render_statutory(tpl, entity)
-    html = render_signature(tpl, person, entity, statutory)
+    html = render_signature(tpl, person, entity, statutory, partial=partial)
     assert "Ada Lovelace" in html
     assert "Engineer" in html
     assert "07700 900000" in html
     assert "ada@otbgroup.co.uk" in html
-    assert statutory in html
+    if tpl.template_version == "1.0.0":
+        assert statutory in html
+    else:
+        # 2.0.0 carries its own footer from the entity's statutory numbers.
+        assert "Registered in England &amp; Wales No." in html
     assert "{{" not in html and "}}" not in html
     assert html.count("<table") == 1
     if code in GROUP_CODES:
         assert entity.company_number in html
         assert entity.legal_name in html
-        assert "England and Wales" in html
+        if tpl.template_version == "1.0.0":
+            assert "England and Wales" in html
+        else:
+            assert "England &amp; Wales" in html
     # Without a mobile the row disappears and nothing is left half-rendered.
-    html_no_mobile = render_signature(tpl, _person(mobile=None), entity, statutory)
+    html_no_mobile = render_signature(
+        tpl, _person(mobile=None), entity, statutory, partial=partial
+    )
     assert "07700" not in html_no_mobile
     assert "{{" not in html_no_mobile
 
@@ -1506,12 +1534,15 @@ def test_shipped_templates_are_inline_only(code):
 
 
 def test_shipped_templates_use_only_known_placeholders():
-    pattern = re.compile(r"\{\{[#/]?\s*([a-z_]+)\s*\}\}")
+    # ``{{#if x}}`` / ``{{/if}}`` are the 2.0.0 block spelling; the name is x.
+    pattern = re.compile(r"\{\{(?:#if\s+|[#/])?\s*([a-z_]+)\s*\}\}")
     for code in ALL_CODES:
         for path in (DEFAULT_TEMPLATES_DIR / code).iterdir():
-            names = set(pattern.findall(path.read_text(encoding="utf-8")))
-            if "-signature-" in path.name:
+            names = set(pattern.findall(path.read_text(encoding="utf-8"))) - {"if"}
+            if "-signature-v1." in path.name:
                 allowed = SIGNATURE_PLACEHOLDERS
+            elif "-signature-" in path.name:
+                allowed = engine.SIGNATURE_V2_PLACEHOLDERS
             else:
                 allowed = STATUTORY_PLACEHOLDERS
             assert names <= allowed, f"{path.name} uses {names - allowed}"
@@ -1577,7 +1608,12 @@ def test_shipped_templates_are_well_under_the_limit(shipped_config):
     for code in ALL_CODES:
         entity = shipped_config.entities[code]
         tpl = load_template(shipped_config, code)
-        html = render_signature(tpl, _person(mobile="07700 900000"), entity)
+        html = render_signature(
+            tpl,
+            _person(mobile="07700 900000"),
+            entity,
+            partial=shipped_config.partials.get(code),
+        )
         assert len(html) < MAX_SIGNATURE_CHARS // 2, code
 
 

@@ -1,0 +1,15 @@
+# Brand partial for Vale Automotive (template 2.0.0). NOT VERIFIED: the logo,
+# colours and office number are not yet known and are left null rather than
+# invented. The entity stays pinned to template 1.0.0 in entities.yaml until
+# every value is filled in and the owner sets verified: true.
+entity: VALE
+verified: false
+entity_name: Vale Automotive Ltd
+logo_url: null
+logo_w: null
+rule_rgb: null
+name_rgb: null
+label_rgb: null
+office_tel: null
+website: valeautomotive.co.uk
+address: Building 83, Langar Industrial Estate, Harby Road, Langar, Nottinghamshire, NG13 9HY

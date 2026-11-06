@@ -1281,6 +1281,49 @@ Set-up steps, pilot sequence, cron schedule, rollback and key rotation are in
 (placeholders, layout rules, what Gmail's sanitiser keeps) is in
 [`gsignatures/TEMPLATES.md`](gsignatures/TEMPLATES.md).
 
+Template 2.0.0 (v1.19.0) adds a brand partial per entity
+(`gsignatures/config/partials/<CODE>.yaml`: logo URL and size, colours,
+office number, website, address, `verified`), the Directory work phone as
+`ddi`, and per-send-as `overrides` in `entities.yaml` (title, name, mobile,
+ddi for one address). An entity pins 2.0.0 only once its partial is marked
+verified; the statutory numbers stay in `entities.yaml`. Logos are served
+from the OTB CDN (next section).
+
+---
+
+### OTB CDN uploads (opt-in) <sub>[`cdn_tools.py`](gcdn/cdn_tools.py)</sub>
+
+Versioned brand assets (signature logos and the like) on
+`cdn.otbgroup.co.uk`, a Cloudflare R2 bucket written through the Cloudflare
+REST API (`api.cloudflare.com`; the S3 endpoint is not used).
+
+| Tool | Description |
+|------|-------------|
+| `upload_cdn_asset` | PUTs one object (`base64_content` or `local_file`, with `content_type`), refuses an unversioned name (`name-vN.ext`) or an existing key, then HEADs the public URL and prints size, sha256, MD5, ETag and the URL. Write tool: removed by `--read-only` |
+| `list_cdn_assets` | Lists objects under a prefix with size, upload time, ETag and public URL. Read-only |
+
+**Token.** Create a Cloudflare API token with the single permission
+**Workers R2 Storage: Edit**, scoped to the one bucket (Account > R2 >
+the bucket), and nothing else. Set on Render:
+
+```bash
+CF_ACCOUNT_ID=<Cloudflare account ID>
+CF_R2_BUCKET=<bucket name behind cdn.otbgroup.co.uk>
+CF_R2_TOKEN=<the token>            # secret; never logged or echoed
+CDN_PUBLIC_BASE_URL=https://cdn.otbgroup.co.uk   # optional, this is the default
+CDN_MAX_UPLOAD_BYTES=20971520      # optional, 20 MiB default
+CDN_ADMIN_EMAILS=oliver@otbgroup.co.uk           # optional, this is the default
+TOOLS="gmail drive calendar docs sheets contacts gsignatures gcdn"
+```
+
+**Gating rule.** The token is held by the server, so every call first
+resolves the authenticated caller from the request context and refuses
+anyone not on `CDN_ADMIN_EMAILS`, or anyone who did not arrive through the
+server's OAuth 2.1 flow (same rule as the signature tools). Objects are
+never overwritten: a changed asset is the next version number, because a
+CDN URL is permanent once a signature points at it. The service is in
+`OPT_IN_TOOLS` and loads only when `TOOLS` names `gcdn`.
+
 ---
 
 ### Connect to Claude Desktop

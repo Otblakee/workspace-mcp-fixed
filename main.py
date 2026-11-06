@@ -59,7 +59,9 @@ configure_file_logging()
 # - gsignatures: managed Gmail signatures via a delegated service account
 #   that can act as any user; see gsignatures/signature_tools.py. Must never
 #   load unless TOOLS names it.
-OPT_IN_TOOLS = {"gadmin", "gadmin_write", "appscript", "gsignatures"}
+# - gcdn: uploads to the public OTB CDN with a server-held Cloudflare token;
+#   see gcdn/cdn_tools.py. Opt-in for the same reason as gsignatures.
+OPT_IN_TOOLS = {"gadmin", "gadmin_write", "appscript", "gsignatures", "gcdn"}
 
 
 # Set to True after argparse if running with --transport stdio. In stdio
@@ -178,6 +180,7 @@ def main():
             "gadmin",
             "gadmin_write",
             "gsignatures",
+            "gcdn",
         ],
         help="Specify which tools to register. If not provided, all tools are registered.",
     )
@@ -314,6 +317,7 @@ def main():
         "gadmin": lambda: import_module("gadmin.admin_tools"),
         "gadmin_write": lambda: import_module("gadmin.admin_group_tools"),
         "gsignatures": lambda: import_module("gsignatures.signature_tools"),
+        "gcdn": lambda: import_module("gcdn.cdn_tools"),
     }
 
     tool_icons = {
@@ -332,6 +336,7 @@ def main():
         "gadmin": "🛡️",
         "gadmin_write": "👥",
         "gsignatures": "✍️",
+        "gcdn": "🌐",
     }
 
     def _tools_in_services(services):

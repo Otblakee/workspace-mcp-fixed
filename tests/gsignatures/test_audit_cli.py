@@ -49,13 +49,16 @@ def config():
 
 
 def _ledger_row(user_email, send_as_email, entity, readback, rendered):
+    # The row records the template version entities.yaml pins today, so the
+    # fixture tenant reads as in_sync whatever the current pin is.
+    pinned = load_config().entities[entity].template_version
     return [
         "2026-09-20T09:00:00+00:00",
         "oliver@otbgroup.co.uk",
         user_email,
         send_as_email,
         entity,
-        "1.0.0",
+        pinned,
         "1.0.0",
         rendered,
         readback,

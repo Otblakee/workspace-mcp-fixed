@@ -285,3 +285,17 @@ gsignatures:
     - restore_email_signature
   extended: []
   complete: []
+
+# OTB CDN uploads (opt-in service, OPT_IN_TOOLS in main.py).
+#
+# upload_cdn_asset PUTs a versioned object to the Cloudflare R2 bucket behind
+# cdn.otbgroup.co.uk through the Cloudflare REST API with a server-held token
+# (CF_ACCOUNT_ID, CF_R2_BUCKET, CF_R2_TOKEN), never overwrites an existing
+# key, verifies the upload at the public URL, and refuses callers not on
+# CDN_ADMIN_EMAILS. list_cdn_assets is read-only. See gcdn/cdn_tools.py.
+gcdn:
+  core:
+    - upload_cdn_asset
+    - list_cdn_assets
+  extended: []
+  complete: []

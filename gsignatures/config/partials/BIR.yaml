@@ -1,0 +1,15 @@
+# Brand partial for BIR Developments (template 2.0.0). Values supplied by the
+# owner on 2026-11-06. The logo is uploaded to the CDN with upload_cdn_asset
+# before the first live apply (acceptance step 1). Statutory values stay in
+# entities.yaml.
+entity: BIR
+verified: true
+entity_name: BIR Developments Ltd
+logo_url: https://cdn.otbgroup.co.uk/bir/bir-logo-black-v1.png
+logo_w: 170
+rule_rgb: rgb(50,71,116)
+name_rgb: rgb(50,71,116)
+label_rgb: rgb(50,71,116)
+office_tel: "+44 (0)1949 861 701"
+website: bir-d.co.uk
+address: Building 83, Langar Industrial Estate, Harby Road, Langar, Nottinghamshire, NG13 9HY

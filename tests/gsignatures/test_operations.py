@@ -592,7 +592,7 @@ class TestApplyUserLive:
         assert primary["run_id"] == RUN
         assert primary["user_email"] == ALICE
         assert primary["entity"] == "OTB"
-        assert primary["template_version"] == "1.0.0"
+        assert primary["template_version"] == config.entities["OTB"].template_version
         assert primary["statutory_version"] == "1.0.0"
         assert primary["readback_hash"] == signature_hash(stored_primary)
         assert primary["previous_hash"] == signature_hash(OLD_PRIMARY)
@@ -1016,7 +1016,7 @@ class TestPendingLedgerRow:
         assert pending["run_id"] == RUN
         assert pending["actor"] == ACTOR
         assert pending["entity"] == "OTB"
-        assert pending["template_version"] == "1.0.0"
+        assert pending["template_version"] == config.entities["OTB"].template_version
         assert pending["statutory_version"] == "1.0.0"
         assert pending["applied_at"].endswith("+00:00")
 
@@ -1707,8 +1707,9 @@ class TestAuditScope:
         assert all(set(r) == set(AUDIT_HEADER) for r in rows)
         by = {r["send_as_email"]: r for r in rows}
         assert by[ALICE]["status"] == "in_sync"
-        assert by[ALICE]["ledger_template_version"] == "1.0.0"
-        assert by[ALICE]["expected_template_version"] == "1.0.0"
+        otb_version = config.entities["OTB"].template_version
+        assert by[ALICE]["ledger_template_version"] == otb_version
+        assert by[ALICE]["expected_template_version"] == otb_version
         assert by[ALICE]["current_hash"] == signature_hash(OLD_PRIMARY)
         assert by[ALICE_JIT]["status"] == "never_applied"
         assert by[ALICE_HOME]["status"] == "unmanaged"

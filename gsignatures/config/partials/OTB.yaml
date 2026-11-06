@@ -1,0 +1,16 @@
+# Brand partial for OTB (template 2.0.0). Values read back from the live
+# signature on oliver@otbgroup.co.uk on 2026-11-06 (get_email_signature_html);
+# the logo is served from the OTB CDN. Statutory values (company and VAT
+# numbers) stay in entities.yaml and are not repeated here.
+entity: OTB
+verified: true
+entity_name: OTB Group Limited
+logo_url: https://cdn.otbgroup.co.uk/otb/otb-logo-shimmer.png
+logo_w: 200
+logo_h: 120
+rule_rgb: rgb(201,162,39)
+name_rgb: rgb(31,56,100)
+label_rgb: rgb(201,162,39)
+office_tel: "+44 (0)1949 861 514"
+website: otbgroup.co.uk
+address: Distribution House, Building 83, Harby Road, Langar, Nottinghamshire, NG13 9HY

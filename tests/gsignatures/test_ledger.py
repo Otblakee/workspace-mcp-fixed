@@ -137,6 +137,7 @@ def _row(**overrides):
         "previous_hash": "",
         "previous_signature_html": "<div>old</div>",
         "run_id": "run-1",
+        "overrides": "",
     }
     base.update(overrides)
     return base
@@ -158,7 +159,10 @@ class TestConstants:
             "previous_hash",
             "previous_signature_html",
             "run_id",
+            "overrides",
         ]
+        # The twelve-column layout every ledger written before v1.19.0 has.
+        assert ledger.LEDGER_LEGACY_HEADERS == [ledger.LEDGER_HEADER[:12]]
         assert ledger.AUDIT_HEADER == [
             "audited_at",
             "user_email",
@@ -171,6 +175,7 @@ class TestConstants:
             "status",
             "reason",
             "current_hash",
+            "overrides",
         ]
 
 
@@ -226,6 +231,34 @@ class TestEnsureTab:
         await ledger.ensure_tab(sheets, SHEET_ID, "Ledger", ledger.LEDGER_HEADER)
         assert "spreadsheets.batchUpdate" not in sheets.names()
         assert sheets.tabs["Ledger"] == [ledger.LEDGER_HEADER]
+
+    @pytest.mark.asyncio
+    async def test_legacy_twelve_column_header_is_upgraded_in_place(self):
+        """A ledger written before v1.19.0 has twelve columns. ensure_tab
+        extends the header row and leaves the data rows alone; a later read
+        sees the new column empty on the old rows."""
+        legacy = ledger.LEDGER_HEADER[:12]
+        old_row = _row_values()[:12]
+        sheets = FakeSheets({"Ledger": [legacy, old_row]})
+        await ledger.ensure_tab(sheets, SHEET_ID, "Ledger", ledger.LEDGER_HEADER)
+        assert "spreadsheets.batchUpdate" not in sheets.names()
+        assert sheets.tabs["Ledger"][0] == ledger.LEDGER_HEADER
+        assert sheets.tabs["Ledger"][1] == old_row
+        latest = await ledger.read_ledger_latest(sheets, SHEET_ID)
+        row = latest[("alice@otbgroup.co.uk", "alice@otbgroup.co.uk")]
+        assert row["run_id"] == "run-1"
+        assert row["overrides"] == ""
+
+    @pytest.mark.asyncio
+    async def test_legacy_header_is_readable_before_any_write(self):
+        legacy = ledger.LEDGER_HEADER[:12]
+        sheets = FakeSheets({"Ledger": [legacy, _row_values()[:12]]})
+        rows = await ledger.read_ledger_rows(sheets, SHEET_ID)
+        assert len(rows) == 1 and rows[0]["overrides"] == ""
+        # A shorter or foreign prefix is still refused.
+        sheets = FakeSheets({"Ledger": [ledger.LEDGER_HEADER[:5], _row_values()[:5]]})
+        with pytest.raises(ledger.LedgerError):
+            await ledger.read_ledger_rows(sheets, SHEET_ID)
 
     @pytest.mark.asyncio
     async def test_existing_tab_with_foreign_header_is_refused(self):
@@ -291,6 +324,7 @@ class TestAppendLedgerRows:
                     "",
                     "",
                     "run-9",
+                    "",
                 ]
             ]
         }
@@ -339,7 +373,7 @@ class TestReadLedgerLatest:
         params = sheets.calls[0][1]
         assert params["spreadsheetId"] == SHEET_ID
         assert _tab_of(params["range"]) == "Ledger"
-        assert params["range"].endswith("!A:L")
+        assert params["range"].endswith("!A:M")
 
     @pytest.mark.asyncio
     async def test_header_only_returns_empty_dict(self):
@@ -559,6 +593,7 @@ class TestWriteAuditReport:
             "in_sync",
             "",
             "abc",
+            "",
         ]
         assert update["body"]["values"][2][8] == "never_applied"
         assert update["body"]["values"][2][3] == ""

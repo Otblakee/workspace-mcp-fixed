@@ -5,9 +5,30 @@ files shipped under `templates/` today are plain placeholders that prove the
 pipeline; the branded files replace them one entity at a time by bumping the
 pinned version in `config/entities.yaml`.
 
+## Template 2.0.0 (v1.19.0)
+
+The shipped 2.0.0 template (`<CODE>-signature-v2.0.0.html`, identical for
+OTB, JIT, VALE and BIR) reproduces the live OTB layout. Besides the 1.0.0
+placeholders it may use:
+
+| Placeholder | Source | Notes |
+| --- | --- | --- |
+| `{{ddi}}` | Directory work phone | Optional: inside `{{#if ddi}} ... {{/if}}` |
+| `{{entity_name}}`, `{{logo_url}}`, `{{logo_w}}`, `{{rule_rgb}}`, `{{name_rgb}}`, `{{label_rgb}}`, `{{office_tel}}`, `{{website}}`, `{{address}}` | `config/partials/<CODE>.yaml` | Required when the partial is `verified: true` |
+| `{{logo_h}}` | partial | Optional: inside `{{#if logo_h}} ... {{/if}}` |
+| `{{company_no}}`, `{{vat_no}}` | `entities.yaml` (`company_number`, `vat_number`) | The statutory numbers are never copied into a partial |
+
+`{{#if x}} ... {{/if}}` is an alias of `{{#x}} ... {{/x}}`; blocks still may
+not nest. A template that uses any partial placeholder loads only for an
+entity whose partial is marked `verified: true`; `load_config` refuses the
+pin otherwise, so an entity stays on 1.0.0 until its values are confirmed
+(JIT and VALE today). Per-send-as `overrides` in `entities.yaml` replace
+`title`, `name`, `mobile` or `ddi` for one address and are recorded on the
+ledger row.
+
 ## Placeholders
 
-A signature template (`<CODE>-signature-vX.Y.Z.html`) may use only:
+A signature template (`<CODE>-signature-vX.Y.Z.html`) may use only (1.0.0):
 
 | Placeholder | Value | Notes |
 | --- | --- | --- |
