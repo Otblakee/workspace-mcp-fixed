@@ -4,6 +4,41 @@ All notable changes to OTB's fork of the Google Workspace MCP are recorded
 here. Versions follow [Semantic Versioning](https://semver.org/). Earlier
 releases are recorded in the git history and in `CLAUDE.md`.
 
+## 1.20.0 (2026-11-06)
+
+- **New: `audit_folder_registry` and `prune_folder_registry`** (module
+  `gdrive/folder_registry_tools.py`, drive `extended` tier). The Folder
+  Registry had filled with hundreds of `.git` rows from a git checkout synced
+  into a JIT working folder, and every registry lookup slowed down. The audit
+  tool is read-only: rows per drive, a depth histogram, the rows the noise
+  rules match, parents over a 200-child budget, duplicated folder IDs, and a
+  JSONL hit list. The prune tool recomputes that hit list from the sheet,
+  copies every matched row to a `RegistryArchive` tab (registry columns plus
+  `archived_at`, `archived_by`, `archive_reason`, `source_row`), checks the
+  append count Google reports, re-reads the registry to prove no matched row
+  changed, and only then deletes the rows in one bottom-up `batchUpdate`.
+  Dry run by default; live needs `dry_run=False` and `confirm=True`; refuses
+  above `max_rows` (5000). Depth 0 and 1 rows and rows with `exclude=TRUE`
+  or `action=skip` are never pruned; over-depth rows only with
+  `prune_over_depth=True`.
+- **New: one noise rule set in `gdrive/drive_batch.py`.**
+  `EXCLUDED_PATH_SEGMENTS` (`.git`, `node_modules`, `.venv`, `venv`,
+  `__pycache__`, `.idea`, `.vscode`, `dist`, `build`, `.cache`,
+  `.pytest_cache`, `.mypy_cache`, `.next`, `target`, `tmp`) plus any
+  dot-prefixed name, checked on every path segment; `DEFAULT_REGISTRY_MAX_DEPTH`
+  is 5 (the Company Slices pattern is five deep; a first cut at 4 dropped its
+  leaves on the live scan). The Apps Script scanner that feeds the registry carries a copy of the
+  same list.
+- **`walk_drive` gains `exclude_names`, `apply_default_excludes` (default
+  True) and `max_depth`.** Excluded items are not recorded and excluded
+  folders are not descended; the drive-wide sweep applies the same rules so
+  the self-check does not report skipped items as missed. The summary says
+  how many were skipped and how to get a full inventory.
+  `reconcile_folders` is unchanged and still walks everything.
+- **Registry reader guardrail.** `_read_registry_rows` logs a warning above
+  2 000 data rows and refuses above 10 000 with a message naming the audit
+  and prune tools; the two new tools read with the limit off.
+
 ## 1.19.0 (2026-11-06)
 
 - **Signature template 2.0.0 (gsignatures).** Reproduces the live OTB

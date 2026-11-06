@@ -59,6 +59,10 @@ drive:
     - get_shared_drive_theme
     - set_shared_drive_theme
     - set_shared_drive_themes_from_registry
+    # Folder Registry hygiene: audit is read-only, prune archives first and
+    # needs dry_run=False + confirm=True to touch the sheet.
+    - audit_folder_registry
+    - prune_folder_registry
   complete:
     - get_drive_file_permissions
     - check_drive_file_public_access

@@ -1214,3 +1214,68 @@ send_as_email="oliver@bir-d.co.uk")` shows 2.0.0, "Managing Director" and
 the CDN logo URL; (3) `preview_email_signature(user_email="ben@bir-d.co.uk")`
 shows his Directory title. The first live apply of 2.0.0 extends the ledger
 header to 13 columns.
+
+## Folder Registry hygiene (v1.20.0)
+
+The Folder Registry (`FolderRegistry` tab) is read whole, per call, by
+`rebuild_hub` and the banner tools. On 2026-11-06 it held hundreds of `.git`
+rows from a git checkout synced into a JIT working folder, written by the
+Apps Script scanner, and every lookup slowed down. Module
+`gdrive/folder_registry_tools.py`, tests in
+`tests/gdrive/test_folder_registry_tools.py`, both tools at the drive
+`extended` tier.
+
+**One noise rule set.** `gdrive/drive_batch.py` holds
+`EXCLUDED_PATH_SEGMENTS`, `excluded_segment(path, extra)` (any segment on
+the list, or starting with a dot, case-insensitive, checked on every segment
+so `.git/objects/ab` is caught by its first segment) and
+`DEFAULT_REGISTRY_MAX_DEPTH = 5` (the Company Slices pattern is five deep;
+the first live scan at 4 dropped its leaves). `walk_drive` and the registry tools import
+it; the Apps Script scanner carries a copy. Change one, change all three.
+
+**`audit_folder_registry`** is read-only (`sheets_read`). Rows per drive,
+depth histogram, noise rows, over-depth rows, parents over `children_budget`
+(200), duplicated folder IDs, blank and path-less rows, and opted-out rows.
+Hit list goes to `registry_audit.jsonl` in the attachment store.
+
+**`prune_folder_registry`** (`sheets_write`) recomputes the hit list from
+the sheet every time; it never takes row numbers from the caller because
+they shift on the first delete. Live order: ensure `RegistryArchive`
+(registry header plus `archived_at`, `archived_by`, `archive_reason`,
+`source_row`; an existing tab with a different header is refused), append
+the hit rows and check `updates.updatedRows` equals what was sent, re-read
+the registry and check every hit still holds the same path and folder_id,
+then one `batchUpdate` of `deleteDimension` requests in descending
+contiguous ranges. Any check failing aborts before the delete and says the
+rows are already in the archive. `dry_run=True` by default; live needs
+`dry_run=False` and `confirm=True` (`LIVE_CONFIRM_MESSAGE`); `max_rows`
+(5000) refuses a bulk misfire. Never pruned: depth 0 and 1 rows
+(`PROTECTED_MAX_DEPTH`), rows with `exclude=TRUE` or `action` in
+skip/none/ignore/exclude, and over-depth rows unless
+`prune_over_depth=True`. Depth comes from the `depth` column when numeric,
+else from the path with the leading drive-name segment not counted.
+`registry_range` may be a tab name or an A1 range; a start row other than 1
+offsets every sheet row number (`split_registry_range`). The module never
+touches Drive files; a source scan pins it.
+
+**`walk_drive`** gains `exclude_names`, `apply_default_excludes` (True) and
+`max_depth`. Excluded items are not recorded and excluded folders are not
+descended; `excluded_items` and `excluded_subtrees` are counted and the
+subtree paths listed. The drive-wide sweep applies the same rules, so the
+self-check does not report skipped items as missed (`sweep_excluded`).
+`max_depth` records folders at that depth but does not descend
+(`depth_capped_subtrees`). `reconcile_folders` passes no exclusions and still
+walks everything: the go/no-go gate must see every item.
+
+**Reader guardrail.** `_read_registry_rows(..., enforce_limit=True)` warns
+above `REGISTRY_WARN_ROWS` (2 000) and refuses above `REGISTRY_MAX_ROWS`
+(10 000) with a message naming the two tools; the tools read with
+`enforce_limit=False`. `registry_rows_from_values` and
+`registry_header_keys` are the shared parsing so every reader sees the same
+rows; a blank sheet row is an empty dict, not a skipped row, so row numbers
+stay aligned.
+
+Outstanding (owner-side, in `FOLLOWUPS.md` "Folder Registry bloat"): the
+Scanner.gs rewrite with the same blocklist, depth cap and child budget; the
+live audit and prune; the `exclude` column; the inventory/registry split;
+moving the checkout out of Drive.

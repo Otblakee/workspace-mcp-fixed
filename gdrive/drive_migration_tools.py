@@ -32,11 +32,14 @@ from auth.service_decorator import require_google_service
 from core.server import server
 from core.utils import UserInputError, handle_http_errors
 from gdrive.drive_batch import (
+    EXCLUDED_PATH_SEGMENTS,
     FOLDER_MIME_TYPE,
     SHORTCUT_MIME_TYPE,
+    excluded_segment,
     execute_with_backoff,
     paginate,
     parse_manifest,
+    path_depth,
     summarise_counts,
     write_jsonl_report,
 )
@@ -131,6 +134,8 @@ async def _inventory_tree(
     *,
     include_trashed: bool = False,
     max_items: int = DEFAULT_MAX_ITEMS,
+    exclude_segments: Optional[Sequence[str]] = None,
+    max_depth: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int], List[str], Dict[str, Any]]:
     """Breadth-first inventory of everything under ``root_id``.
 
@@ -138,6 +143,13 @@ async def _inventory_tree(
     relative to the root so two trees can be compared positionally. Shortcut
     targets are recorded but never followed — a shortcut is an item in its own
     right and following it would double-count the target.
+
+    ``exclude_segments`` is the full list of noise segment names (``.git``,
+    ``node_modules``, …); any dot-prefixed segment is also noise. An excluded
+    item is not recorded and an excluded folder is not descended; the count of
+    skipped items and the names of skipped subtrees are reported instead.
+    ``None`` or empty means no exclusion at all. ``max_depth`` records folders
+    at that depth (root children are depth 1) but does not descend into them.
     """
     root = await execute_with_backoff(
         lambda: service.files().get(
@@ -158,6 +170,17 @@ async def _inventory_tree(
     seen_ids = {root_id}
     folder_count = 0
     truncated = False
+    excluded_items = 0
+    excluded_subtrees: List[str] = []
+    depth_capped_subtrees = 0
+    # ``excluded_segment`` already knows the defaults; pass only the extras,
+    # or None to switch exclusion off entirely.
+    exclusion_on = bool(exclude_segments)
+    extra_segments = (
+        [s for s in exclude_segments if s.lower() not in EXCLUDED_PATH_SEGMENTS]
+        if exclusion_on
+        else None
+    )
 
     # deque, not list: ``pop(0)`` on a list shifts every remaining entry, which
     # makes the traversal quadratic in the folder count. At the 50k-item scale
@@ -200,8 +223,18 @@ async def _inventory_tree(
                 continue
             seen_ids.add(child_id)
 
+            is_folder = child.get("mimeType") == FOLDER_MIME_TYPE
+            if exclusion_on and excluded_segment(child_path, extra_segments):
+                excluded_items += 1
+                if is_folder:
+                    excluded_subtrees.append(child_path)
+                continue
+
             rows.append(_inventory_row(child, child_path, "walk"))
-            if child.get("mimeType") == FOLDER_MIME_TYPE:
+            if is_folder:
+                if max_depth is not None and path_depth(child_path) >= max_depth:
+                    depth_capped_subtrees += 1
+                    continue
                 queue.append((child_id, child_path))
 
         if len(rows) >= max_items:
@@ -221,6 +254,25 @@ async def _inventory_tree(
         "items_found": len(rows),
         "truncated": int(truncated),
     }
+    if exclusion_on:
+        counts["excluded_items"] = excluded_items
+        counts["excluded_subtrees"] = len(excluded_subtrees)
+        if excluded_subtrees:
+            shown = ", ".join(sorted(excluded_subtrees)[:10])
+            more = len(excluded_subtrees) - 10
+            warnings.append(
+                f"{len(excluded_subtrees)} noise subtree(s) skipped by the "
+                f"exclusion rules (contents not counted): {shown}"
+                + (f" … and {more} more" if more > 0 else "")
+            )
+    if max_depth is not None:
+        counts["depth_capped_subtrees"] = depth_capped_subtrees
+        if depth_capped_subtrees:
+            warnings.append(
+                f"{depth_capped_subtrees} folder(s) at max_depth={max_depth} were "
+                "recorded but not descended; the inventory is a floor below "
+                "that depth."
+            )
     return rows, counts, warnings, root
 
 
@@ -329,6 +381,8 @@ async def _full_inventory(
     include_trashed: bool = False,
     max_items: int = DEFAULT_MAX_ITEMS,
     self_check: bool = True,
+    exclude_segments: Optional[Sequence[str]] = None,
+    max_depth: Optional[int] = None,
 ) -> Tuple[
     List[Dict[str, Any]],
     Dict[str, int],
@@ -348,7 +402,18 @@ async def _full_inventory(
     comparison and yield a clean verdict over lost content.
     """
     rows, counts, warnings, root_meta = await _inventory_tree(
-        service, root_id, include_trashed=include_trashed, max_items=max_items
+        service,
+        root_id,
+        include_trashed=include_trashed,
+        max_items=max_items,
+        exclude_segments=exclude_segments,
+        max_depth=max_depth,
+    )
+    exclusion_on = bool(exclude_segments)
+    extra_segments = (
+        [s for s in exclude_segments if s.lower() not in EXCLUDED_PATH_SEGMENTS]
+        if exclusion_on
+        else None
     )
 
     sweep_only: List[Dict[str, Any]] = []
@@ -378,12 +443,24 @@ async def _full_inventory(
 
         known_paths = {row["id"]: row["path"] for row in rows}
         sweep_by_id = {item.get("id"): item for item in sweep}
+        sweep_excluded = 0
         for item in sweep:
             item_id = item.get("id")
             if item_id in known_paths or item_id == root_id:
                 continue
             path = _resolve_sweep_path(item, known_paths, sweep_by_id, root_id)
+            # The walk skipped noise and depth-capped subtrees on purpose; the
+            # sweep must apply the same rules or it would report every item
+            # inside them as "missed", which is the opposite of the truth.
+            if exclusion_on and excluded_segment(path, extra_segments):
+                sweep_excluded += 1
+                continue
+            if max_depth is not None and path_depth(path) > max_depth:
+                sweep_excluded += 1
+                continue
             sweep_only.append(_inventory_row(item, path, "sweep"))
+        if sweep_excluded:
+            counts["sweep_excluded"] = sweep_excluded
 
         # Sort before applying the cap so truncation is deterministic rather
         # than dependent on the order Drive happened to return pages in.
@@ -426,6 +503,9 @@ async def walk_drive(
     include_trashed: bool = False,
     self_check: bool = True,
     max_items: int = DEFAULT_MAX_ITEMS,
+    exclude_names: Optional[List[str]] = None,
+    apply_default_excludes: bool = True,
+    max_depth: Optional[int] = None,
 ) -> str:
     """
     Produces a complete recursive inventory of a shared drive or folder.
@@ -453,6 +533,17 @@ async def walk_drive(
             completeness guarantee.
         max_items (int): Safety cap on inventory size. Defaults to 50000.
             A truncated walk says so explicitly.
+        exclude_names (Optional[List[str]]): Extra folder or file names to
+            treat as noise, on top of the defaults. Matched case-insensitively
+            against every segment of an item's path.
+        apply_default_excludes (bool): Skip the standard working-folder noise
+            (``.git``, ``node_modules``, ``.venv``, ``__pycache__``, ``dist``,
+            ``build``, … and any dot-prefixed name). Defaults to True. Pass
+            False for a true full inventory, e.g. before a migration copy.
+            With it False and no ``exclude_names``, nothing is excluded.
+        max_depth (Optional[int]): Record folders at this depth (root
+            children are depth 1) but do not descend into them. Default None,
+            no cap.
 
     Returns:
         str: Summary counts, discrepancies, and the manifest location.
@@ -461,14 +552,38 @@ async def walk_drive(
         raise UserInputError("root_id is required.")
     if max_items < 1:
         raise UserInputError("max_items must be at least 1.")
+    if max_depth is not None and max_depth < 1:
+        raise UserInputError("max_depth must be at least 1 when set.")
 
-    logger.info("[walk_drive] root=%s self_check=%s", root_id, self_check)
+    exclude_segments: List[str] = []
+    if apply_default_excludes:
+        exclude_segments.extend(sorted(EXCLUDED_PATH_SEGMENTS))
+    for name in exclude_names or []:
+        cleaned = str(name or "").strip()
+        if not cleaned:
+            continue
+        if "/" in cleaned:
+            raise UserInputError(
+                f"exclude_names entries are single folder or file names, not "
+                f"paths: {cleaned!r}"
+            )
+        exclude_segments.append(cleaned)
+
+    logger.info(
+        "[walk_drive] root=%s self_check=%s excludes=%d max_depth=%s",
+        root_id,
+        self_check,
+        len(exclude_segments),
+        max_depth,
+    )
     rows, counts, warnings, root_meta, sweep_only = await _full_inventory(
         service,
         root_id,
         include_trashed=include_trashed,
         max_items=max_items,
         self_check=self_check,
+        exclude_segments=exclude_segments or None,
+        max_depth=max_depth,
     )
     drive_id = root_meta.get("driveId")
     is_drive_root = bool(drive_id) and drive_id == root_meta.get("id")
@@ -508,6 +623,12 @@ async def walk_drive(
         # Only claim a pass when the sweep actually ran to completion; a
         # truncated sweep finding nothing extra proves nothing.
         lines.append("✅ Self-check passed: the sweep found nothing the walk missed.")
+    if exclude_segments:
+        lines.append(
+            f"ℹ️ Exclusion rules were on ({counts.get('excluded_items', 0)} item(s) "
+            "skipped). Pass apply_default_excludes=False and no exclude_names "
+            "for a full inventory."
+        )
     for warning in warnings[:20]:
         lines.append(f"⚠️ {warning}")
     if len(warnings) > 20:
@@ -1528,10 +1649,30 @@ async def _hub_registry_service(service, user_google_email: str):
     return service
 
 
+# Row-count guardrails for the Folder Registry. Every reader loads the whole
+# tab per call, so a registry that has filled up with working-folder noise
+# (hundreds of ``.git`` rows from one synced checkout, 2026-11) slows every
+# caller down silently. Warn when it is getting large; refuse when it is
+# plainly an inventory rather than a registry, and point at the tool that
+# fixes it. ``audit_folder_registry`` / ``prune_folder_registry`` read with
+# ``enforce_limit=False`` because they exist to fix exactly that state.
+REGISTRY_WARN_ROWS = 2_000
+REGISTRY_MAX_ROWS = 10_000
+
+
 async def _read_registry_rows(
-    sheets_service, spreadsheet_id: str, sheet_range: str
+    sheets_service,
+    spreadsheet_id: str,
+    sheet_range: str,
+    *,
+    enforce_limit: bool = True,
 ) -> List[Dict[str, str]]:
-    """Read the Folder Registry into dicts keyed by its header row."""
+    """Read the Folder Registry into dicts keyed by its header row.
+
+    Rows are returned in sheet order with no gaps, so ``index + 2`` (plus the
+    range's start-row offset, if any) is the row's 1-based sheet row number.
+    A blank sheet row is an empty dict, not a skipped row.
+    """
     response = await execute_with_backoff(
         lambda: (
             sheets_service.spreadsheets()
@@ -1545,7 +1686,39 @@ async def _read_registry_rows(
         raise UserInputError(
             f"Registry range '{sheet_range}' in {spreadsheet_id} is empty."
         )
-    header = [str(h).strip().lower().replace(" ", "_") for h in values[0]]
+    data_rows = len(values) - 1
+    if enforce_limit and data_rows > REGISTRY_MAX_ROWS:
+        raise UserInputError(
+            f"Registry range '{sheet_range}' holds {data_rows} rows, above the "
+            f"{REGISTRY_MAX_ROWS}-row limit for a Folder Registry. That is an "
+            "inventory, not a registry, and every tool that reads it would "
+            "slow down. Run audit_folder_registry to see what is clogging it "
+            "and prune_folder_registry to archive the noise rows, then retry."
+        )
+    if data_rows > REGISTRY_WARN_ROWS:
+        logger.warning(
+            "Folder Registry range %r in %s holds %d rows (warn threshold %d); "
+            "run audit_folder_registry to check for noise rows.",
+            sheet_range,
+            spreadsheet_id,
+            data_rows,
+            REGISTRY_WARN_ROWS,
+        )
+    return registry_rows_from_values(values)
+
+
+def registry_header_keys(header_row: Sequence[Any]) -> List[str]:
+    """Normalise a registry header row to dict keys (lower snake_case)."""
+    return [str(h).strip().lower().replace(" ", "_") for h in header_row]
+
+
+def registry_rows_from_values(values: Sequence[Sequence[Any]]) -> List[Dict[str, str]]:
+    """Turn a ``values.get`` grid (header first) into dicts, one per data row.
+
+    Shared with ``gdrive.folder_registry_tools`` so the audit and prune tools
+    see exactly the rows every other registry reader sees.
+    """
+    header = registry_header_keys(values[0]) if values else []
     rows: List[Dict[str, str]] = []
     for raw in values[1:]:
         row = {

@@ -458,3 +458,82 @@ def format_access_line(attachment_id: str, path: str) -> str:
 def summarise_counts(counts: Dict[str, int]) -> str:
     """Render a ``key: value`` count block for tool output."""
     return "\n".join(f"   {k}: {v}" for k, v in counts.items())
+
+
+# --- Folder-tree noise rules -------------------------------------------------
+#
+# Shared by ``walk_drive`` (gdrive/drive_migration_tools.py), the Folder
+# Registry tools (gdrive/folder_registry_tools.py) and, by copy, the
+# Apps Script scanner that feeds the registry. Keep the three in step: the
+# point is that every inventory of a folder tree agrees on what is noise.
+#
+# A working folder (a git checkout, a Python venv, a node project) synced
+# into Drive brings hundreds of machine-managed folders with it. None of
+# them belong in a registry of folders OTB has decided exist, and a registry
+# reader that loads the whole tab per call slows down for every one of them.
+
+EXCLUDED_PATH_SEGMENTS = frozenset(
+    {
+        ".git",
+        "node_modules",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".idea",
+        ".vscode",
+        "dist",
+        "build",
+        ".cache",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".next",
+        "target",
+        "tmp",
+    }
+)
+
+# Depth of the deepest folder the registry should normally hold. The drive
+# root is depth 0 and its direct children are depth 1. Anything deeper is
+# either a working-folder artefact or a tree the architecture doc does not
+# model, and either way it belongs in an inventory, not the registry.
+# 5, not 4: the Company Slices pattern (98_Company Slices/<entity>/
+# 03_Insurance (Company Slice)/03_Claims/YYYY) is five deep by design, and
+# the first live scan at 4 dropped those leaves (owner decision, 2026-11-06).
+DEFAULT_REGISTRY_MAX_DEPTH = 5
+
+
+def path_segments(path: str) -> List[str]:
+    """Split a slash-separated path into its non-empty segments."""
+    return [seg for seg in str(path or "").split("/") if seg.strip()]
+
+
+def path_depth(path: str) -> int:
+    """Depth of ``path`` where the root is 0 and ``a/b`` is 2."""
+    return len(path_segments(path))
+
+
+def excluded_segment(
+    path: str, extra_segments: Optional[Iterable[str]] = None
+) -> Optional[str]:
+    """Return the first segment of ``path`` that marks it as noise, else None.
+
+    A segment is noise when it starts with a dot (``.git``, ``.DS_Store``) or
+    when its lower-cased form is in ``EXCLUDED_PATH_SEGMENTS`` or
+    ``extra_segments``. Every segment is checked, so ``.git/objects/ab`` is
+    caught by its first segment, not only the leaf.
+    """
+    extras = {str(s).strip().lower() for s in (extra_segments or ()) if str(s).strip()}
+    for seg in path_segments(path):
+        lowered = seg.strip().lower()
+        if (
+            lowered.startswith(".")
+            or lowered in EXCLUDED_PATH_SEGMENTS
+            or lowered in extras
+        ):
+            return seg
+    return None
+
+
+def is_excluded_path(path: str, extra_segments: Optional[Iterable[str]] = None) -> bool:
+    """True when any segment of ``path`` is noise (see ``excluded_segment``)."""
+    return excluded_segment(path, extra_segments) is not None
