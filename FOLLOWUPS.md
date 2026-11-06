@@ -495,36 +495,54 @@ dry run shows the reason per drive; adjust `classify_registry_drive` if so.
 
 ## Folder Registry bloat (found 2026-11-06, tools shipped in v1.18.0)
 
-A git checkout synced into a JIT working folder put hundreds of `.git` rows
-into `FolderRegistry` through the Apps Script scanner, and every lookup
-slowed down. v1.18.0 ships `audit_folder_registry`, `prune_folder_registry`,
-the `walk_drive` exclusions and the reader guardrail. Still to do, in order:
+A git checkout synced into `JIT-Operations/JIT_DeereData_Working` put 259
+`.git` folders (plus a `__pycache__`) into `FolderRegistry` through the Apps
+Script scanner, and every lookup slowed down. v1.18.0 ships
+`audit_folder_registry`, `prune_folder_registry`, the `walk_drive` exclusions
+and the reader guardrail.
 
-1. **Scanner.gs blocklist, depth cap and child budget.** The scanner is the
-   source of the rows, so it must carry the same rules as
-   `gdrive/drive_batch.py::EXCLUDED_PATH_SEGMENTS`: skip any path segment on
-   the list or starting with a dot, stop at depth 4, and when one parent
-   would add more than 200 rows write a single summary row instead. Owner
-   pastes the rewritten script; keep the two lists identical by hand until
-   the scanner can read the list from the Sheet.
-2. **Run the audit, then the prune, on the live registry.** Dry run first;
-   check the per-drive counts and the noise-segment breakdown; then
-   `dry_run=False, confirm=True`. The `RegistryArchive` tab is the undo.
-   Record the before and after row counts here.
-3. **`exclude` column on the registry.** TRUE on the root row of any working
-   or scratch folder. The scanner skips that subtree; the readers already
-   treat `exclude=TRUE` and `action=skip` rows as opted out, and the prune
-   tool never touches them. Decide whether `_read_registry_rows` should drop
-   opted-out rows for `rebuild_hub` and the banner tools, or leave that to
-   each caller.
-4. **Split inventory from registry.** The scanner's full crawl belongs in an
+**Done on 2026-11-06 (Apps Script side, project "OTB Filing Assistant"):**
+
+- Code.gs v2.1: shared noise rules (`REGISTRY_NOISE_SEGMENTS`,
+  `REGISTRY_MAX_DEPTH`, `REGISTRY_CHILDREN_BUDGET`, `isNoisePath_`), read-side
+  filter of noise / over-depth / opted-out rows, chunked cache,
+  `checkHealth` reports hidden rows.
+- Scanner.gs v2.1: one `Files.list` per drive instead of one per folder,
+  noise rules applied before writing and before descending, depth cap,
+  child budget with a `scan_note`, durable `exclude` column (14) carried
+  over by `folder_id`, `ScanSkips` tab listing everything skipped.
+- First scan with the new scanner: 1,502 registry rows, no `.git` row;
+  `ScanSkips` shows the `.git` tree (259) and `__pycache__` (1).
+- `exclude = TRUE` set on `JIT-Operations/JIT_DeereData_Working`,
+  `JIT-Operations/09_John Deere Archive/JIT_DeereData_Working EPDC FLOW` and
+  the `OTB-SCRATCH-mcp-test-Health` drive root.
+- Depth cap set to 5 in both places (owner decision): the first scan at 4
+  dropped real leaves such as `98_Company Slices/<entity>/03_Insurance
+  (Company Slice)/03_Claims/YYYY` (68 `over_depth` entries on `ScanSkips`).
+
+**Still to do:**
+
+1. **Scanner.gs: honour `exclude` on a drive root.** `visit()` only checks
+   the flag below the root, so the flag on `OTB-SCRATCH-mcp-test-Health`
+   (depth 0) does nothing until that one-line condition is relaxed. Code.gs
+   `readFromRegistry_` likewise keeps depth 0 and 1 rows before the opt-out
+   check; swap the order so an excluded drive vanishes from the assistant.
+2. **Live prune is no longer needed**: `writeToRegistry_` clears and
+   rewrites the tab on every scan, so the scanner fix removed the rows on
+   its own. Run `audit_folder_registry` once the PR is live as the
+   independent check and record the counts here.
+3. **Split inventory from registry.** The scanner's full crawl belongs in an
    `Inventory` tab or in a `walk_drive` JSONL, not in `FolderRegistry`. The
    registry only gains rows by a deliberate add (`create_folder_tree`
    write-back, see "Registry write-back" above). Update
    OTB_IT_TargetDriveArchitecture to say so.
-5. **Move the code checkout out of Drive**, or mark its root `exclude`.
-   Drive for Desktop plus git is a known source of lock-file and half-sync
-   trouble regardless of the registry.
+4. **Move the code checkout out of Drive.** Drive for Desktop plus git is a
+   known source of lock-file and half-sync trouble regardless of the
+   registry (`_to_delete/git_stale_locks` and `state/wal_holding/
+   git_locks_cleared` in that folder say it has already bitten).
+5. **Keep the three noise lists identical by hand** (drive_batch.py,
+   Code.gs, Scanner.gs reads Code.gs) until the scanner can read the list
+   from the Sheet.
 
 ## `rebuild_hub` defaults do not match the live Folder Registry
 

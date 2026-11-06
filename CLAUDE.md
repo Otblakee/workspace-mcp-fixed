@@ -1112,7 +1112,8 @@ Apps Script scanner, and every lookup slowed down. Module
 `EXCLUDED_PATH_SEGMENTS`, `excluded_segment(path, extra)` (any segment on
 the list, or starting with a dot, case-insensitive, checked on every segment
 so `.git/objects/ab` is caught by its first segment) and
-`DEFAULT_REGISTRY_MAX_DEPTH = 4`. `walk_drive` and the registry tools import
+`DEFAULT_REGISTRY_MAX_DEPTH = 5` (the Company Slices pattern is five deep;
+the first live scan at 4 dropped its leaves). `walk_drive` and the registry tools import
 it; the Apps Script scanner carries a copy. Change one, change all three.
 
 **`audit_folder_registry`** is read-only (`sheets_read`). Rows per drive,

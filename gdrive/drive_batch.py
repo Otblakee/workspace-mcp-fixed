@@ -496,7 +496,10 @@ EXCLUDED_PATH_SEGMENTS = frozenset(
 # root is depth 0 and its direct children are depth 1. Anything deeper is
 # either a working-folder artefact or a tree the architecture doc does not
 # model, and either way it belongs in an inventory, not the registry.
-DEFAULT_REGISTRY_MAX_DEPTH = 4
+# 5, not 4: the Company Slices pattern (98_Company Slices/<entity>/
+# 03_Insurance (Company Slice)/03_Claims/YYYY) is five deep by design, and
+# the first live scan at 4 dropped those leaves (owner decision, 2026-11-06).
+DEFAULT_REGISTRY_MAX_DEPTH = 5
 
 
 def path_segments(path: str) -> List[str]:

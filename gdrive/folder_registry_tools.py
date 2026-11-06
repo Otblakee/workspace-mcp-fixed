@@ -537,7 +537,7 @@ async def audit_folder_registry(
         registry_range (str): Tab name or A1 range; the first row is the
             header. Defaults to "FolderRegistry".
         max_depth (int): Rows deeper than this are reported as over depth.
-            Drive root is 0. Defaults to 4.
+            Drive root is 0. Defaults to 5.
         exclude_names (Optional[List[str]]): Extra folder names to treat as
             noise, on top of the defaults.
         children_budget (int): A parent with more registered children than
@@ -629,7 +629,7 @@ async def prune_folder_registry(
         user_google_email (str): The user's Google email address. Required.
         registry_spreadsheet_id (str): Spreadsheet ID of the Folder Registry.
         registry_range (str): Tab name or A1 range. Defaults to "FolderRegistry".
-        max_depth (int): Depth above which rows count as over depth. Defaults to 4.
+        max_depth (int): Depth above which rows count as over depth. Defaults to 5.
         exclude_names (Optional[List[str]]): Extra folder names to treat as noise.
         prune_over_depth (bool): Also prune over-depth rows. Defaults to False.
         archive_tab (str): Tab the pruned rows are copied to first. Defaults

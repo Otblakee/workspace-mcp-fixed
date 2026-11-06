@@ -26,7 +26,8 @@ releases are recorded in the git history and in `CLAUDE.md`.
   `__pycache__`, `.idea`, `.vscode`, `dist`, `build`, `.cache`,
   `.pytest_cache`, `.mypy_cache`, `.next`, `target`, `tmp`) plus any
   dot-prefixed name, checked on every path segment; `DEFAULT_REGISTRY_MAX_DEPTH`
-  is 4. The Apps Script scanner that feeds the registry carries a copy of the
+  is 5 (the Company Slices pattern is five deep; a first cut at 4 dropped its
+  leaves on the live scan). The Apps Script scanner that feeds the registry carries a copy of the
   same list.
 - **`walk_drive` gains `exclude_names`, `apply_default_excludes` (default
   True) and `max_depth`.** Excluded items are not recorded and excluded
